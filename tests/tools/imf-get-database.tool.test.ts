@@ -77,6 +77,9 @@ describe('imfGetDatabase', () => {
     expect(result.dimensions).toHaveLength(3);
     expect(result.dimensions[0].id).toBe('COUNTRY');
     expect(result.dimensions[0].codelist[0]).toEqual({ id: 'USA', name: 'United States' });
+    expect(result.source).toBe(
+      'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    );
   });
 
   it('throws ctx.fail("dataflow_not_found") when dataflow does not exist', async () => {
@@ -158,6 +161,7 @@ describe('imfGetDatabase', () => {
           codelist_truncated: false,
         },
       ],
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
     const blocks = imfGetDatabase.format!(output);
     const text = (blocks[0] as { text: string }).text;
@@ -166,6 +170,8 @@ describe('imfGetDatabase', () => {
     expect(text).toContain('USA');
     expect(text).toContain('United States');
     expect(text).toContain('World Economic Outlook');
+    expect(text).toContain('Source: International Monetary Fund');
+    expect(text).toContain('https://data.imf.org/');
   });
 
   it('formats truncation notice when codelist_truncated is true', () => {
@@ -184,6 +190,7 @@ describe('imfGetDatabase', () => {
           codelist_truncated: true,
         },
       ],
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
     const blocks = imfGetDatabase.format!(output);
     const text = (blocks[0] as { text: string }).text;

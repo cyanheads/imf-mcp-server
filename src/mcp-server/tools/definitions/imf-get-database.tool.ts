@@ -9,6 +9,9 @@ import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
 const MAX_CODELIST_ENTRIES = 50;
 
+/** IMF SDMX 3.0 data portal base URL — used to construct per-dataflow attribution links. */
+const IMF_DATA_PORTAL = 'https://data.imf.org/';
+
 export const imfGetDatabase = tool('imf_get_database', {
   description:
     "Fetch a dataflow's dimension list and complete codelist for each dimension. " +
@@ -83,6 +86,11 @@ export const imfGetDatabase = tool('imf_get_database', {
           .describe('A single dimension with its codelist.'),
       )
       .describe('All dimensions of this dataflow with their codelists.'),
+    source: z
+      .string()
+      .describe(
+        'Attribution string required by IMF data terms: "Source: International Monetary Fund, <dataflow name>, <link>".',
+      ),
   }),
 
   errors: [
@@ -151,6 +159,7 @@ export const imfGetDatabase = tool('imf_get_database', {
       ...(structure.description ? { description: structure.description } : {}),
       key_format: structure.keyFormat,
       dimensions,
+      source: `Source: International Monetary Fund, ${structure.name}, ${IMF_DATA_PORTAL}`,
     };
   },
 
@@ -180,6 +189,8 @@ export const imfGetDatabase = tool('imf_get_database', {
       }
       lines.push('');
     }
+
+    lines.push(`_${result.source}_`);
 
     return [{ type: 'text', text: lines.join('\n') }];
   },

@@ -93,6 +93,9 @@ describe('imfQueryDataset', () => {
     expect(result.series_attributes.unit).toBe('Percent');
     expect(result.observation_count).toBe(3);
     expect(result.canvas_id).toBeUndefined();
+    expect(result.source).toBe(
+      'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    );
   });
 
   it('passes start_period and end_period to service', async () => {
@@ -196,6 +199,9 @@ describe('imfQueryDataset', () => {
     // Preview rows surfaced inline
     expect(result.observations).toHaveLength(1);
     expect(result.observations[0].time_period).toBe('2020');
+    expect(result.source).toBe(
+      'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    );
   });
 
   it('returns inline observations when spillover fits (spilled=false)', async () => {
@@ -237,6 +243,7 @@ describe('imfQueryDataset', () => {
       series_attributes: MOCK_SERIES_ATTRS,
       observation_count: 3,
       truncated: false,
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
     const blocks = imfQueryDataset.format!(output);
     const text = (blocks[0] as { text: string }).text;
@@ -245,6 +252,9 @@ describe('imfQueryDataset', () => {
     expect(text).toContain('2020');
     expect(text).toContain('3.5');
     expect(text).toContain('Percent');
+    expect(text).toContain('Source: International Monetary Fund');
+    expect(text).toContain('World Economic Outlook');
+    expect(text).toContain('https://data.imf.org/');
   });
 
   it('formats canvas spill path with canvas_id and table_name', () => {
@@ -257,6 +267,7 @@ describe('imfQueryDataset', () => {
       truncated: true,
       canvas_id: 'canvas-abc',
       table_name: 'spilled_abc123',
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
     const blocks = imfQueryDataset.format!(output);
     const text = (blocks[0] as { text: string }).text;
@@ -264,5 +275,6 @@ describe('imfQueryDataset', () => {
     expect(text).toContain('spilled_abc123');
     expect(text).toContain('5000');
     expect(text).toContain('imf_dataframe_query');
+    expect(text).toContain('Source: International Monetary Fund');
   });
 });

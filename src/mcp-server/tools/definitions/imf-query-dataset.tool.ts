@@ -12,6 +12,9 @@ import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
 const PREVIEW_CHARS = 100_000;
 
+/** IMF SDMX 3.0 data portal base URL — used to construct per-dataflow attribution links. */
+const IMF_DATA_PORTAL = 'https://data.imf.org/';
+
 export const imfQueryDataset = tool('imf_query_dataset', {
   description:
     'Query an IMF SDMX dataflow by dimension key over a time range. ' +
@@ -133,6 +136,11 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .optional()
       .describe(
         'DuckDB table name on the canvas — present when truncated=true; reference in SQL via FROM <table_name>.',
+      ),
+    source: z
+      .string()
+      .describe(
+        'Attribution string required by IMF data terms: "Source: International Monetary Fund, <dataflow name>, <link>".',
       ),
   }),
 
@@ -289,6 +297,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           truncated: true,
           canvas_id: instance.canvasId,
           table_name: result.handle.tableName,
+          source: `Source: International Monetary Fund, ${dataflow.name}, ${IMF_DATA_PORTAL}`,
         };
       }
     }
@@ -303,6 +312,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       series_attributes: queryResult.seriesAttributes,
       observation_count: queryResult.observations.length,
       truncated: false,
+      source: `Source: International Monetary Fund, ${dataflow.name}, ${IMF_DATA_PORTAL}`,
     };
   },
 
@@ -347,6 +357,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         lines.push(`| ${obs.series_key} | ${obs.time_period} | ${val} | ${status} |`);
       }
     }
+
+    lines.push(`\n_${result.source}_`);
 
     return [{ type: 'text', text: lines.join('\n') }];
   },
