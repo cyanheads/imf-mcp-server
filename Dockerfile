@@ -43,8 +43,9 @@ ENV NODE_ENV=production
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
 LABEL org.opencontainers.image.title="imf-mcp-server"
-LABEL org.opencontainers.image.description=""
+LABEL org.opencontainers.image.description="Query IMF SDMX 3.0 macroeconomic data — 193 dataflows, WEO, BOP, CPI, exchange rates, 190 countries."
 LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.source="https://github.com/cyanheads/imf-mcp-server"
 
 # Copy dependency manifests
 COPY package.json bun.lock ./

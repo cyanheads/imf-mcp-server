@@ -11,35 +11,18 @@
 
 ---
 
-## First Session
+## Server Overview
 
-This project was just scaffolded with `bunx @cyanheads/mcp-ts-core init`. You're holding a production-grade MCP framework with the hard parts already solved — error handling, telemetry, auth, transport, validation, lifecycle. What's missing is the **domain**. Your job: design the tool, resource, and service surface with the user, then implement it as small pure handlers that throw — the framework catches, classifies, and instruments the rest. Design before code; the user's first messages set direction, so wait for them before scaffolding definitions.
+**imf-mcp-server** wraps the IMF SDMX 3.0 public portal. No API key required.
 
-> **Remove this section** from CLAUDE.md / AGENTS.md after completing these steps. The skills and conventions below remain — this block is one-time onboarding only.
+**Surface area:** 5 tools, 1 resource, 0 prompts.
 
-1. **Get your bearings.** Take stock of the project tree, the skills in `skills/`, and the tools/MCP servers available. Light tool use is fine for context-building — you're mapping the territory, not committing yet.
-2. **Read the framework docs** — `node_modules/@cyanheads/mcp-ts-core/CLAUDE.md` (builders, Context, errors, exports, conventions)
-3. **Run the `setup` skill** — read `skills/setup/SKILL.md` and follow its checklist (project orientation, agent protocol file selection, echo definition cleanup, skill sync)
-4. **Design the server** — read `skills/design-mcp-server/SKILL.md` and work through it with the user to map the domain into tools, resources, and services before scaffolding
+**Workflow:** `imf_list_databases` → `imf_get_database` → `imf_query_dataset`. Large result sets spill to DataCanvas — `imf_dataframe_describe` then `imf_dataframe_query` for SQL access.
 
----
-
-## What's Next?
-
-When the user asks what's next or needs direction, suggest options based on the current project state. Common next steps:
-
-1. **Re-run the `setup` skill** — ensures CLAUDE.md, skills, structure, and metadata are populated and up to date with the current codebase
-2. **Run the `design-mcp-server` skill** — if the tool/resource surface hasn't been mapped yet, work through domain design
-3. **Add tools/resources/prompts** — scaffold new definitions using the `add-tool`, `add-app-tool`, `add-resource`, `add-prompt` skills
-4. **Add services** — scaffold domain service integrations using the `add-service` skill
-5. **Add tests** — scaffold tests for existing definitions using the `add-test` skill
-6. **Field-test definitions** — exercise tools/resources/prompts with real inputs using the `field-test` skill, get a report of issues and pain points
-7. **Run `devcheck`** — lint, format, typecheck, and security audit
-8. **Run the `security-pass` skill** — audit handlers for MCP-specific security gaps: output injection, scope blast radius, input sinks, tenant isolation
-9. **Run the `polish-docs-meta` skill** — finalize README, CHANGELOG, metadata, and agent protocol for shipping
-10. **Run the `maintenance` skill** — investigate changelogs, adopt upstream changes, and sync skills after `bun update --latest`
-
-Tailor suggestions to what's actually missing or stale — don't recite the full list every time.
+**Key constraints:**
+- Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE)
+- Key format is dot-separated DSD dimension order (e.g. `USA.NGDP_RPCH.A` for WEO)
+- Canvas spill requires `CANVAS_PROVIDER_TYPE=duckdb`
 
 ---
 
@@ -56,40 +39,48 @@ Tailor suggestions to what's actually missing or stale — don't recite the full
 
 ## Patterns
 
-### Tool
+### Tool (with canvas spill)
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { spillover } from '@cyanheads/mcp-ts-core/canvas';
+import { getCanvas } from '@/services/canvas/canvas-accessor.js';
+import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
-export const searchItems = tool('search_items', {
-  description: 'Search inventory items by query.',
-  annotations: { readOnlyHint: true },
+export const imfQueryDataset = tool('imf_query_dataset', {
+  description: 'Query an IMF SDMX dataflow by dimension key over a time range. ...',
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
-    query: z.string().describe('Search terms'),
-    limit: z.number().default(10).describe('Max results'),
+    dataflow_id: z.string().describe('Dataflow ID from imf_list_databases, e.g. WEO.'),
+    key: z.string().describe('Dot-separated codes in DSD keyPosition order, e.g. USA.NGDP_RPCH.A.'),
+    canvas_id: z.string().optional().describe('Existing canvas to accumulate into.'),
   }),
   output: z.object({
-    items: z.array(z.object({
-      id: z.string().describe('Item ID'),
-      name: z.string().describe('Item name'),
-    })).describe('Matching items'),
+    observations: z.array(z.object({
+      series_key: z.string().describe('Dimension codes for this series.'),
+      time_period: z.string().describe('Period label, e.g. 2023 or 2023-Q1.'),
+      value: z.number().nullable().describe('Observation value; null when missing.'),
+    })).describe('Inline rows — empty when results spilled to canvas.'),
+    truncated: z.boolean().describe('True when results spilled to DataCanvas.'),
+    canvas_id: z.string().optional().describe('DataCanvas session ID when truncated=true.'),
   }),
-  auth: ['inventory:read'],
-
+  errors: [
+    { reason: 'dataflow_not_found', code: JsonRpcErrorCode.NotFound,
+      when: 'dataflow_id does not match any known dataflow',
+      recovery: 'Call imf_list_databases to browse available dataflow IDs.' },
+  ],
   async handler(input, ctx) {
-    const items = await findItems(input.query, input.limit);
-    ctx.log.info('Search completed', { query: input.query, count: items.length });
-    return { items };
+    const svc = getImfSdmxService();
+    const queryResult = await svc.fetchData(/* ... */);
+    const canvas = getCanvas();
+    if (canvas) {
+      const instance = await canvas.acquire(input.canvas_id, ctx);
+      const result = await spillover({ canvas: instance, source: rows, previewChars: 100_000 });
+      if (result.spilled) return { observations: result.previewRows, truncated: true, canvas_id: instance.canvasId };
+    }
+    return { observations: queryResult.observations, truncated: false };
   },
-
-  // format() populates content[] — the markdown twin of structuredContent.
-  // Different clients read different surfaces (Claude Code → structuredContent,
-  // Claude Desktop → content[]); both must carry the same data.
-  // Enforced at lint time: every field in `output` must appear in the rendered text.
-  format: (result) => [{
-    type: 'text',
-    text: result.items.map(i => `**${i.id}**: ${i.name}`).join('\n'),
-  }],
+  format: (result) => [{ type: 'text', text: result.observations.map(o => `${o.time_period}: ${o.value}`).join('\n') }],
 });
 ```
 
@@ -97,54 +88,44 @@ export const searchItems = tool('search_items', {
 
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
-export const itemData = resource('inventory://{itemId}', {
-  description: 'Fetch an inventory item by ID.',
-  params: z.object({ itemId: z.string().describe('Item identifier') }),
-  auth: ['inventory:read'],
-  async handler(params, ctx) {
-    const item = await ctx.state.get(`item:${params.itemId}`);
-    if (!item) throw notFound(`Item ${params.itemId} not found`, { itemId: params.itemId });
-    return item;
-  },
-});
-```
-
-### Prompt
-
-```ts
-import { prompt, z } from '@cyanheads/mcp-ts-core';
-
-export const reviewCode = prompt('review_code', {
-  description: 'Review code for issues and best practices.',
-  args: z.object({
-    code: z.string().describe('Code to review'),
-    language: z.string().optional().describe('Programming language'),
+export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
+  name: 'imf-database',
+  title: 'IMF Dataflow Metadata',
+  description: 'Metadata for a single IMF SDMX dataflow — dimensions with full codelists, key_format, name, and description.',
+  mimeType: 'application/json',
+  params: z.object({
+    dataflow_id: z.string().describe('Dataflow identifier, e.g. WEO, BOP, CPI.'),
   }),
-  generate: (args) => [
-    { role: 'user', content: { type: 'text', text: `Review this ${args.language ?? ''} code:\n${args.code}` } },
-  ],
+  async handler(params, ctx) {
+    const svc = getImfSdmxService();
+    const dataflow = await svc.findDataflow(params.dataflow_id, undefined, undefined, ctx);
+    if (!dataflow) throw notFound(`Dataflow '${params.dataflow_id}' not found`);
+    const structure = await svc.fetchDataflowStructure(params.dataflow_id, dataflow.agencyId, dataflow.version, ctx);
+    return { dataflow_id: structure.dataflowId, key_format: structure.keyFormat, dimensions: structure.dimensions };
+  },
 });
 ```
 
 ### Server config
 
 ```ts
-// src/config/server-config.ts — lazy-parsed, separate from framework config
+// src/config/server-config.ts — actual schema
 import { z } from '@cyanheads/mcp-ts-core';
 import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
-  apiKey: z.string().describe('External API key'),
-  maxResults: z.coerce.number().default(100),
+  baseUrl: z.string().default('https://api.imf.org/external/sdmx/3.0').describe('IMF SDMX 3.0 base URL'),
+  requestTimeoutMs: z.coerce.number().default(30_000).describe('Per-request timeout in milliseconds'),
 });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
 export function getServerConfig() {
   _config ??= parseEnvConfig(ServerConfigSchema, {
-    apiKey: 'MY_API_KEY',
-    maxResults: 'MY_MAX_RESULTS',
+    baseUrl: 'IMF_BASE_URL',
+    requestTimeoutMs: 'IMF_REQUEST_TIMEOUT_MS',
   });
   return _config;
 }
@@ -223,20 +204,24 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 
 ```text
 src/
-  index.ts                              # createApp() entry point
+  index.ts                              # createApp() entry point — registers tools/resources, inits services
   config/
-    server-config.ts                    # Server-specific env vars (Zod schema)
+    server-config.ts                    # IMF_BASE_URL, IMF_REQUEST_TIMEOUT_MS (Zod schema)
   services/
-    [domain]/
-      [domain]-service.ts               # Domain service (init/accessor pattern)
-      types.ts                          # Domain types
+    canvas/
+      canvas-accessor.ts               # DataCanvas instance accessor (setCanvas / getCanvas)
+    imf-sdmx/
+      imf-sdmx-service.ts              # IMF SDMX 3.0 API client — dataflows, DSD, data fetch
+      types.ts                          # Domain types for dataflows and observations
   mcp-server/
     tools/definitions/
-      [tool-name].tool.ts               # Tool definitions
+      imf-list-databases.tool.ts       # List all 193 dataflows with optional filter
+      imf-get-database.tool.ts         # Fetch DSD — dimension list and codelists
+      imf-query-dataset.tool.ts        # Query by key + time range; spills to canvas
+      imf-dataframe-describe.tool.ts   # List canvas tables and schema
+      imf-dataframe-query.tool.ts      # SQL SELECT on staged canvas tables
     resources/definitions/
-      [resource-name].resource.ts       # Resource definitions
-    prompts/definitions/
-      [prompt-name].prompt.ts           # Prompt definitions
+      imf-database.resource.ts         # imf://database/{dataflow_id} — full codelist resource
 ```
 
 ---
