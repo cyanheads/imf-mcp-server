@@ -166,21 +166,24 @@ export class ImfSdmxService {
     // We fetch the structure endpoint directly using the dataflow's agency+version.
     const dsdId = `DSD_${dataflowId}`;
 
-    const structure = await this.fetchDataStructure(
-      dataflow.agencyId,
-      dsdId,
-      dataflow.version,
-      ctx,
-    ).catch(() => {
-      // Fallback: some flows use the flow agency/version as the DSD path directly.
-      // Fetch using the raw dataflow endpoint with ?references=all.
-      return this.fetchDataflowStructureFallback(
-        dataflowId,
+    let structure: DataflowStructure | undefined;
+    try {
+      structure = await this.fetchDataStructure(
         dataflow.agencyId,
+        dsdId,
         dataflow.version,
         ctx,
+      ).catch(() =>
+        this.fetchDataflowStructureFallback(dataflowId, dataflow.agencyId, dataflow.version, ctx),
       );
-    });
+    } catch {
+      // Both primary and fallback DSD fetch failed; throw a controlled message
+      // (the raw McpError would carry the upstream URL path in its message).
+      throw serviceUnavailable(`Structure unavailable for dataflow '${dataflowId}'`, {
+        reason: 'structure_unavailable',
+        dataflowId,
+      });
+    }
 
     if (!structure) {
       throw serviceUnavailable(`Structure unavailable for dataflow '${dataflowId}'`, {

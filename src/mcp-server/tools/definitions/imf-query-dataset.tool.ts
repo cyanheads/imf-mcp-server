@@ -223,9 +223,12 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         ctx,
         ctx.signal,
       );
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw ctx.fail('structure_unavailable', msg, ctx.recoveryFor('structure_unavailable'));
+    } catch {
+      throw ctx.fail(
+        'structure_unavailable',
+        `IMF SDMX data endpoint unavailable for dataflow '${input.dataflow_id}'`,
+        ctx.recoveryFor('structure_unavailable'),
+      );
     }
 
     // Detect empty result
