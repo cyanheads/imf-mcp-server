@@ -53,15 +53,18 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .string()
       .optional()
       .describe(
-        'Start of time range. Format matches the dataflow frequency: ' +
+        'Requested start of time range. Format matches the dataflow frequency: ' +
           'YYYY (annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly). ' +
-          'Omit to use the full available range.',
+          'Note: the IMF SDMX 3.0 compact JSON endpoint returns the full available series ' +
+          'regardless of this parameter — observations outside the requested range may still appear.',
       ),
     end_period: z
       .string()
       .optional()
       .describe(
-        'End of time range. Same format as start_period. Omit for the full available range.',
+        'Requested end of time range. Same format as start_period. ' +
+          'See start_period note: the API returns the full series; this parameter is passed through ' +
+          'but may not filter observations.',
       ),
     canvas_id: z
       .string()
@@ -86,6 +89,12 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .array(
         z
           .object({
+            series_key: z
+              .string()
+              .describe(
+                'Dot-separated dimension codes identifying this series, e.g. USA.NGDP_RPCH.A. ' +
+                  'Matches the single-country equivalent of the query key — useful when a query covers multiple countries.',
+              ),
             time_period: z.string().describe('Time label, e.g. 2023 or 2023-Q1 or 2023-01.'),
             value: z.number().nullable().describe('Observation value, null when missing.'),
             status: z
@@ -244,7 +253,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       const instance = await canvas.acquire(input.canvas_id, ctx);
       const rows = queryResult.observations.map((obs) => ({
         dataflow_id: input.dataflow_id,
-        key: input.key,
+        series_key: obs.series_key,
         time_period: obs.time_period,
         value: obs.value,
         status: obs.status,
@@ -270,6 +279,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           ...(input.start_period ? { start_period: input.start_period } : {}),
           ...(input.end_period ? { end_period: input.end_period } : {}),
           observations: obsFromPreview.map((r) => ({
+            series_key: r.series_key as string,
             time_period: r.time_period as string,
             value: r.value as number | null,
             status: r.status as string | null,
@@ -302,7 +312,9 @@ export const imfQueryDataset = tool('imf_query_dataset', {
 
     if (result.start_period || result.end_period) {
       const range = [result.start_period, result.end_period].filter(Boolean).join(' – ');
-      lines.push(`**Period:** ${range}`);
+      lines.push(
+        `**Requested period:** ${range} _(note: the IMF API returns the full available series; observations may extend beyond this range)_`,
+      );
     }
 
     const { unit, scale, decimals } = result.series_attributes;
@@ -327,12 +339,12 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     }
 
     if (result.observations.length > 0) {
-      lines.push('\n| Time Period | Value | Status |');
-      lines.push('|:------------|------:|:-------|');
+      lines.push('\n| Series Key | Time Period | Value | Status |');
+      lines.push('|:-----------|:------------|------:|:-------|');
       for (const obs of result.observations) {
         const val = obs.value != null ? obs.value.toString() : '—';
         const status = obs.status ?? '—';
-        lines.push(`| ${obs.time_period} | ${val} | ${status} |`);
+        lines.push(`| ${obs.series_key} | ${obs.time_period} | ${val} | ${status} |`);
       }
     }
 

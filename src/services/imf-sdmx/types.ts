@@ -40,6 +40,8 @@ export interface DataflowStructure {
 
 /** A decoded observation row. */
 export interface Observation {
+  /** Dot-separated dimension codes for this series, e.g. "USA.NGDP_RPCH.A". */
+  series_key: string;
   status: string | null;
   time_period: string;
   value: number | null;
@@ -83,6 +85,7 @@ export interface SdmxStructure {
     observation?: Array<SdmxAttributeDef>;
   };
   dimensions?: {
+    /** Series-level dimensions — values array lists the code for each index position in the series key. */
     series?: Array<SdmxDimensionDef>;
     observation?: Array<SdmxDimensionDef>;
   };
@@ -90,7 +93,9 @@ export interface SdmxStructure {
 
 export interface SdmxDimensionDef {
   id: string;
-  values: Array<{ id: string; name?: string }>;
+  /** IMF SDMX 3.0 uses `value` for observation dimension values (e.g. time periods);
+   *  legacy SDMX 2.1 used `id`. Both are optional to handle either format. */
+  values: Array<{ id?: string; value?: string; name?: string }>;
 }
 
 export interface SdmxAttributeDef {
@@ -119,7 +124,11 @@ export interface SdmxStructureResponse {
         dimensionList?: {
           dimensions?: Array<{
             id?: string;
-            conceptIdentity?: { id?: string; urn?: string };
+            /** String URN in IMF SDMX 3.0 (e.g. "urn:sdmx:...=IMF.RES:CS_WEO(4.0).COUNTRY"). */
+            conceptIdentity?: string | { id?: string; urn?: string };
+            /** SDMX 3.0 position — IMF returns this field instead of keyPosition. */
+            position?: number;
+            /** Legacy SDMX 2.1 position field — absent on IMF SDMX 3.0. */
             keyPosition?: number;
             localRepresentation?: {
               enumeration?: { id?: string; agencyID?: string; version?: string };

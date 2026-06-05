@@ -40,7 +40,7 @@ export class ImfSdmxService {
 
   /** Fetch all dataflows, with 1-hour caching. */
   async fetchDataflows(ctx: Context): Promise<Dataflow[]> {
-    const cacheKey = 'imf:dataflows:all';
+    const cacheKey = 'imf/dataflows/all';
     const cached = await ctx.state.get<Dataflow[]>(cacheKey);
     if (cached) {
       ctx.log.debug('Dataflows served from cache', { count: cached.length });
@@ -105,7 +105,7 @@ export class ImfSdmxService {
     version: string,
     ctx: Context,
   ): Promise<DataflowStructure | undefined> {
-    const cacheKey = `imf:dsd:${agencyId}:${dsdId}:${version}`;
+    const cacheKey = `imf/dsd/${agencyId}/${dsdId}/${version}`;
     const cached = await ctx.state.get<DataflowStructure>(cacheKey);
     if (cached) {
       ctx.log.debug('DSD served from cache', { dsdId });
@@ -206,7 +206,7 @@ export class ImfSdmxService {
     version: string,
     ctx: Context,
   ): Promise<DataflowStructure | undefined> {
-    const cacheKey = `imf:dsd-fb:${agencyId}:${dataflowId}:${version}`;
+    const cacheKey = `imf/dsd-fb/${agencyId}/${dataflowId}/${version}`;
     const cached = await ctx.state.get<DataflowStructure>(cacheKey);
     if (cached) return cached;
 
@@ -336,22 +336,51 @@ export class ImfSdmxService {
 
     const dimList = dsd.dataStructureComponents?.dimensionList?.dimensions ?? [];
 
-    // Sort by keyPosition
-    const sorted = [...dimList].sort((a, b) => (a.keyPosition ?? 0) - (b.keyPosition ?? 0));
+    // IMF SDMX 3.0 uses `position` (SDMX 3.0 spec); legacy used `keyPosition`.
+    const sorted = [...dimList].sort(
+      (a, b) => (a.position ?? a.keyPosition ?? 0) - (b.position ?? b.keyPosition ?? 0),
+    );
+
+    // Derive the dataflow ID portion for IMF naming-convention codelist lookup.
+    // IMF SDMX 3.0 does not populate localRepresentation.enumeration — codelists are
+    // identified by naming convention: CL_<FLOW_ID>_<DIM_ID> (flow-specific) or
+    // CL_<DIM_ID> (shared). Try flow-specific first, then shared.
+    const flowIdForCl = id.replace(/^DSD_/, '');
 
     const dimensions: Dimension[] = sorted.map((d, idx) => {
-      const dimId = d.id ?? d.conceptIdentity?.id ?? `DIM_${idx}`;
+      const dimId = d.id ?? `DIM_${idx}`;
       const enumRef = d.localRepresentation?.enumeration;
       let codelist: CodelistEntry[] = [];
 
-      if (enumRef) {
-        // Try various lookup keys
-        const keys = [
+      // 1. IMF naming convention (primary path — enumeration is null on SDMX 3.0).
+      // Also try the concept ID extracted from the conceptIdentity URN (e.g. FREQ from
+      // "urn:sdmx:...CS_MASTER_SYSTEM(1.0).FREQ") since some shared codelists use the
+      // concept ID rather than the dimension ID (e.g. FREQUENCY dim → CL_FREQ codelist).
+      const conceptId =
+        typeof d.conceptIdentity === 'string' ? d.conceptIdentity.replace(/^.*\./, '') : undefined;
+      const conventionKeys = [
+        `CL_${flowIdForCl}_${dimId}`,
+        `CL_${dimId}`,
+        ...(conceptId && conceptId !== dimId
+          ? [`CL_${flowIdForCl}_${conceptId}`, `CL_${conceptId}`]
+          : []),
+      ];
+      for (const k of conventionKeys) {
+        const found = clMap.get(k);
+        if (found && found.length > 0) {
+          codelist = found;
+          break;
+        }
+      }
+
+      // 2. Explicit enumeration reference (fallback for servers that populate it)
+      if (codelist.length === 0 && enumRef) {
+        const enumKeys = [
           `${enumRef.agencyID ?? ''}:${enumRef.id ?? ''}:${enumRef.version ?? ''}`,
           `${enumRef.agencyID ?? ''}:${enumRef.id ?? ''}`,
           enumRef.id ?? '',
         ];
-        for (const k of keys) {
+        for (const k of enumKeys) {
           const found = clMap.get(k);
           if (found && found.length > 0) {
             codelist = found;
@@ -363,7 +392,7 @@ export class ImfSdmxService {
       return {
         id: dimId,
         name: dimId,
-        position: d.keyPosition ?? idx,
+        position: d.position ?? d.keyPosition ?? idx,
         codelist,
       };
     });
@@ -418,7 +447,19 @@ export class ImfSdmxService {
     const observations: Observation[] = [];
     let seriesAttributes: SeriesAttributes = { unit: null, scale: null, decimals: null };
 
-    for (const [, seriesData] of Object.entries(series)) {
+    // Series-level dimensions for decoding the colon-separated series key ("0:0:0").
+    const seriesDims = structure?.dimensions?.series ?? [];
+
+    for (const [seriesKey, seriesData] of Object.entries(series)) {
+      // Decode the series key ("0:1:0") into dimension code values ("USA.NGDP_RPCH.A").
+      const seriesKeyParts = seriesKey.split(':');
+      const seriesCodeParts = seriesDims.map((dim, dimIdx) => {
+        const valIdx = parseInt(seriesKeyParts[dimIdx] ?? '0', 10);
+        const val = dim.values[valIdx];
+        return val?.id ?? val?.value ?? seriesKeyParts[dimIdx] ?? '';
+      });
+      const decodedSeriesKey = seriesCodeParts.join('.');
+
       // Extract series-level attributes for the first series we find
       if (seriesData.attributes) {
         const attrs = seriesData.attributes;
@@ -432,7 +473,8 @@ export class ImfSdmxService {
       // Decode observations
       for (const [obsIdx, obsValues] of Object.entries(seriesData.observations ?? {})) {
         const timeIdx = parseInt(obsIdx, 10);
-        const timePeriod = timeValues[timeIdx]?.id ?? obsIdx;
+        // IMF SDMX 3.0 uses `value` field for time periods; fallback to `id` for legacy compat.
+        const timePeriod = timeValues[timeIdx]?.value ?? timeValues[timeIdx]?.id ?? obsIdx;
         const rawValue = obsValues?.[0];
         const value = rawValue != null && rawValue !== '' ? parseFloat(rawValue) : null;
 
@@ -446,7 +488,7 @@ export class ImfSdmxService {
           }
         }
 
-        observations.push({ time_period: timePeriod, value, status });
+        observations.push({ series_key: decodedSeriesKey, time_period: timePeriod, value, status });
       }
     }
 

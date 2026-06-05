@@ -26,6 +26,7 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
     const dataflow = await svc.findDataflow(params.dataflow_id, undefined, undefined, ctx);
     if (!dataflow) {
       throw notFound(`Dataflow '${params.dataflow_id}' not found`, {
+        reason: 'dataflow_not_found',
         dataflowId: params.dataflow_id,
       });
     }
@@ -44,6 +45,7 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
         throw notFound(
           `Dataflow '${params.dataflow_id}' not found`,
           {
+            reason: 'dataflow_not_found',
             dataflowId: params.dataflow_id,
           },
           { cause: err },
@@ -52,6 +54,7 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
       throw serviceUnavailable(
         `Structure unavailable for dataflow '${params.dataflow_id}'`,
         {
+          reason: 'structure_unavailable',
           dataflowId: params.dataflow_id,
         },
         { cause: err },
