@@ -1,6 +1,6 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-06-05 10:18:45
+Generated on: 2026-06-05 12:23:27
 
 ```text
 imf-mcp-server/
@@ -19,6 +19,7 @@ imf-mcp-server/
 │   ├── extensions.json
 │   └── settings.json
 ├── changelog/
+│   ├── 0.1.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -162,6 +163,7 @@ imf-mcp-server/
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml
+├── CHANGELOG.md
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile
