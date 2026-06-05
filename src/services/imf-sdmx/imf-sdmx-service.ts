@@ -171,7 +171,7 @@ export class ImfSdmxService {
       dsdId,
       dataflow.version,
       ctx,
-    ).catch(async () => {
+    ).catch(() => {
       // Fallback: some flows use the flow agency/version as the DSD path directly.
       // Fetch using the raw dataflow endpoint with ?references=all.
       return this.fetchDataflowStructureFallback(
@@ -260,7 +260,8 @@ export class ImfSdmxService {
     const queryParams = new URLSearchParams();
     if (startPeriod) queryParams.set('startPeriod', startPeriod);
     if (endPeriod) queryParams.set('endPeriod', endPeriod);
-    const qs = queryParams.toString() ? `?${queryParams.toString()}` : '';
+    const qsStr = queryParams.toString();
+    const qs = qsStr ? `?${qsStr}` : '';
 
     // Build a minimal RequestContextLike for fetchWithTimeout when no ctx provided
     const now = new Date().toISOString();

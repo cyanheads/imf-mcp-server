@@ -264,25 +264,22 @@ export const imfQueryDataset = tool('imf_query_dataset', {
 
       const result = await spillover({
         canvas: instance,
-        source: (function* () {
-          yield* rows;
-        })(),
+        source: rows,
         previewChars: PREVIEW_CHARS,
         signal: ctx.signal,
       });
 
       if (result.spilled) {
-        const obsFromPreview = result.previewRows as typeof rows;
         return {
           dataflow_id: input.dataflow_id,
           key: input.key,
           ...(input.start_period ? { start_period: input.start_period } : {}),
           ...(input.end_period ? { end_period: input.end_period } : {}),
-          observations: obsFromPreview.map((r) => ({
-            series_key: r.series_key as string,
-            time_period: r.time_period as string,
-            value: r.value as number | null,
-            status: r.status as string | null,
+          observations: result.previewRows.map((r) => ({
+            series_key: r.series_key,
+            time_period: r.time_period,
+            value: r.value,
+            status: r.status,
           })),
           series_attributes: queryResult.seriesAttributes,
           observation_count: result.handle.rowCount,
