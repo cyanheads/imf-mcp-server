@@ -5,17 +5,26 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
-import { echoPrompt } from './mcp-server/prompts/definitions/echo.prompt.js';
-import { echoResource } from './mcp-server/resources/definitions/echo.resource.js';
-import { echoAppUiResource } from './mcp-server/resources/definitions/echo-app-ui.app-resource.js';
-import { echoTool } from './mcp-server/tools/definitions/echo.tool.js';
-import { echoAppTool } from './mcp-server/tools/definitions/echo-app.app-tool.js';
+import { getServerConfig } from './config/server-config.js';
+import { allPromptDefinitions } from './mcp-server/prompts/definitions/index.js';
+import { allResourceDefinitions } from './mcp-server/resources/definitions/index.js';
+import { allToolDefinitions } from './mcp-server/tools/definitions/index.js';
+import { setCanvas } from './services/canvas/canvas-accessor.js';
+import { initImfSdmxService } from './services/imf-sdmx/imf-sdmx-service.js';
 
 await createApp({
-  tools: [echoTool, echoAppTool],
-  resources: [echoResource, echoAppUiResource],
-  prompts: [echoPrompt],
-  // instructions: 'Server-level orientation forwarded to the model on every initialize.\n' +
-  //   '- Use shortcut `X` for the most common case\n' +
-  //   '- Tools require auth via the `inventory:read` scope',
+  tools: allToolDefinitions,
+  resources: allResourceDefinitions,
+  prompts: allPromptDefinitions,
+  instructions:
+    'IMF SDMX 3.0 macroeconomic data server. Keyless — no API key required.\n' +
+    'Workflow: imf_list_databases → imf_get_database → imf_query_dataset\n' +
+    'Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE).\n' +
+    'Large multi-country queries spill to DataCanvas; use imf_dataframe_query for SQL analysis.\n' +
+    'Key legacy note: the IFS monolithic database is decomposed — use CPI, ER, IL, MFS_* instead.',
+  setup(core) {
+    const cfg = getServerConfig();
+    initImfSdmxService(core.config, core.storage, cfg.baseUrl, cfg.requestTimeoutMs);
+    setCanvas(core.canvas);
+  },
 });

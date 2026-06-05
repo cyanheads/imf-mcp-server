@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "imf-mcp-server",
-  "description": "",
+  "name": "cyanheads/imf-mcp-server",
+  "description": "Global macroeconomic and financial statistics from the IMF SDMX 3.0 portal — 193 dataflows covering WEO projections, balance of payments, exchange rates, price indices, and national accounts for ~190 member countries. Keyless access.",
   "repository": {
-    "url": "",
+    "url": "https://github.com/cyanheads/imf-mcp-server",
     "source": "github"
   },
   "version": "0.1.0",
