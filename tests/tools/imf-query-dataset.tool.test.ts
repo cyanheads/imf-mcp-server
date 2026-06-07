@@ -257,6 +257,43 @@ describe('imfQueryDataset', () => {
     expect(text).toContain('https://data.imf.org/');
   });
 
+  it('suppresses scale "0" in format output (upstream no-op sentinel)', () => {
+    // Upstream emits scale "0" when scale is absent — it must not be printed.
+    const output = {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      observations: MOCK_OBSERVATIONS,
+      series_attributes: { unit: null, scale: '0', decimals: 0 },
+      observation_count: 3,
+      truncated: false,
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    };
+    const blocks = imfQueryDataset.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    // "0" scale and null unit — Series line should be omitted entirely
+    expect(text).not.toContain('**Series:**');
+  });
+
+  it('shows Series line when unit is present even with scale "0"', () => {
+    const output = {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      observations: MOCK_OBSERVATIONS,
+      series_attributes: { unit: 'Percent', scale: '0', decimals: 2 },
+      observation_count: 3,
+      truncated: false,
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    };
+    const blocks = imfQueryDataset.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('**Series:**');
+    expect(text).toContain('Percent');
+    // "0" scale must not appear in the output
+    expect(text).not.toMatch(/\| 0 \||\| 0$/m);
+    // But decimals should still render
+    expect(text).toContain('2 decimals');
+  });
+
   it('formats canvas spill path with canvas_id and table_name', () => {
     const output = {
       dataflow_id: 'WEO',

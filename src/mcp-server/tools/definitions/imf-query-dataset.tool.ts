@@ -328,8 +328,11 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     }
 
     const { unit, scale, decimals } = result.series_attributes;
-    if (unit || scale) {
-      const meta = [unit, scale, decimals != null ? `${decimals} decimals` : null]
+    // Suppress scale "0" — it's a no-op multiplier the upstream API emits when
+    // scale is absent; printing "0" is misleading.
+    const meaningfulScale = scale && scale !== '0' ? scale : null;
+    if (unit || meaningfulScale) {
+      const meta = [unit, meaningfulScale, decimals != null ? `${decimals} decimals` : null]
         .filter(Boolean)
         .join(' | ');
       lines.push(`**Series:** ${meta}`);
