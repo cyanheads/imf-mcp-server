@@ -63,21 +63,22 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
   ],
 
   async handler(input, ctx) {
+    // Validate SQL before canvas acquisition — invalid_sql is a client error
+    // independent of whether the canvas is enabled.
+    if (!/^\s*SELECT\s/i.test(input.sql)) {
+      throw ctx.fail(
+        'invalid_sql',
+        'SQL must be a SELECT statement. DML and DDL are not permitted.',
+        ctx.recoveryFor('invalid_sql'),
+      );
+    }
+
     const canvas = getCanvas();
     if (!canvas) {
       throw ctx.fail(
         'canvas_not_found',
         'DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb.',
         ctx.recoveryFor('canvas_not_found'),
-      );
-    }
-
-    // Validate SQL starts with SELECT
-    if (!/^\s*SELECT\s/i.test(input.sql)) {
-      throw ctx.fail(
-        'invalid_sql',
-        'SQL must be a SELECT statement. DML and DDL are not permitted.',
-        ctx.recoveryFor('invalid_sql'),
       );
     }
 

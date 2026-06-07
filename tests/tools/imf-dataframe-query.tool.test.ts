@@ -37,21 +37,31 @@ describe('imfDataframeQuery', () => {
     });
   });
 
-  it('throws ValidationError when SQL is not a SELECT statement', async () => {
-    // Canvas is disabled — but the SQL check happens before the canvas check
-    // Actually the handler checks canvas first, then SQL. Let's enable canvas:
-    const mockInstance = { canvasId: 'canvas-abc', query: vi.fn() };
-    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
-      acquire: vi.fn().mockResolvedValue(mockInstance),
-    });
-
+  it('throws ctx.fail("invalid_sql") for DML even when canvas is disabled', async () => {
+    // Canvas is not enabled — SQL validation must fire before the canvas check.
     const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeQuery.errors });
     const input = imfDataframeQuery.input.parse({
       canvas_id: 'canvas-abc',
       sql: 'DROP TABLE spilled_abc123',
     });
 
-    await expect(imfDataframeQuery.handler(input, ctx)).rejects.toThrow(/SELECT/);
+    await expect(imfDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.InvalidParams,
+      data: { reason: 'invalid_sql' },
+    });
+  });
+
+  it('throws ctx.fail("invalid_sql") for INSERT even when canvas is disabled', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeQuery.errors });
+    const input = imfDataframeQuery.input.parse({
+      canvas_id: 'canvas-abc',
+      sql: 'INSERT INTO foo VALUES (1)',
+    });
+
+    await expect(imfDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.InvalidParams,
+      data: { reason: 'invalid_sql' },
+    });
   });
 
   it('throws ctx.fail("canvas_not_found") when canvas.acquire fails', async () => {
