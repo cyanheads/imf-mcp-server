@@ -84,6 +84,32 @@ describe('imfListDatabases', () => {
     expect(result.dataflows).toHaveLength(0);
   });
 
+  it('populates notice when filter matches nothing', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    const input = imfListDatabases.input.parse({ filter: 'xyznonexistent' });
+    const result = await imfListDatabases.handler(input, ctx);
+
+    expect(result.notice).toBeDefined();
+    expect(result.notice).toContain('xyznonexistent');
+    expect(result.notice).toContain('non-vintage');
+  });
+
+  it('does not populate notice when filter matches results', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    const input = imfListDatabases.input.parse({ filter: 'balance' });
+    const result = await imfListDatabases.handler(input, ctx);
+
+    expect(result.notice).toBeUndefined();
+  });
+
+  it('does not populate notice when no filter is provided', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    const input = imfListDatabases.input.parse({});
+    const result = await imfListDatabases.handler(input, ctx);
+
+    expect(result.notice).toBeUndefined();
+  });
+
   it('formats output with agency and name info', () => {
     const output = {
       dataflows: [
@@ -115,5 +141,28 @@ describe('imfListDatabases', () => {
     const blocks = imfListDatabases.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('Price indices for 90+ countries');
+  });
+
+  it('renders notice in format output when present', () => {
+    const output = {
+      dataflows: [],
+      total_count: 0,
+      notice: 'No dataflows matched filter "xyz". Try a broader term.',
+    };
+    const blocks = imfListDatabases.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('No dataflows matched filter "xyz"');
+  });
+
+  it('does not render notice line when absent', () => {
+    const output = {
+      dataflows: [
+        { id: 'WEO', agency_id: 'IMF.RES', version: '9.0.0', name: 'World Economic Outlook' },
+      ],
+      total_count: 1,
+    };
+    const blocks = imfListDatabases.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('No dataflows matched');
   });
 });

@@ -54,6 +54,12 @@ export const imfListDatabases = tool('imf_list_databases', {
         'Matching dataflows; pass the id to imf_get_database to resolve dimension codelists.',
       ),
     total_count: z.number().describe('Total number of matching dataflows returned.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Populated when the filter matches nothing — explains why and suggests next steps.',
+      ),
   }),
 
   async handler(input, ctx) {
@@ -64,6 +70,9 @@ export const imfListDatabases = tool('imf_list_databases', {
     if (!input.include_vintages) {
       dataflows = dataflows.filter((df) => !VINTAGE_PATTERN.test(df.id));
     }
+
+    // Capture total before substring filter — used in empty-result notice.
+    const totalBeforeFilter = dataflows.length;
 
     // Name/ID substring filter
     const filterLower = input.filter?.toLowerCase().trim();
@@ -78,24 +87,33 @@ export const imfListDatabases = tool('imf_list_databases', {
 
     ctx.log.info('Dataflows listed', { count: dataflows.length, filter: input.filter });
 
-    const result = {
-      dataflows: dataflows.map((df) => ({
-        id: df.id,
-        agency_id: df.agencyId,
-        version: df.version,
-        name: df.name,
-        ...(df.description ? { description: df.description } : {}),
-      })),
-      total_count: dataflows.length,
-    };
+    const mappedDataflows = dataflows.map((df) => ({
+      id: df.id,
+      agency_id: df.agencyId,
+      version: df.version,
+      name: df.name,
+      ...(df.description ? { description: df.description } : {}),
+    }));
 
-    return result;
+    const notice =
+      filterLower && dataflows.length === 0
+        ? `No dataflows matched filter "${input.filter}". Try a broader term, or omit filter to browse all ${totalBeforeFilter} non-vintage dataflows. Set include_vintages=true to include historical snapshot entries.`
+        : undefined;
+
+    return {
+      dataflows: mappedDataflows,
+      total_count: dataflows.length,
+      ...(notice ? { notice } : {}),
+    };
   },
 
   format: (result) => {
     const lines: string[] = [
       `**${result.total_count} dataflow${result.total_count === 1 ? '' : 's'}**\n`,
     ];
+    if (result.notice) {
+      lines.push(`> ${result.notice}\n`);
+    }
     for (const df of result.dataflows) {
       lines.push(`### ${df.id}`);
       lines.push(`**Agency:** ${df.agency_id} | **Version:** ${df.version}`);
