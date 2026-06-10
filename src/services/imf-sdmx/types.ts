@@ -103,6 +103,21 @@ export interface SdmxAttributeDef {
   values?: Array<{ id: string; name?: string }>;
 }
 
+/**
+ * Parsed result from the SDMX 2.1 availableconstraint endpoint.
+ * Used to enrich no_data errors with actual coverage information.
+ */
+export interface AvailabilityResult {
+  /** Per-dimension lists of codes that actually have data (from cube region KeyValues). */
+  available_codes: Record<string, string[]>;
+  /** Total series count for the queried constraint. 0 = code not covered at all. */
+  series_count: number;
+  /** Latest period with data, if present in the constraint annotations. */
+  time_period_end: string | null;
+  /** Earliest period with data, if present in the constraint annotations. */
+  time_period_start: string | null;
+}
+
 /** Raw SDMX structure response shape. */
 export interface SdmxStructureResponse {
   data?: {

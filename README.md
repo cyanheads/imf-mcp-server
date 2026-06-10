@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -56,7 +56,7 @@ Resolve human-readable terms to SDMX dimension codes before querying.
 - Returns all dimension IDs, positions, and their complete codelists (e.g. `"United States"` → `USA`, `"real GDP growth"` → `NGDP_RPCH`)
 - Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE)
 - `key_format` field shows the exact dot-separated dimension order required by `imf_query_dataset`
-- Codelists truncated at 50 entries inline; full list available via the `imf://database/{dataflow_id}` resource
+- Codelists truncated at 50 entries inline; use `codelist_filter` to search large codelists by substring (returns all matches, uncapped), or the `imf://database/{dataflow_id}` resource for the full list
 
 ---
 
@@ -68,6 +68,7 @@ Query an IMF SDMX dataflow by dimension key over a time range.
 - `+` syntax for multi-code positions (e.g. `USA+GBR+DEU.NGDP_RPCH.A`)
 - Returns observations with `time_period`, `value`, `status`, and series attributes (`unit`, `scale`, `decimals`)
 - Large multi-country or long time-range queries automatically spill to DataCanvas — `canvas_id` and `table_name` are returned for SQL follow-up
+- `no_data` errors include availability context from the upstream constraint endpoint: `series_count=0` means the code has no coverage in the dataflow; `series_count>0` means the combination is wrong and `available_codes` lists what does have data
 
 ---
 
@@ -89,7 +90,7 @@ Only SELECT statements are accepted — DML and DDL are rejected. Requires `CANV
 |:-----|:----|:------------|
 | Resource | `imf://database/{dataflow_id}` | Full metadata for a single IMF SDMX dataflow — all dimensions with complete codelists, `key_format`, name, and description. Stable URI-addressable reference for known dataflow IDs (WEO, BOP, CPI, etc.). |
 
-All resource data is also reachable via `imf_get_database`. The resource URI provides the untruncated codelist for large dimensions that `imf_get_database` caps at 50 entries.
+All resource data is also reachable via `imf_get_database`. The resource URI provides the untruncated codelist for large dimensions that `imf_get_database` caps at 50 entries. The `codelist_filter` parameter on `imf_get_database` is a lighter alternative for targeted code lookup — it returns all substring matches without the cap.
 
 ## Data source
 

@@ -19,7 +19,9 @@ export const imfGetDatabase = tool('imf_get_database', {
     '"real GDP growth" → NGDP_RPCH). ' +
     'Required before imf_query_dataset — SDMX keys are opaque without codelist lookups. ' +
     'Country codes are ISO 3-letter (USA, GBR, DEU), not ISO 2-letter (US, GB, DE). ' +
-    'The key_format field shows the exact dimension order required by imf_query_dataset.',
+    'The key_format field shows the exact dimension order required by imf_query_dataset. ' +
+    'Note: codelists enumerate the code universe, not actual coverage — valid codes can still ' +
+    'return no_data if the combination has no series in this dataflow.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -42,6 +44,15 @@ export const imfGetDatabase = tool('imf_get_database', {
       .string()
       .optional()
       .describe('Dataflow version, e.g. 9.0.0. Auto-detected from the dataflow list when omitted.'),
+    codelist_filter: z
+      .string()
+      .optional()
+      .describe(
+        "Optional case-insensitive substring to search within each dimension's codelist (code ID and name). " +
+          'When set, returns all matching entries per dimension instead of the first-50 window — ' +
+          'useful for large codelists like WEO INDICATOR (145 entries). ' +
+          'Example: "CPI" or "PCPIPCH" surfaces consumer price index codes without hitting the 50-entry cap.',
+      ),
   }),
   output: z.object({
     dataflow_id: z.string().describe('Dataflow identifier, e.g. WEO, BOP, CPI.'),
@@ -75,7 +86,8 @@ export const imfGetDatabase = tool('imf_get_database', {
               )
               .describe(
                 'Valid codes for this dimension. ' +
-                  `Up to ${MAX_CODELIST_ENTRIES} entries shown; full list available via the imf://database resource.`,
+                  `Up to ${MAX_CODELIST_ENTRIES} entries shown when no codelist_filter is set; ` +
+                  'use codelist_filter to search large codelists or the imf://database resource for the full list.',
               ),
             codelist_truncated: z
               .boolean()
@@ -140,13 +152,31 @@ export const imfGetDatabase = tool('imf_get_database', {
       dimensions: structure.dimensions.length,
     });
 
+    const codelistFilterLower = input.codelist_filter?.toLowerCase().trim();
+
     const dimensions = structure.dimensions.map((dim) => {
-      const truncated = dim.codelist.length > MAX_CODELIST_ENTRIES;
+      let entries = dim.codelist;
+      let truncated: boolean;
+
+      if (codelistFilterLower) {
+        // Filter mode: return all matching entries (no cap)
+        entries = entries.filter(
+          (e) =>
+            e.id.toLowerCase().includes(codelistFilterLower) ||
+            e.name.toLowerCase().includes(codelistFilterLower),
+        );
+        truncated = false;
+      } else {
+        // Default mode: cap at MAX_CODELIST_ENTRIES
+        truncated = entries.length > MAX_CODELIST_ENTRIES;
+        entries = entries.slice(0, MAX_CODELIST_ENTRIES);
+      }
+
       return {
         id: dim.id,
         name: dim.name,
         position: dim.position,
-        codelist: dim.codelist.slice(0, MAX_CODELIST_ENTRIES),
+        codelist: entries,
         codelist_truncated: truncated,
       };
     });
@@ -182,7 +212,9 @@ export const imfGetDatabase = tool('imf_get_database', {
           lines.push(`- \`${code.id}\` — ${code.name}`);
         }
         if (dim.codelist_truncated) {
-          lines.push(`_(truncated at ${MAX_CODELIST_ENTRIES} entries)_`);
+          lines.push(
+            `_(truncated at ${MAX_CODELIST_ENTRIES} entries — use codelist_filter to search, or imf://database/{dataflow_id} for the full list)_`,
+          );
         }
       } else {
         lines.push('_(no codelist entries available)_');

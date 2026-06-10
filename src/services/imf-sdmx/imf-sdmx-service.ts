@@ -11,6 +11,7 @@ import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type {
+  AvailabilityResult,
   CodelistEntry,
   Dataflow,
   DataflowStructure,
@@ -294,6 +295,98 @@ export class ImfSdmxService {
     );
 
     return this.decodeObservations(raw, dataflowId, key, startPeriod, endPeriod);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Availability constraint (SDMX 2.1 — used for no_data enrichment)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Query the SDMX 2.1 availableconstraint endpoint for a dataflow + first-dimension code.
+   * Returns parsed availability info (series_count, per-dimension codes, time range).
+   * The 2.1 endpoint path is derived from the configured 3.0 base URL.
+   *
+   * Never throws — returns null on any failure so callers can degrade gracefully.
+   */
+  async fetchAvailabilityConstraint(
+    dataflowId: string,
+    firstDimensionCode: string,
+    ctx?: Context,
+    signal?: AbortSignal,
+  ): Promise<AvailabilityResult | null> {
+    // Derive the SDMX 2.1 base URL from the configured 3.0 URL.
+    // e.g. https://api.imf.org/external/sdmx/3.0 → https://api.imf.org/external/sdmx/2.1
+    const base21 = this.baseUrl.replace(/\/sdmx\/3\.0\/?$/, '/sdmx/2.1');
+    const key = firstDimensionCode ? `${encodeURIComponent(firstDimensionCode)}..` : '';
+    const url = `${base21}/availableconstraint/${encodeURIComponent(dataflowId)}/${key}`;
+
+    const fetchCtx: RequestContext = ctx
+      ? (ctx as unknown as RequestContext)
+      : ({ requestId: 'avail', timestamp: new Date().toISOString() } as RequestContext);
+    const effectiveSignal = signal ?? ctx?.signal;
+
+    try {
+      const response = await fetchWithTimeout(
+        url,
+        Math.min(this.timeoutMs, 10_000), // cap availability lookup at 10s
+        fetchCtx,
+        {
+          headers: { Accept: 'application/xml, text/xml' },
+          ...(effectiveSignal ? { signal: effectiveSignal } : {}),
+        },
+      );
+
+      if (!response.ok) return null;
+
+      const xml = await response.text();
+      return this.parseAvailabilityXml(xml);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Parse the SDMX 2.1 availableconstraint XML response.
+   * Extracts series_count annotation, cube-region com:KeyValue entries, and time annotations.
+   */
+  private parseAvailabilityXml(xml: string): AvailabilityResult | null {
+    // series_count annotation: <com:AnnotationTitle>N</com:AnnotationTitle> following id="series_count"
+    const seriesCountMatch =
+      /id="series_count"[^>]*>[\s\S]*?<com:AnnotationTitle>(\d+)<\/com:AnnotationTitle>/i.exec(xml);
+    const series_count = seriesCountMatch ? parseInt(seriesCountMatch[1] ?? '0', 10) : 0;
+
+    // time_period_start / time_period_end annotations
+    const tpsMatch =
+      /id="time_period_start"[^>]*>[\s\S]*?<com:AnnotationTitle>([^<]+)<\/com:AnnotationTitle>/i.exec(
+        xml,
+      );
+    const tpeMatch =
+      /id="time_period_end"[^>]*>[\s\S]*?<com:AnnotationTitle>([^<]+)<\/com:AnnotationTitle>/i.exec(
+        xml,
+      );
+    const time_period_start = tpsMatch?.[1]?.trim() ?? null;
+    const time_period_end = tpeMatch?.[1]?.trim() ?? null;
+
+    // Cube region KeyValues: <com:KeyValue id="DIMENSION"> <com:Value>CODE</com:Value> ... </com:KeyValue>
+    const available_codes: Record<string, string[]> = {};
+    for (const kvMatch of xml.matchAll(
+      /<com:KeyValue\s+id="([^"]+)"[^>]*>([\s\S]*?)<\/com:KeyValue>/gi,
+    )) {
+      const dimId = kvMatch[1] ?? '';
+      const inner = kvMatch[2] ?? '';
+      if (!dimId) continue;
+
+      const values = [...inner.matchAll(/<com:Value>([^<]+)<\/com:Value>/gi)]
+        .map((m) => m[1]?.trim() ?? '')
+        .filter(Boolean);
+
+      if (values.length > 0) {
+        // Cap per-dimension value lists to avoid bloating the error message
+        available_codes[dimId] = values.slice(0, 20);
+      }
+    }
+
+    return { series_count, available_codes, time_period_start, time_period_end };
   }
 
   // ---------------------------------------------------------------------------

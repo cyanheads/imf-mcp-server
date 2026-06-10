@@ -1,6 +1,6 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-06-05 12:23:27
+Generated on: 2026-06-10 22:32:45
 
 ```text
 imf-mcp-server/
@@ -20,6 +20,7 @@ imf-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md

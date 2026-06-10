@@ -15,6 +15,45 @@ const PREVIEW_CHARS = 100_000;
 /** IMF SDMX 3.0 data portal base URL — used to construct per-dataflow attribution links. */
 const IMF_DATA_PORTAL = 'https://data.imf.org/';
 
+/**
+ * Normalize a period string to a canonical comparable form.
+ * Supports:
+ *   Annual:      "YYYY"        → "YYYY"
+ *   Quarterly:   "YYYY-QN"     → "YYYY-QN"
+ *   Monthly:     "YYYY-MM"     → "YYYY-MM" (input format)
+ *   Monthly:     "YYYY-MNN"    → "YYYY-MM" (upstream format, e.g. "1956-M01" → "1956-01")
+ * Returns null for unrecognized formats (those observations are not filtered out).
+ */
+function normalizePeriod(period: string): string | null {
+  // Annual: "2023"
+  if (/^\d{4}$/.test(period)) return period;
+  // Quarterly: "2023-Q1"
+  if (/^\d{4}-Q\d$/.test(period)) return period;
+  // Monthly YYYY-MM (input format)
+  if (/^\d{4}-\d{2}$/.test(period)) return period;
+  // Monthly YYYY-MNN (upstream format, e.g. "1956-M01", "2023-M12")
+  const mMatch = /^(\d{4})-M(\d{1,2})$/.exec(period);
+  if (mMatch) {
+    const [, year, month] = mMatch;
+    return `${year}-${month?.padStart(2, '0')}`;
+  }
+  return null;
+}
+
+/** Return true if observation period falls within [start, end] (both inclusive, either optional). */
+function periodInRange(
+  timePeriod: string,
+  startNorm: string | null | undefined,
+  endNorm: string | null | undefined,
+): boolean {
+  if (!startNorm && !endNorm) return true;
+  const norm = normalizePeriod(timePeriod);
+  if (!norm) return true; // unrecognized format — don't filter
+  if (startNorm && norm < startNorm) return false;
+  if (endNorm && norm > endNorm) return false;
+  return true;
+}
+
 export const imfQueryDataset = tool('imf_query_dataset', {
   description:
     'Query an IMF SDMX dataflow by dimension key over a time range. ' +
@@ -23,6 +62,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     'Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE). ' +
     'Key format: dot-separated codes in DSD keyPosition order (e.g. USA.NGDP_RPCH.A for WEO). ' +
     'Use + to specify multiple codes per position (e.g. USA+GBR.NGDP_RPCH.A). ' +
+    'Codelists from imf_get_database enumerate the code universe, not actual coverage — ' +
+    'valid codes can still return no_data if the combination has no series. ' +
     'Large analytical result sets (multi-country, long time range) spill to DataCanvas; ' +
     'imf_dataframe_query provides SQL analysis of spilled results.',
   annotations: {
@@ -56,18 +97,16 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .string()
       .optional()
       .describe(
-        'Requested start of time range. Format matches the dataflow frequency: ' +
+        'Start of time range (inclusive). Format matches the dataflow frequency: ' +
           'YYYY (annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly). ' +
-          'Note: the IMF SDMX 3.0 compact JSON endpoint returns the full available series ' +
-          'regardless of this parameter — observations outside the requested range may still appear.',
+          'Observations before this period are excluded from the result.',
       ),
     end_period: z
       .string()
       .optional()
       .describe(
-        'Requested end of time range. Same format as start_period. ' +
-          'See start_period note: the API returns the full series; this parameter is passed through ' +
-          'but may not filter observations.',
+        'End of time range (inclusive). Same format as start_period. ' +
+          'Observations after this period are excluded from the result.',
       ),
     canvas_id: z
       .string()
@@ -98,7 +137,13 @@ export const imfQueryDataset = tool('imf_query_dataset', {
                 'Dot-separated dimension codes identifying this series, e.g. USA.NGDP_RPCH.A. ' +
                   'Matches the single-country equivalent of the query key — useful when a query covers multiple countries.',
               ),
-            time_period: z.string().describe('Time label, e.g. 2023 or 2023-Q1 or 2023-01.'),
+            time_period: z
+              .string()
+              .describe(
+                'Time label as emitted by the upstream API. Annual: YYYY (e.g. 2023). ' +
+                  'Quarterly: YYYY-QN (e.g. 2023-Q1). Monthly: YYYY-MNN (e.g. 2023-M01, not YYYY-MM). ' +
+                  'start_period/end_period accept both YYYY-MM and YYYY-MNN for monthly comparisons.',
+              ),
             value: z.number().nullable().describe('Observation value, null when missing.'),
             status: z
               .string()
@@ -154,9 +199,9 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     {
       reason: 'no_data',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Key is structurally valid but returns an empty dataset — typically an unknown dimension code or no data for the time range',
+      when: 'Key is structurally valid but returns an empty dataset — either the code combination has no series in this dataflow, or the time range is outside available coverage',
       recovery:
-        'Verify dimension codes with imf_get_database; check that start_period/end_period overlap available data.',
+        'Check the availability context in the error — if series_count is 0 the code has no coverage; if series_count > 0 the combination is wrong and available_codes lists what does have data.',
     },
     {
       reason: 'key_dimension_mismatch',
@@ -239,30 +284,83 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       );
     }
 
-    // Detect empty result
-    if (queryResult.observations.length === 0) {
-      throw ctx.fail(
-        'no_data',
-        `No data returned for key '${input.key}' in dataflow '${input.dataflow_id}'`,
-        {
-          key: input.key,
-          dataflowId: input.dataflow_id,
-          ...ctx.recoveryFor('no_data'),
-        },
-      );
+    // Drop null-value padding rows (value=null AND status=null).
+    // Calendar-padded series carry these for periods before data starts; they add no information.
+    // Keep rows where status is non-null even if value is null — those are official missing-value markers.
+    const nonPaddingObservations = queryResult.observations.filter(
+      (obs) => obs.value !== null || obs.status !== null,
+    );
+
+    // Apply period filter server-side before canvas spill.
+    const startNorm = input.start_period ? normalizePeriod(input.start_period) : null;
+    const endNorm = input.end_period ? normalizePeriod(input.end_period) : null;
+    const filteredObservations =
+      startNorm || endNorm
+        ? nonPaddingObservations.filter((obs) => periodInRange(obs.time_period, startNorm, endNorm))
+        : nonPaddingObservations;
+
+    // Detect empty result (after null-padding removal and period filtering)
+    if (filteredObservations.length === 0) {
+      // Enrich the error with availability info so the caller can distinguish
+      // "code not covered" from "valid code, wrong combination".
+      // Uses the first dimension code from the key (e.g. "TUR" from "TUR.MFS135..M").
+      const firstCode = input.key.split('.')[0] ?? '';
+      const availability = await svc
+        .fetchAvailabilityConstraint(input.dataflow_id, firstCode, ctx, ctx.signal)
+        .catch(() => null);
+
+      let noDataMsg: string;
+      let recoveryHint: string | undefined;
+
+      if (availability) {
+        if (availability.series_count === 0) {
+          noDataMsg =
+            `'${firstCode}' has 0 series in '${input.dataflow_id}' — ` +
+            `this code has no coverage in this dataflow. ` +
+            `Coverage is narrower than the codelist; check availability rather than the codelist to pick codes.`;
+          recoveryHint =
+            `'${firstCode}' is not covered in '${input.dataflow_id}'. ` +
+            `Try a different code — the codelist may include codes with no actual data.`;
+        } else {
+          const dimLines = Object.entries(availability.available_codes)
+            .map(([dim, codes]) => `${dim}: ${codes.join(', ')}`)
+            .join('; ');
+          const timeLine =
+            availability.time_period_start || availability.time_period_end
+              ? ` Available time range: ${availability.time_period_start ?? '?'} – ${availability.time_period_end ?? '?'}.`
+              : '';
+          noDataMsg =
+            `No data for key '${input.key}' in '${input.dataflow_id}' ` +
+            `(${availability.series_count} series exist for '${firstCode}', but this combination has none). ` +
+            `Available codes per dimension: ${dimLines}.${timeLine}`;
+          recoveryHint =
+            `The combination is wrong — '${firstCode}' has ${availability.series_count} series but not for this key. ` +
+            `Available codes: ${dimLines}.${timeLine}`;
+        }
+      } else {
+        noDataMsg = `No data returned for key '${input.key}' in dataflow '${input.dataflow_id}'`;
+      }
+
+      throw ctx.fail('no_data', noDataMsg, {
+        key: input.key,
+        dataflowId: input.dataflow_id,
+        ...(availability ? { availability } : {}),
+        ...ctx.recoveryFor('no_data'),
+        ...(recoveryHint ? { recovery: { hint: recoveryHint } } : {}),
+      });
     }
 
     ctx.log.info('Data query completed', {
       dataflowId: input.dataflow_id,
       key: input.key,
-      observations: queryResult.observations.length,
+      observations: filteredObservations.length,
     });
 
     // Canvas spill path
     const canvas = getCanvas();
     if (canvas) {
       const instance = await canvas.acquire(input.canvas_id, ctx);
-      const rows = queryResult.observations.map((obs) => ({
+      const rows = filteredObservations.map((obs) => ({
         dataflow_id: input.dataflow_id,
         series_key: obs.series_key,
         time_period: obs.time_period,
@@ -308,9 +406,9 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       key: input.key,
       ...(input.start_period ? { start_period: input.start_period } : {}),
       ...(input.end_period ? { end_period: input.end_period } : {}),
-      observations: queryResult.observations,
+      observations: filteredObservations,
       series_attributes: queryResult.seriesAttributes,
-      observation_count: queryResult.observations.length,
+      observation_count: filteredObservations.length,
       truncated: false,
       source: `Source: International Monetary Fund, ${dataflow.name}, ${IMF_DATA_PORTAL}`,
     };
@@ -322,9 +420,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
 
     if (result.start_period || result.end_period) {
       const range = [result.start_period, result.end_period].filter(Boolean).join(' – ');
-      lines.push(
-        `**Requested period:** ${range} _(note: the IMF API returns the full available series; observations may extend beyond this range)_`,
-      );
+      lines.push(`**Period:** ${range}`);
     }
 
     const { unit, scale, decimals } = result.series_attributes;

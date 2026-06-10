@@ -196,4 +196,125 @@ describe('imfGetDatabase', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('truncated');
   });
+
+  // -------------------------------------------------------------------------
+  // #8: codelist_filter
+  // -------------------------------------------------------------------------
+
+  it('codelist_filter filters by code ID substring (case-insensitive)', async () => {
+    const largeCodelist = Array.from({ length: 60 }, (_, i) => ({
+      id: `IND_${String(i).padStart(3, '0')}`,
+      name: `Indicator ${i}`,
+    }));
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dimensions: [
+        {
+          ...MOCK_STRUCTURE.dimensions[0],
+          codelist: largeCodelist,
+        },
+        ...MOCK_STRUCTURE.dimensions.slice(1),
+      ],
+    });
+
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: 'ind_001' });
+    const result = await imfGetDatabase.handler(input, ctx);
+
+    const countryDim = result.dimensions[0];
+    expect(countryDim.codelist).toHaveLength(1);
+    expect(countryDim.codelist[0].id).toBe('IND_001');
+    // filter mode — not truncated
+    expect(countryDim.codelist_truncated).toBe(false);
+  });
+
+  it('codelist_filter filters by name substring (case-insensitive)', async () => {
+    const codelistWithDescriptions = [
+      { id: 'PCPIPCH', name: 'Inflation, average consumer prices' },
+      { id: 'NGDP_RPCH', name: 'GDP, Constant prices, Percent change' },
+      { id: 'BCA', name: 'Current account balance' },
+    ];
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dimensions: [
+        { id: 'INDICATOR', name: 'Indicator', position: 0, codelist: codelistWithDescriptions },
+        ...MOCK_STRUCTURE.dimensions.slice(1),
+      ],
+    });
+
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: 'inflation' });
+    const result = await imfGetDatabase.handler(input, ctx);
+
+    const dim = result.dimensions[0];
+    expect(dim.codelist).toHaveLength(1);
+    expect(dim.codelist[0].id).toBe('PCPIPCH');
+  });
+
+  it('codelist_filter returns all matches — not capped at 50', async () => {
+    // 80 entries that all match "match"
+    const largeCodelist = Array.from({ length: 80 }, (_, i) => ({
+      id: `MATCH_${i}`,
+      name: `Match entry ${i}`,
+    }));
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dimensions: [
+        { id: 'INDICATOR', name: 'Indicator', position: 0, codelist: largeCodelist },
+        ...MOCK_STRUCTURE.dimensions.slice(1),
+      ],
+    });
+
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: 'match' });
+    const result = await imfGetDatabase.handler(input, ctx);
+
+    expect(result.dimensions[0].codelist).toHaveLength(80);
+    expect(result.dimensions[0].codelist_truncated).toBe(false);
+  });
+
+  it('without codelist_filter: behavior unchanged (first 50, truncated flag)', async () => {
+    const largeCodelist = Array.from({ length: 60 }, (_, i) => ({
+      id: `C${i}`,
+      name: `Country ${i}`,
+    }));
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dimensions: [
+        { id: 'COUNTRY', name: 'Country', position: 0, codelist: largeCodelist },
+        ...MOCK_STRUCTURE.dimensions.slice(1),
+      ],
+    });
+
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO' });
+    const result = await imfGetDatabase.handler(input, ctx);
+
+    expect(result.dimensions[0].codelist).toHaveLength(50);
+    expect(result.dimensions[0].codelist_truncated).toBe(true);
+  });
+
+  it('truncation notice in format output names the escape hatch', () => {
+    const output = {
+      dataflow_id: 'WEO',
+      agency_id: 'IMF.RES',
+      version: '9.0.0',
+      name: 'World Economic Outlook',
+      key_format: 'COUNTRY.INDICATOR.FREQUENCY',
+      dimensions: [
+        {
+          id: 'INDICATOR',
+          name: 'Indicator',
+          position: 0,
+          codelist: [{ id: 'NGDP_RPCH', name: 'GDP growth' }],
+          codelist_truncated: true,
+        },
+      ],
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    };
+    const blocks = imfGetDatabase.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('codelist_filter');
+    expect(text).toContain('imf://database');
+  });
 });
