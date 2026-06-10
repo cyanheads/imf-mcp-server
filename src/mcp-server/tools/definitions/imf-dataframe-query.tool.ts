@@ -50,8 +50,7 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
       reason: 'canvas_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'canvas_id does not match any registered DataCanvas table (expired, wrong session, or canvas disabled)',
-      recovery:
-        'Re-run imf_query_dataset to obtain a fresh canvas_id; ensure CANVAS_PROVIDER_TYPE=duckdb is set.',
+      recovery: 'Re-run imf_query_dataset to obtain a fresh canvas_id.',
     },
     {
       reason: 'invalid_sql',

@@ -165,4 +165,36 @@ describe('imfListDatabases', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).not.toContain('No dataflows matched');
   });
+
+  // -------------------------------------------------------------------------
+  // #9: filter matches descriptions (not just name/ID)
+  // -------------------------------------------------------------------------
+
+  it('returns a description-only match when filter matches description but not name or ID', async () => {
+    // APDREO has a description about "regional economic outlook" but the ID/name don't match "regional"
+    const dataflows = [
+      {
+        id: 'APDREO',
+        agencyId: 'IMF.STA',
+        version: '1.0.0',
+        name: 'APD Regional Economic Outlook',
+        description: 'Asia Pacific regional economic outlook database',
+      },
+      {
+        id: 'WEO',
+        agencyId: 'IMF.RES',
+        version: '9.0.0',
+        name: 'World Economic Outlook',
+      },
+    ];
+    mockSvc.fetchDataflows.mockResolvedValue(dataflows);
+
+    const ctx = createMockContext({ tenantId: 'test' });
+    // "asia pacific" matches only via description on APDREO (and not WEO)
+    const input = imfListDatabases.input.parse({ filter: 'asia pacific' });
+    const result = await imfListDatabases.handler(input, ctx);
+
+    expect(result.total_count).toBe(1);
+    expect(result.dataflows[0].id).toBe('APDREO');
+  });
 });

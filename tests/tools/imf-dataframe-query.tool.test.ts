@@ -138,4 +138,16 @@ describe('imfDataframeQuery', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('0');
   });
+
+  // -------------------------------------------------------------------------
+  // #9: canvas_not_found recovery text
+  // -------------------------------------------------------------------------
+
+  it('canvas_not_found recovery tells caller to re-run imf_query_dataset', () => {
+    // Verify the error contract recovery no longer includes the provider hint
+    const recovery =
+      imfDataframeQuery.errors?.find((e) => e.reason === 'canvas_not_found')?.recovery ?? '';
+    expect(recovery).toContain('imf_query_dataset');
+    expect(recovery).not.toContain('CANVAS_PROVIDER_TYPE');
+  });
 });

@@ -99,4 +99,21 @@ describe('imfDataframeDescribe', () => {
     expect(text).toContain('VARCHAR');
     expect(text).toContain('DOUBLE');
   });
+
+  // -------------------------------------------------------------------------
+  // #9: canvas_not_found recovery text
+  // -------------------------------------------------------------------------
+
+  it('canvas_not_found recovery tells caller to re-run imf_query_dataset', async () => {
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue(undefined);
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeDescribe.errors });
+    const input = imfDataframeDescribe.input.parse({ canvas_id: 'canvas-abc' });
+
+    await imfDataframeDescribe.handler(input, ctx).catch(() => {});
+    // Recovery should mention re-running imf_query_dataset, not CANVAS_PROVIDER_TYPE
+    const recovery =
+      imfDataframeDescribe.errors?.find((e) => e.reason === 'canvas_not_found')?.recovery ?? '';
+    expect(recovery).toContain('imf_query_dataset');
+    expect(recovery).not.toContain('CANVAS_PROVIDER_TYPE');
+  });
 });

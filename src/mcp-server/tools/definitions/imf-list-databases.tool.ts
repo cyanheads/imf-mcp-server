@@ -23,7 +23,7 @@ export const imfListDatabases = tool('imf_list_databases', {
       .string()
       .optional()
       .describe(
-        'Optional name or ID substring to filter results. Case-insensitive. ' +
+        'Optional name, ID, or description substring to filter results. Case-insensitive. ' +
           'Example: "exchange rate" returns ER and related dataflows.',
       ),
     include_vintages: z
