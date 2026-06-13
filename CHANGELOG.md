@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-06-12
+
+Adopt @cyanheads/mcp-ts-core ^0.10.6: enrichment block for imf_list_databases notice, denySystemCatalogs on canvas queries, explicit name/title identity; MCPB bundle cleaner and packaging guards
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-06-10
 
 imf_query_dataset: server-side period filtering, null-padding removal, no_data availability enrichment; imf_get_database: codelist_filter param; description fixes
