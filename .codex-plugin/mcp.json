@@ -1,7 +1,7 @@
 {
   "imf-mcp-server": {
     "command": "npx",
-    "args": ["-y", "imf-mcp-server"],
+    "args": ["-y", "@cyanheads/imf-mcp-server"],
     "env": {
       "MCP_TRANSPORT_TYPE": "stdio"
     }
