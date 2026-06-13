@@ -205,7 +205,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     },
     {
       reason: 'key_dimension_mismatch',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: "Number of dot-separated segments in key does not match the dataflow's DSD dimension count",
       recovery:
         'Call imf_get_database to get the correct key_format for this dataflow, then reconstruct the key.',

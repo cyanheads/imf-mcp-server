@@ -13,6 +13,8 @@ import { setCanvas } from './services/canvas/canvas-accessor.js';
 import { initImfSdmxService } from './services/imf-sdmx/imf-sdmx-service.js';
 
 await createApp({
+  name: 'imf-mcp-server',
+  title: 'imf-mcp-server',
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,

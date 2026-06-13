@@ -3,7 +3,7 @@
  * @module tests/tools/imf-list-databases.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/imf-sdmx/imf-sdmx-service.js', () => ({
@@ -84,30 +84,31 @@ describe('imfListDatabases', () => {
     expect(result.dataflows).toHaveLength(0);
   });
 
-  it('populates notice when filter matches nothing', async () => {
+  it('enriches notice when filter matches nothing', async () => {
     const ctx = createMockContext({ tenantId: 'test' });
     const input = imfListDatabases.input.parse({ filter: 'xyznonexistent' });
-    const result = await imfListDatabases.handler(input, ctx);
+    await imfListDatabases.handler(input, ctx);
 
-    expect(result.notice).toBeDefined();
-    expect(result.notice).toContain('xyznonexistent');
-    expect(result.notice).toContain('non-vintage');
+    const notice = getEnrichment(ctx).notice as string | undefined;
+    expect(notice).toBeDefined();
+    expect(notice).toContain('xyznonexistent');
+    expect(notice).toContain('non-vintage');
   });
 
-  it('does not populate notice when filter matches results', async () => {
+  it('does not enrich notice when filter matches results', async () => {
     const ctx = createMockContext({ tenantId: 'test' });
     const input = imfListDatabases.input.parse({ filter: 'balance' });
-    const result = await imfListDatabases.handler(input, ctx);
+    await imfListDatabases.handler(input, ctx);
 
-    expect(result.notice).toBeUndefined();
+    expect(getEnrichment(ctx).notice).toBeUndefined();
   });
 
-  it('does not populate notice when no filter is provided', async () => {
+  it('does not enrich notice when no filter is provided', async () => {
     const ctx = createMockContext({ tenantId: 'test' });
     const input = imfListDatabases.input.parse({});
-    const result = await imfListDatabases.handler(input, ctx);
+    await imfListDatabases.handler(input, ctx);
 
-    expect(result.notice).toBeUndefined();
+    expect(getEnrichment(ctx).notice).toBeUndefined();
   });
 
   it('formats output with agency and name info', () => {
@@ -143,23 +144,12 @@ describe('imfListDatabases', () => {
     expect(text).toContain('Price indices for 90+ countries');
   });
 
-  it('renders notice in format output when present', () => {
+  it('does not render notice in format output (notice is enrichment)', () => {
+    // notice lives in the enrichment block — the framework mirrors it into the
+    // content[] trailer, so format() must not render it from the domain payload.
     const output = {
       dataflows: [],
       total_count: 0,
-      notice: 'No dataflows matched filter "xyz". Try a broader term.',
-    };
-    const blocks = imfListDatabases.format!(output);
-    const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('No dataflows matched filter "xyz"');
-  });
-
-  it('does not render notice line when absent', () => {
-    const output = {
-      dataflows: [
-        { id: 'WEO', agency_id: 'IMF.RES', version: '9.0.0', name: 'World Economic Outlook' },
-      ],
-      total_count: 1,
     };
     const blocks = imfListDatabases.format!(output);
     const text = (blocks[0] as { text: string }).text;

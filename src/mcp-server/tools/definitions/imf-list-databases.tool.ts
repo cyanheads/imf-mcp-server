@@ -54,13 +54,15 @@ export const imfListDatabases = tool('imf_list_databases', {
         'Matching dataflows; pass the id to imf_get_database to resolve dimension codelists.',
       ),
     total_count: z.number().describe('Total number of matching dataflows returned.'),
+  }),
+  enrichment: {
     notice: z
       .string()
       .optional()
       .describe(
         'Populated when the filter matches nothing — explains why and suggests next steps.',
       ),
-  }),
+  },
 
   async handler(input, ctx) {
     const svc = getImfSdmxService();
@@ -95,15 +97,15 @@ export const imfListDatabases = tool('imf_list_databases', {
       ...(df.description ? { description: df.description } : {}),
     }));
 
-    const notice =
-      filterLower && dataflows.length === 0
-        ? `No dataflows matched filter "${input.filter}". Try a broader term, or omit filter to browse all ${totalBeforeFilter} non-vintage dataflows. Set include_vintages=true to include historical snapshot entries.`
-        : undefined;
+    if (filterLower && dataflows.length === 0) {
+      ctx.enrich.notice(
+        `No dataflows matched filter "${input.filter}". Try a broader term, or omit filter to browse all ${totalBeforeFilter} non-vintage dataflows. Set include_vintages=true to include historical snapshot entries.`,
+      );
+    }
 
     return {
       dataflows: mappedDataflows,
       total_count: dataflows.length,
-      ...(notice ? { notice } : {}),
     };
   },
 
@@ -111,9 +113,6 @@ export const imfListDatabases = tool('imf_list_databases', {
     const lines: string[] = [
       `**${result.total_count} dataflow${result.total_count === 1 ? '' : 's'}**\n`,
     ];
-    if (result.notice) {
-      lines.push(`> ${result.notice}\n`);
-    }
     for (const df of result.dataflows) {
       lines.push(`### ${df.id}`);
       lines.push(`**Agency:** ${df.agency_id} | **Version:** ${df.version}`);

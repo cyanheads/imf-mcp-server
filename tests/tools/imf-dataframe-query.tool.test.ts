@@ -46,7 +46,7 @@ describe('imfDataframeQuery', () => {
     });
 
     await expect(imfDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'invalid_sql' },
     });
   });
@@ -59,7 +59,7 @@ describe('imfDataframeQuery', () => {
     });
 
     await expect(imfDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'invalid_sql' },
     });
   });

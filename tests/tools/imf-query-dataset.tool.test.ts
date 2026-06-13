@@ -140,7 +140,7 @@ describe('imfQueryDataset', () => {
     const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.NGDP_RPCH' });
 
     await expect(imfQueryDataset.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'key_dimension_mismatch' },
     });
   });

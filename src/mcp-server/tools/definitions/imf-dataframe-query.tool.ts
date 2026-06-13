@@ -54,7 +54,7 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
     },
     {
       reason: 'invalid_sql',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'sql does not start with SELECT — DML and DDL statements are not permitted',
       recovery:
         'Rewrite the statement as a SELECT query referencing tables from imf_dataframe_describe.',
@@ -91,7 +91,10 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
       });
     }
 
-    const result = await instance.query(input.sql, { signal: ctx.signal });
+    const result = await instance.query(input.sql, {
+      signal: ctx.signal,
+      denySystemCatalogs: true,
+    });
     ctx.log.info('Canvas query executed', {
       canvasId: input.canvas_id,
       rowCount: result.rowCount,
