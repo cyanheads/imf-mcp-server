@@ -1,5 +1,5 @@
 {
-  "imf-mcp-server": {
+  "@cyanheads/imf-mcp-server": {
     "command": "npx",
     "args": ["-y", "@cyanheads/imf-mcp-server"],
     "env": {
