@@ -1,25 +1,25 @@
 {
-  "name": "imf-mcp-server",
+  "name": "@cyanheads/imf-mcp-server",
   "version": "0.2.1",
-  "description": "",
+  "description": "Query IMF SDMX 3.0 macroeconomic data — 193 dataflows, 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "",
-    "email": "",
-    "url": ""
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
-  "homepage": "",
-  "repository": "",
+  "homepage": "https://github.com/cyanheads/imf-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/imf-mcp-server.git",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "imf", "sdmx", "macroeconomics", "world-economic-outlook", "weo", "balance-of-payments", "exchange-rates", "economic-data", "international-monetary-fund", "typescript", "bun", "stdio", "streamable-http", "ai-agent"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
     "displayName": "imf-mcp-server",
-    "shortDescription": "",
-    "longDescription": "",
-    "developerName": "",
-    "category": "",
+    "shortDescription": "Query IMF SDMX 3.0 macroeconomic data — 193 dataflows, 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP.",
+    "longDescription": "Query the IMF's SDMX 3.0 macroeconomic database. Supports 193 dataflows across 190 countries — WEO projections, balance of payments, CPI, exchange rates, and national accounts — with SQL over large result sets. Deployable as stdio or streamable HTTP.",
+    "developerName": "cyanheads",
+    "category": "finance",
     "capabilities": ["Read"],
-    "websiteURL": "",
+    "websiteURL": "https://github.com/cyanheads/imf-mcp-server",
     "defaultPrompt": []
   }
 }
