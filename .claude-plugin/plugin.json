@@ -1,5 +1,5 @@
 {
-  "name": "@cyanheads/imf-mcp-server",
+  "name": "imf-mcp-server",
   "version": "0.2.1",
   "description": "Query IMF SDMX 3.0 macroeconomic data — 193 dataflows, 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP.",
   "author": {
@@ -9,7 +9,7 @@
   "repository": "git+https://github.com/cyanheads/imf-mcp-server.git",
   "license": "Apache-2.0",
   "mcpServers": {
-    "@cyanheads/imf-mcp-server": {
+    "imf-mcp-server": {
       "command": "npx",
       "args": [
         "-y",
