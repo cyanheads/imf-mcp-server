@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-06-20
+
+Adopt @cyanheads/mcp-ts-core ^0.10.9: DuckdbProvider.describe() binder fix, ctx.content media collector, sharper canvas SQL-gate classification; new check-dependency-specifiers devcheck step and plugin-manifest packaging checks
+
 ## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-06-12
 
 Adopt @cyanheads/mcp-ts-core ^0.10.6: enrichment block for imf_list_databases notice, denySystemCatalogs on canvas queries, explicit name/title identity; MCPB bundle cleaner and packaging guards

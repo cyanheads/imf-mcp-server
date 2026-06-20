@@ -1,6 +1,6 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-06-13 03:43:24
+Generated on: 2026-06-20 11:47:14
 
 ```text
 imf-mcp-server/
@@ -28,6 +28,7 @@ imf-mcp-server/
 ├── scripts/
 │   ├── build-changelog.ts
 │   ├── build.ts
+│   ├── check-dependency-specifiers.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
 │   ├── check-skill-versions.ts
