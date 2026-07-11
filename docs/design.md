@@ -6,7 +6,7 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `imf_list_databases` | List all IMF SDMX dataflows available on the portal (193 total). Returns id, agencyID, version, name, description. Entry point — every query requires a dataflow id. | `filter` (optional name substring), `include_vintages` (bool, default false) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
+| `imf_list_databases` | List all IMF SDMX dataflows available on the portal. Returns id, agencyID, version, name, description. Entry point — every query requires a dataflow id. | `filter` (optional name substring), `include_vintages` (bool, default false) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_get_database` | Fetch a dataflow's dimension list plus the complete codelist for each dimension. Resolves human terms to SDMX codes ("United States" → USA, "real GDP growth" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, unit, scale, and status attributes. Large analytical result sets spill to DataCanvas for SQL — returns `canvas_id` + `table_name`. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call. Shows table name, row count, and column schema. | `canvas_id` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
@@ -107,7 +107,7 @@ None — this is a pure data server; no reusable message templates warranted.
 
 ## Overview
 
-Global macroeconomic and financial statistics from the International Monetary Fund, accessed via the IMF's SDMX 3.0 portal (`api.imf.org`). Covers 193 dataflows including WEO projections, balance of payments, exchange rates, price indices, international liquidity, government finance, and national accounts for ~190 member countries.
+Global macroeconomic and financial statistics from the International Monetary Fund, accessed via the IMF's SDMX 3.0 portal (`api.imf.org`). Covers hundreds of dataflows including WEO projections, balance of payments, exchange rates, price indices, international liquidity, government finance, and national accounts for ~190 member countries.
 
 The server follows the **discover → describe → query** workflow: `imf_list_databases` to find a dataflow id, `imf_get_database` to resolve dimension codes, `imf_query_dataset` to fetch observations. Large analytical pulls (multi-country time series) spill to a DataCanvas table for SQL via `imf_dataframe_query`.
 
@@ -119,7 +119,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 
 - Keyless access — no API key or registration required; all data via public `api.imf.org` endpoints
 - SDMX 3.0 JSON format (`application/vnd.sdmx.data+json;version=2.0` or default `application/json`)
-- Discovery: `GET /external/sdmx/3.0/structure/dataflow` → 193 dataflows with id, agencyID, version, name
+- Discovery: `GET /external/sdmx/3.0/structure/dataflow` → all dataflows with id, agencyID, version, name, and the DSD `structure` URN
 - Structure: `GET /external/sdmx/3.0/structure/datastructure/{agency}/{dsd_id}/{version}?references=all` → dimensions + all codelists
 - Data: `GET /external/sdmx/3.0/data/dataflow/{agency}/{flow}/{version}/{key}?startPeriod=&endPeriod=` → SDMX-JSON observations
 - Key format: dot-separated dimension codes in DSD order (e.g. `USA.NGDP_RPCH.A` for WEO; `USA.CPI._T.PCH.A` for CPI)
@@ -154,7 +154,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 
 1. **Config and server setup** — `src/config/server-config.ts` with `IMF_BASE_URL`, `IMF_REQUEST_TIMEOUT_MS`; canvas accessor wired in `setup()`
 2. **ImfSdmxService** — `fetchDataflows()`, `fetchDataStructure()`, `fetchData()` with retry, timeout, SDMX-JSON parse; dimension key builder; observation decoder (position index → time label)
-3. **`imf_list_databases`** — list + name-filter; inline preview (all 193 fit)
+3. **`imf_list_databases`** — list + name-filter; inline preview (the full list fits)
 4. **`imf_get_database`** — DSD fetch with `?references=all`; dimensions + codelists; local name→code resolution
 5. **`imf_query_dataset`** — key validation, data fetch, observation decode, spillover for large results
 6. **`imf_dataframe_describe` + `imf_dataframe_query`** — canvas query pair (no-op when canvas disabled)
@@ -168,7 +168,7 @@ Each step is independently testable.
 
 | Noun | Operations | Notes |
 |:-----|:-----------|:------|
-| Dataflow | list (all 193), get (structure + codelists) | Discovery surface |
+| Dataflow | list (full catalog), get (structure + codelists) | Discovery surface |
 | Dimension | list per dataflow, resolve code by name | Part of `imf_get_database` |
 | Codelist | fetch per DSD dimension | Returned inline in `imf_get_database` |
 | Observation | fetch by dimension key + time range | `imf_query_dataset` |
@@ -204,7 +204,7 @@ Steps 1–2 are cache candidates (DSD rarely changes; dataflow list changes when
 | `https://sdmxcentral.imf.org/ws/public/sdmxapi/rest/` | **Partially working** — structure endpoints return XML, but data endpoints return "No Results Found" | Structures-only, not a data source |
 | `https://api.imf.org/external/sdmx/3.0/` | **Working, keyless** — all tested endpoints return 200 without auth | The current canonical endpoint |
 
-The `api.imf.org` portal does not require registration for data queries. All 193 dataflows, datastructures with codelists, and observations are accessible without credentials.
+The `api.imf.org` portal does not require registration for data queries. All dataflows, datastructures with codelists, and observations are accessible without credentials.
 
 **SDMX surface on `api.imf.org`:** The new portal does not carry the legacy `IFS` (International Financial Statistics) monolithic database. IFS has been decomposed into topic-specific dataflows: `CPI` (Consumer Price Index), `ER` (Exchange Rates), `IL` (International Liquidity / reserves), `MFS_*` (Monetary and Financial Statistics components), `IIP` (International Investment Position). This is a richer structure — each sub-database has its own DSD with tailored dimensions — but agents need `imf_list_databases` + `imf_get_database` to navigate it, since the legacy "IFS → indicator code" mental model no longer applies.
 
@@ -245,7 +245,7 @@ The portal exposes 70+ `_VINTAGE` dataflows (e.g. `WEO_2025_OCT_VINTAGE`, `CPI_2
 
 ### 8. Caching strategy
 
-- Dataflow list (193 flows): cache 1 hour — changes only when IMF publishes new releases
+- Dataflow list: cache 1 hour — changes only when IMF publishes new releases
 - DSD + codelists: cache 24 hours per `(agency, dsd_id, version)` — rarely changes within a version
 - Data observations: no cache — always live
 

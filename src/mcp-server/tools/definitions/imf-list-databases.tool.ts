@@ -10,9 +10,10 @@ const VINTAGE_PATTERN = /VINTAGE/i;
 
 export const imfListDatabases = tool('imf_list_databases', {
   description:
-    'List all IMF SDMX dataflows available on the portal (193 total). ' +
+    'List IMF SDMX dataflows available on the portal. ' +
     'Entry point for every query: imf_get_database and imf_query_dataset both require a dataflow id obtained here. ' +
-    'Vintage (historical snapshot) dataflows such as WEO_2025_OCT_VINTAGE are excluded by default; set include_vintages=true to include them.',
+    'Vintage (historical snapshot) dataflows such as WEO_2025_OCT_VINTAGE are excluded by default; set include_vintages=true to include them. ' +
+    'The returned total_count reflects the current live catalog size.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
