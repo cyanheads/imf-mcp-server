@@ -1,12 +1,12 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cyanheads/imf-mcp-server",
-  "description": "Query IMF SDMX 3.0 macroeconomic data — 193 dataflows, WEO, BOP, CPI, exchange rates, 190 countries.",
+  "description": "Query IMF SDMX 3.0 macroeconomic dataflows — WEO, BOP, CPI, exchange rates, 190 countries.",
   "repository": {
     "url": "https://github.com/cyanheads/imf-mcp-server",
     "source": "github"
   },
-  "version": "0.2.2",
+  "version": "0.2.3",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/imf-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "packageArguments": [
         {
           "type": "positional",
@@ -48,7 +48,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/imf-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "packageArguments": [
         {
           "type": "positional",

@@ -1,6 +1,6 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-06-20 11:47:14
+Generated on: 2026-07-11 16:56:30
 
 ```text
 imf-mcp-server/
@@ -11,10 +11,12 @@ imf-mcp-server/
 │   ├── mcp.json
 │   └── plugin.json
 ├── .github/
-│   └── ISSUE_TEMPLATE/
-│       ├── bug_report.yml
-│       ├── config.yml
-│       └── feature_request.yml
+│   ├── ISSUE_TEMPLATE/
+│   │   ├── bug_report.yml
+│   │   ├── config.yml
+│   │   └── feature_request.yml
+│   ├── FUNDING.yml
+│   └── SECURITY.md
 ├── .vscode/
 │   ├── extensions.json
 │   └── settings.json
@@ -156,6 +158,9 @@ imf-mcp-server/
 │   ├── prompts/
 │   ├── resources/
 │   │   └── imf-database.resource.test.ts
+│   ├── services/
+│   │   └── imf-sdmx/
+│   │       └── imf-sdmx-service.test.ts
 │   └── tools/
 │       ├── imf-dataframe-describe.tool.test.ts
 │       ├── imf-dataframe-query.tool.test.ts
@@ -164,6 +169,7 @@ imf-mcp-server/
 │       └── imf-query-dataset.tool.test.ts
 ├── .dockerignore
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
 ├── AGENTS.md
@@ -171,6 +177,7 @@ imf-mcp-server/
 ├── bun.lock
 ├── bunfig.toml
 ├── CHANGELOG.md
+├── CITATION.cff
 ├── CLAUDE.md
 ├── devcheck.config.json
 ├── Dockerfile

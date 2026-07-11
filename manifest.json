@@ -1,8 +1,8 @@
 {
   "manifest_version": "0.3",
   "name": "imf-mcp-server",
-  "version": "0.2.2",
-  "description": "Query IMF SDMX 3.0 macroeconomic data — 193 dataflows, WEO, BOP, CPI, exchange rates, 190 countries.",
+  "version": "0.2.3",
+  "description": "Query IMF SDMX 3.0 macroeconomic dataflows — WEO, BOP, CPI, exchange rates, 190 countries.",
   "author": { "name": "cyanheads" },
   "repository": {
     "type": "git",

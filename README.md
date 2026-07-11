@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/imf-mcp-server</h1>
-  <p><b>Query IMF SDMX 3.0 macroeconomic data — 193 dataflows, 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP.</b>
+  <p><b>Query IMF SDMX 3.0 macroeconomic data — hundreds of dataflows across 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP.</b>
   <div>5 Tools • 1 Resource</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -33,7 +33,7 @@ Five tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed c
 
 | Tool | Description |
 |:-----|:------------|
-| `imf_list_databases` | List all IMF SDMX dataflows available on the portal (193 total), with optional name/ID substring filtering |
+| `imf_list_databases` | List all IMF SDMX dataflows available on the portal, with optional name/ID substring filtering |
 | `imf_get_database` | Fetch a dataflow's dimension list and complete codelist — resolves human terms to SDMX codes before querying |
 | `imf_query_dataset` | Query a dataflow by dimension key over a time range; large result sets spill to DataCanvas |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call |
@@ -43,7 +43,7 @@ Five tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed c
 
 Entry point for every IMF query workflow — browse and filter the full dataflow catalog.
 
-- 193 dataflows covering WEO projections, balance of payments, CPI, exchange rates, money/finance statistics, and national accounts
+- Hundreds of dataflows covering WEO projections, balance of payments, CPI, exchange rates, money/finance statistics, and national accounts
 - Vintage (historical snapshot) dataflows excluded by default; set `include_vintages=true` to include them
 - Case-insensitive substring filter across ID, name, and description
 
