@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-07-11
+
+imf_query_dataset rejects malformed and reversed start_period/end_period before the upstream call; docs/design.md error-code label corrections for key_dimension_mismatch and invalid_sql
+
 ## [0.2.3](changelog/0.2.x/0.2.3.md) — 2026-07-11
 
 Adopt @cyanheads/mcp-ts-core ^0.10.14 with a bun install supply-chain guard; fix imf_get_database codelist resolution and dataflow identity for shared/_PUB IMF DSDs; drop stale hardcoded dataflow counts
