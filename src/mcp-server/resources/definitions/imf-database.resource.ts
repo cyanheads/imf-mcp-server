@@ -65,6 +65,8 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
       dataflow_id: structure.dataflowId,
       agency_id: structure.agencyId,
       version: structure.version,
+      ...(structure.dsdVersion ? { dsd_version: structure.dsdVersion } : {}),
+      ...(structure.dsdId ? { structure_ref: structure.dsdId } : {}),
       name: structure.name,
       ...(structure.description ? { description: structure.description } : {}),
       key_format: structure.keyFormat,

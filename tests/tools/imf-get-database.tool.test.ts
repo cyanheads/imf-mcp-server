@@ -82,6 +82,53 @@ describe('imfGetDatabase', () => {
     );
   });
 
+  it('#12 surfaces dsd_version and structure_ref when the structure carries them', async () => {
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dataflowId: 'IIP',
+      name: 'International Investment Position (IIP)',
+      version: '13.0.0',
+      dsdId: 'DSD_BOP',
+      dsdVersion: '24.0.0',
+    });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'IIP' });
+    const result = await imfGetDatabase.handler(input, ctx);
+
+    // Flow identity preserved; DSD identity exposed additively.
+    expect(result.version).toBe('13.0.0');
+    expect(result.name).toBe('International Investment Position (IIP)');
+    expect((result as { dsd_version?: string }).dsd_version).toBe('24.0.0');
+    expect((result as { structure_ref?: string }).structure_ref).toBe('DSD_BOP');
+  });
+
+  it('#12 format renders the DSD structure line when dsd_version/structure_ref are present', () => {
+    const output = {
+      dataflow_id: 'IIP',
+      agency_id: 'IMF.STA',
+      version: '13.0.0',
+      dsd_version: '24.0.0',
+      structure_ref: 'DSD_BOP',
+      name: 'International Investment Position (IIP)',
+      key_format: 'COUNTRY.INDICATOR.FREQUENCY',
+      dimensions: [
+        {
+          id: 'COUNTRY',
+          name: 'Country',
+          position: 0,
+          codelist: [{ id: 'USA', name: 'United States' }],
+          codelist_truncated: false,
+        },
+      ],
+      source:
+        'Source: International Monetary Fund, International Investment Position (IIP), https://data.imf.org/',
+    };
+    const blocks = imfGetDatabase.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('DSD_BOP');
+    expect(text).toContain('24.0.0');
+  });
+
   it('throws ctx.fail("dataflow_not_found") when dataflow does not exist', async () => {
     mockSvc.findDataflow.mockResolvedValue(undefined);
     const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });

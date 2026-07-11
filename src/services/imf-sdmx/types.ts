@@ -9,6 +9,13 @@ export interface Dataflow {
   description?: string;
   id: string;
   name: string;
+  /**
+   * SDMX URN of the DSD this dataflow references, e.g.
+   * `"urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=IMF.STA:DSD_BOP(24.0+.0)"`.
+   * IMF names DSDs independently of the flow (ER → DSD_ER_PUB, IIP → shared
+   * DSD_BOP), so this is the authoritative structure reference.
+   */
+  structure?: string;
   version: string;
 }
 
@@ -32,6 +39,16 @@ export interface DataflowStructure {
   dataflowId: string;
   description?: string;
   dimensions: Dimension[];
+  /**
+   * Identifier of the underlying DSD, e.g. `"DSD_BOP"`. Differs from
+   * `dataflowId` when the flow references a shared structure (IIP → DSD_BOP).
+   */
+  dsdId?: string;
+  /**
+   * Version of the underlying DSD. Differs from `version` (the dataflow's own
+   * version) when the flow references a shared or independently-versioned DSD.
+   */
+  dsdVersion?: string;
   /** Dimension names in keyPosition order, e.g. "COUNTRY.INDICATOR.FREQUENCY" */
   keyFormat: string;
   name: string;
@@ -127,7 +144,12 @@ export interface SdmxStructureResponse {
       version?: string;
       names?: Record<string, string>;
       descriptions?: Record<string, string>;
-      structure?: { id: string; agencyID?: string; version?: string };
+      /**
+       * SDMX URN string referencing this dataflow's DSD, e.g.
+       * `"urn:sdmx:...DataStructure=IMF.STA:DSD_ER_PUB(4.0+.0)"`. The live API
+       * returns a string here, not an object.
+       */
+      structure?: string;
     }>;
     dataStructures?: Array<{
       id: string;

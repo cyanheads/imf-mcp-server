@@ -26,6 +26,26 @@ import type {
 const DATAFLOWS_CACHE_TTL = 3600; // 1 hour
 const DSD_CACHE_TTL = 86_400; // 24 hours
 
+/**
+ * Parse an SDMX DataStructure URN into its agency / id / version parts.
+ * IMF dataflows carry this URN in their `structure` field, and the referenced
+ * DSD is often named independently of the flow (ER → DSD_ER_PUB, IIP → shared
+ * DSD_BOP) — so the URN is the authoritative DSD reference, not a `DSD_<flow>` guess.
+ *
+ * @example
+ * parseDsdUrn('urn:sdmx:...DataStructure=IMF.STA:DSD_BOP(24.0+.0)')
+ * // → { agencyId: 'IMF.STA', id: 'DSD_BOP', version: '24.0.0' }
+ */
+function parseDsdUrn(urn: string): { agencyId: string; id: string; version: string } | undefined {
+  const match = /DataStructure=([^:]+):([^(]+)\(([^)]+)\)/.exec(urn);
+  if (!match) return;
+  const [, agencyId, id, rawVersion] = match;
+  if (!agencyId || !id || !rawVersion) return;
+  // IMF encodes the DSD version with a wildcard marker (e.g. "24.0+.0"); strip
+  // the "+" to get the concrete version the datastructure endpoint resolves.
+  return { agencyId, id, version: rawVersion.replace(/\+/g, '') };
+}
+
 export class ImfSdmxService {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
@@ -126,7 +146,17 @@ export class ImfSdmxService {
             signal: ctx.signal,
           },
         );
+        // HTTP 204 (or an empty body) means the DSD id does not exist — a
+        // definitive miss, not a transient error. Opt out of retry (retryable:
+        // false) so callers fall through to the fallback immediately rather than
+        // exhausting the retry budget against a guaranteed-empty response.
         const text = await response.text();
+        if (response.status === 204 || text.trim() === '') {
+          throw notFound(`Data structure '${dsdId}' not found`, {
+            reason: 'dsd_not_found',
+            retryable: false,
+          });
+        }
         return this.parseJson<SdmxStructureResponse>(text, 'data structure');
       },
       {
@@ -163,20 +193,23 @@ export class ImfSdmxService {
       });
     }
 
-    // Derive DSD id from the dataflow — IMF SDMX 3.0 uses DSD_<FLOW_ID> naming for most flows.
-    // We fetch the structure endpoint directly using the dataflow's agency+version.
-    const dsdId = `DSD_${dataflowId}`;
+    // Resolve the DSD from the dataflow's own `structure` URN. IMF names DSDs
+    // independently of the flow (ER → DSD_ER_PUB, IIP → shared DSD_BOP), so the
+    // legacy `DSD_<flow>` guess returns HTTP 204 for those and burns the retry
+    // budget before falling through. The fallback (dataflow endpoint with
+    // references=all) covers flows whose URN is absent or unparseable.
+    const dsdRef = dataflow.structure ? parseDsdUrn(dataflow.structure) : undefined;
+
+    const fallback = () =>
+      this.fetchDataflowStructureFallback(dataflowId, dataflow.agencyId, dataflow.version, ctx);
 
     let structure: DataflowStructure | undefined;
     try {
-      structure = await this.fetchDataStructure(
-        dataflow.agencyId,
-        dsdId,
-        dataflow.version,
-        ctx,
-      ).catch(() =>
-        this.fetchDataflowStructureFallback(dataflowId, dataflow.agencyId, dataflow.version, ctx),
-      );
+      structure = dsdRef
+        ? await this.fetchDataStructure(dsdRef.agencyId, dsdRef.id, dsdRef.version, ctx).catch(
+            fallback,
+          )
+        : await fallback();
     } catch {
       // Both primary and fallback DSD fetch failed; throw a controlled message
       // (the raw McpError would carry the upstream URL path in its message).
@@ -193,12 +226,18 @@ export class ImfSdmxService {
       });
     }
 
-    // Merge name/description from the dataflow into the structure.
+    // Pin identity to the dataflow's OWN values — a shared DSD (IIP → DSD_BOP)
+    // must not overwrite the flow's public name/version/agency. Dimensions and
+    // key_format legitimately flow from the (possibly shared) DSD. The DSD's own
+    // version/id are surfaced additively as dsdVersion/dsdId for callers.
     const mergedDescription = structure.description ?? dataflow.description;
     return {
       ...structure,
       dataflowId,
-      name: structure.name || dataflow.name,
+      agencyId: dataflow.agencyId,
+      version: dataflow.version,
+      name: dataflow.name,
+      dsdVersion: structure.version,
       ...(mergedDescription ? { description: mergedDescription } : {}),
     };
   }
@@ -401,6 +440,7 @@ export class ImfSdmxService {
       version: f.version ?? '1.0',
       name: f.names?.en ?? f.id,
       ...(f.descriptions?.en ? { description: f.descriptions.en } : {}),
+      ...(f.structure ? { structure: f.structure } : {}),
     }));
   }
 
@@ -438,30 +478,43 @@ export class ImfSdmxService {
       (a, b) => (a.position ?? a.keyPosition ?? 0) - (b.position ?? b.keyPosition ?? 0),
     );
 
-    // Derive the dataflow ID portion for IMF naming-convention codelist lookup.
-    // IMF SDMX 3.0 does not populate localRepresentation.enumeration — codelists are
-    // identified by naming convention: CL_<FLOW_ID>_<DIM_ID> (flow-specific) or
-    // CL_<DIM_ID> (shared). Try flow-specific first, then shared.
-    const flowIdForCl = id.replace(/^DSD_/, '');
+    // Flow token for IMF naming-convention codelist lookup comes from the DSD's
+    // OWN id, not the queried dataflow id — IIP shares DSD_BOP, whose codelists
+    // are CL_BOP_*, and ER → DSD_ER_PUB carries a publication suffix. IMF SDMX 3.0
+    // does not populate localRepresentation.enumeration, so codelists are resolved
+    // by convention: CL_<FLOW>_<DIM> / CL_<FLOW>_<DIM>_PUB (flow-specific) then
+    // CL_<DIM> / CL_<DIM>_PUB (shared). The flow token is tried both with the
+    // suffix (DSD_ER_PUB → ER_PUB) and stripped (→ ER), so CL_ER_INDICATOR_PUB
+    // resolves for ER and CL_BOP_INDICATOR for IIP.
+    const resolvedDsdId = dsd.id ?? id;
+    const flowCore = resolvedDsdId.replace(/^DSD_/, '');
+    const flowBase = flowCore.replace(/_PUB$/i, '');
+    const flowTokens = [...new Set([flowCore, flowBase])];
 
     const dimensions: Dimension[] = sorted.map((d, idx) => {
       const dimId = d.id ?? `DIM_${idx}`;
-      const enumRef = d.localRepresentation?.enumeration;
       let codelist: CodelistEntry[] = [];
 
-      // 1. IMF naming convention (primary path — enumeration is null on SDMX 3.0).
-      // Also try the concept ID extracted from the conceptIdentity URN (e.g. FREQ from
-      // "urn:sdmx:...CS_MASTER_SYSTEM(1.0).FREQ") since some shared codelists use the
-      // concept ID rather than the dimension ID (e.g. FREQUENCY dim → CL_FREQ codelist).
+      // Concept ID extracted from the conceptIdentity URN (e.g. FREQ from
+      // "urn:sdmx:...CS_MASTER_SYSTEM(1.0).FREQ") — some shared codelists key off
+      // the concept rather than the dimension id (FREQUENCY dim → CL_FREQ codelist).
       const conceptId =
         typeof d.conceptIdentity === 'string' ? d.conceptIdentity.replace(/^.*\./, '') : undefined;
-      const conventionKeys = [
-        `CL_${flowIdForCl}_${dimId}`,
-        `CL_${dimId}`,
-        ...(conceptId && conceptId !== dimId
-          ? [`CL_${flowIdForCl}_${conceptId}`, `CL_${conceptId}`]
-          : []),
+      const nameTokens = [
+        ...new Set([dimId, ...(conceptId && conceptId !== dimId ? [conceptId] : [])]),
       ];
+
+      // 1. IMF naming convention (primary path — enumeration is null on SDMX 3.0).
+      // Flow-specific candidates (both suffix variants) first, then shared.
+      const conventionKeys: string[] = [];
+      for (const ft of flowTokens) {
+        for (const nt of nameTokens) {
+          conventionKeys.push(`CL_${ft}_${nt}`, `CL_${ft}_${nt}_PUB`);
+        }
+      }
+      for (const nt of nameTokens) {
+        conventionKeys.push(`CL_${nt}`, `CL_${nt}_PUB`);
+      }
       for (const k of conventionKeys) {
         const found = clMap.get(k);
         if (found && found.length > 0) {
@@ -471,6 +524,7 @@ export class ImfSdmxService {
       }
 
       // 2. Explicit enumeration reference (fallback for servers that populate it)
+      const enumRef = d.localRepresentation?.enumeration;
       if (codelist.length === 0 && enumRef) {
         const enumKeys = [
           `${enumRef.agencyID ?? ''}:${enumRef.id ?? ''}:${enumRef.version ?? ''}`,
@@ -506,6 +560,7 @@ export class ImfSdmxService {
       dataflowId: id,
       agencyId: dsd.agencyID ?? agencyId,
       version: dsd.version ?? version,
+      dsdId: resolvedDsdId,
       name,
       ...(description ? { description } : {}),
       keyFormat,

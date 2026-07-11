@@ -58,6 +58,19 @@ export const imfGetDatabase = tool('imf_get_database', {
     dataflow_id: z.string().describe('Dataflow identifier, e.g. WEO, BOP, CPI.'),
     agency_id: z.string().describe('Agency that publishes this dataflow, e.g. IMF.RES, IMF.STA.'),
     version: z.string().describe('Dataflow version string, e.g. 9.0.0.'),
+    dsd_version: z
+      .string()
+      .optional()
+      .describe(
+        'Version of the underlying data structure definition (DSD) that backs this dataflow. ' +
+          'Differs from version when the dataflow references a shared DSD (e.g. IIP → DSD_BOP at 24.0.0).',
+      ),
+    structure_ref: z
+      .string()
+      .optional()
+      .describe(
+        'Identifier of the underlying DSD, e.g. DSD_BOP. Several dataflows can share one DSD.',
+      ),
     name: z.string().describe('Human-readable dataflow name.'),
     description: z.string().optional().describe('Extended description, if available.'),
     key_format: z
@@ -185,6 +198,8 @@ export const imfGetDatabase = tool('imf_get_database', {
       dataflow_id: structure.dataflowId,
       agency_id: structure.agencyId,
       version: structure.version,
+      ...(structure.dsdVersion ? { dsd_version: structure.dsdVersion } : {}),
+      ...(structure.dsdId ? { structure_ref: structure.dsdId } : {}),
       name: structure.name,
       ...(structure.description ? { description: structure.description } : {}),
       key_format: structure.keyFormat,
@@ -199,6 +214,12 @@ export const imfGetDatabase = tool('imf_get_database', {
     lines.push(
       `**Dataflow:** ${result.dataflow_id} | **Agency:** ${result.agency_id} | **Version:** ${result.version}`,
     );
+    if (result.structure_ref || result.dsd_version) {
+      const dsdParts: string[] = [];
+      if (result.structure_ref) dsdParts.push(`**Structure:** ${result.structure_ref}`);
+      if (result.dsd_version) dsdParts.push(`**DSD version:** ${result.dsd_version}`);
+      lines.push(dsdParts.join(' | '));
+    }
     if (result.description) lines.push(`\n${result.description}`);
     lines.push(`\n**Key format:** \`${result.key_format}\``);
     lines.push('\n### Dimensions\n');
