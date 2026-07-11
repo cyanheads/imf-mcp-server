@@ -22,7 +22,8 @@ const IMF_DATA_PORTAL = 'https://data.imf.org/';
  *   Quarterly:   "YYYY-QN"     → "YYYY-QN"
  *   Monthly:     "YYYY-MM"     → "YYYY-MM" (input format)
  *   Monthly:     "YYYY-MNN"    → "YYYY-MM" (upstream format, e.g. "1956-M01" → "1956-01")
- * Returns null for unrecognized formats (those observations are not filtered out).
+ * Returns null for unrecognized formats; callers decide whether null is fatal
+ * (input validation) or a pass-through (per-observation filtering).
  */
 function normalizePeriod(period: string): string | null {
   // Annual: "2023"
@@ -64,6 +65,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     'Use + to specify multiple codes per position (e.g. USA+GBR.NGDP_RPCH.A). ' +
     'Codelists from imf_get_database enumerate the code universe, not actual coverage — ' +
     'valid codes can still return no_data if the combination has no series. ' +
+    'start_period and end_period must be valid period strings (YYYY, YYYY-QN, or YYYY-MM) ' +
+    'with start_period no later than end_period; malformed or reversed ranges are rejected. ' +
     'Large analytical result sets (multi-country, long time range) spill to DataCanvas; ' +
     'imf_dataframe_query provides SQL analysis of spilled results.',
   annotations: {
@@ -105,7 +108,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .string()
       .optional()
       .describe(
-        'End of time range (inclusive). Same format as start_period. ' +
+        'End of time range (inclusive). Same format as start_period, and must be ' +
+          'greater than or equal to start_period. ' +
           'Observations after this period are excluded from the result.',
       ),
     canvas_id: z
@@ -211,6 +215,18 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         'Call imf_get_database to get the correct key_format for this dataflow, then reconstruct the key.',
     },
     {
+      reason: 'invalid_period_format',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'start_period or end_period is not one of the recognized period formats',
+      recovery: 'Use YYYY (annual), YYYY-QN (quarterly, e.g. 2023-Q1), or YYYY-MM (monthly).',
+    },
+    {
+      reason: 'invalid_period_range',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'start_period is later than end_period',
+      recovery: 'Provide start_period less than or equal to end_period (chronological order).',
+    },
+    {
       reason: 'structure_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'api.imf.org returns non-200 on the data endpoint',
@@ -219,6 +235,50 @@ export const imfQueryDataset = tool('imf_query_dataset', {
   ],
 
   async handler(input, ctx) {
+    /**
+     * Reject malformed or reversed period bounds before any upstream call.
+     * normalizePeriod() returns null for unrecognized input; the per-observation
+     * filter treats null as "don't filter", but as INPUT a null bound must be
+     * fatal. Period filtering is client-side (IMF ignores startPeriod/endPeriod),
+     * so rejecting known-bad input early is free and skips a wasted round-trip.
+     */
+    const startNorm = input.start_period ? normalizePeriod(input.start_period) : null;
+    const endNorm = input.end_period ? normalizePeriod(input.end_period) : null;
+
+    if (input.start_period && startNorm === null) {
+      throw ctx.fail(
+        'invalid_period_format',
+        `start_period '${input.start_period}' is not a recognized period format (expected YYYY, YYYY-QN, or YYYY-MM)`,
+        {
+          field: 'start_period',
+          value: input.start_period,
+          ...ctx.recoveryFor('invalid_period_format'),
+        },
+      );
+    }
+    if (input.end_period && endNorm === null) {
+      throw ctx.fail(
+        'invalid_period_format',
+        `end_period '${input.end_period}' is not a recognized period format (expected YYYY, YYYY-QN, or YYYY-MM)`,
+        {
+          field: 'end_period',
+          value: input.end_period,
+          ...ctx.recoveryFor('invalid_period_format'),
+        },
+      );
+    }
+    if (startNorm && endNorm && startNorm > endNorm) {
+      throw ctx.fail(
+        'invalid_period_range',
+        `start_period '${input.start_period}' is after end_period '${input.end_period}' — start_period must be <= end_period`,
+        {
+          start_period: input.start_period,
+          end_period: input.end_period,
+          ...ctx.recoveryFor('invalid_period_range'),
+        },
+      );
+    }
+
     const svc = getImfSdmxService();
 
     // Resolve dataflow
@@ -291,9 +351,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       (obs) => obs.value !== null || obs.status !== null,
     );
 
-    // Apply period filter server-side before canvas spill.
-    const startNorm = input.start_period ? normalizePeriod(input.start_period) : null;
-    const endNorm = input.end_period ? normalizePeriod(input.end_period) : null;
+    // Apply period filter server-side (startNorm / endNorm validated at handler top).
     const filteredObservations =
       startNorm || endNorm
         ? nonPaddingObservations.filter((obs) => periodInRange(obs.time_period, startNorm, endNorm))

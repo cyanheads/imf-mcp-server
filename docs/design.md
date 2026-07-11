@@ -42,7 +42,7 @@ errors: [
 
 **Input constraints:**
 - `key`: string — dot-separated dimension codes in DSD `keyPosition` order. Use `+` to specify multiple codes per position (e.g. `USA+GBR.NGDP_RPCH.A`). Omit a trailing dimension position to wildcard it. Country codes are ISO 3-letter (USA, not US). Call `imf_get_database` first to obtain the correct `key_format` and valid codes.
-- `start_period` / `end_period`: string — format matches the dataflow's frequency: `YYYY` (annual), `YYYY-QN` (quarterly, e.g. `2023-Q1`), `YYYY-MM` (monthly). Omit either to use the full available range.
+- `start_period` / `end_period`: string — format matches the dataflow's frequency: `YYYY` (annual), `YYYY-QN` (quarterly, e.g. `2023-Q1`), `YYYY-MM` (monthly). Omit either to use the full available range. Malformed values and reversed ranges (`start_period > end_period`) are rejected before the upstream call.
 
 **Output (inline, no canvas spill):**
 - `dataflow_id`, `key`, `start_period`, `end_period`
@@ -66,9 +66,15 @@ errors: [
   { reason: 'no_data', code: NotFound,
     when: 'Key is structurally valid but returns an empty dataset (HTTP 200, no series) — typically an unknown dimension code or no data for the time range',
     recovery: 'Verify dimension codes with imf_get_database; check that start_period/end_period overlap available data.' },
-  { reason: 'key_dimension_mismatch', code: InvalidParams,
+  { reason: 'key_dimension_mismatch', code: ValidationError,
     when: 'Number of dot-separated segments in key does not match the dataflow\'s DSD dimension count',
     recovery: 'Call imf_get_database to get the correct key_format for this dataflow, then reconstruct the key.' },
+  { reason: 'invalid_period_format', code: ValidationError,
+    when: 'start_period or end_period is not one of the recognized period formats',
+    recovery: 'Use YYYY (annual), YYYY-QN (quarterly, e.g. 2023-Q1), or YYYY-MM (monthly).' },
+  { reason: 'invalid_period_range', code: ValidationError,
+    when: 'start_period is later than end_period',
+    recovery: 'Provide start_period less than or equal to end_period (chronological order).' },
   { reason: 'structure_unavailable', code: ServiceUnavailable,
     when: 'api.imf.org returns non-200 on the data endpoint',
     recovery: 'Retry after a short wait.' },
@@ -89,7 +95,7 @@ errors: [
 ```
 
 **Additional constraint on `imf_dataframe_query`:**
-- `sql`: must start with `SELECT` (enforced via Zod `.regex(/^\s*SELECT\s/i)` or handler validation). DML and DDL are rejected with `InvalidParams`.
+- `sql`: must start with `SELECT` (enforced via Zod `.regex(/^\s*SELECT\s/i)` or handler validation). DML and DDL are rejected with `ValidationError` (reason `invalid_sql`).
 
 ### Resources
 

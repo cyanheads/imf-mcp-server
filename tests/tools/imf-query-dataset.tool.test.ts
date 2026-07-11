@@ -467,6 +467,79 @@ describe('imfQueryDataset', () => {
   });
 
   // -------------------------------------------------------------------------
+  // #11: period input validation (malformed + reversed ranges)
+  // -------------------------------------------------------------------------
+
+  it('rejects a malformed start_period before any upstream call', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+    const input = imfQueryDataset.input.parse({
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      start_period: 'not-a-period',
+    });
+
+    await expect(imfQueryDataset.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_period_format' },
+    });
+    // Known-bad input is rejected before touching the network.
+    expect(mockSvc.findDataflow).not.toHaveBeenCalled();
+    expect(mockSvc.fetchData).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed end_period', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+    const input = imfQueryDataset.input.parse({
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      end_period: 'garbage',
+    });
+
+    await expect(imfQueryDataset.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_period_format' },
+    });
+  });
+
+  it('rejects a reversed range (start_period > end_period)', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+    const input = imfQueryDataset.input.parse({
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      start_period: '2024',
+      end_period: '2020',
+    });
+
+    await expect(imfQueryDataset.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_period_range' },
+    });
+    // Rejected before the upstream data fetch.
+    expect(mockSvc.fetchData).not.toHaveBeenCalled();
+  });
+
+  it('accepts a valid forward range and returns the filtered series', async () => {
+    const observations = [
+      { series_key: 'USA.NGDP_RPCH.A', time_period: '2009', value: 1.0, status: null },
+      { series_key: 'USA.NGDP_RPCH.A', time_period: '2010', value: 2.0, status: null },
+      { series_key: 'USA.NGDP_RPCH.A', time_period: '2015', value: 3.0, status: null },
+      { series_key: 'USA.NGDP_RPCH.A', time_period: '2020', value: 4.0, status: null },
+      { series_key: 'USA.NGDP_RPCH.A', time_period: '2021', value: 5.0, status: null },
+    ];
+    mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+    const input = imfQueryDataset.input.parse({
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      start_period: '2010',
+      end_period: '2020',
+    });
+    const result = await imfQueryDataset.handler(input, ctx);
+
+    expect(result.observations.map((o) => o.time_period)).toEqual(['2010', '2015', '2020']);
+  });
+
+  // -------------------------------------------------------------------------
   // #5: no_data availability enrichment
   // -------------------------------------------------------------------------
 
