@@ -81,8 +81,9 @@ export const imfGetDatabase = tool('imf_get_database', {
       .string()
       .optional()
       .describe(
-        "This dataflow's own description, matching what imf_list_databases reports for the " +
-          "same id — not the shared DSD's. Absent when the dataflow publishes none.",
+        "This dataflow's own description in full — not the shared DSD's, and not the " +
+          'shortened preview imf_list_databases returns for the same id. Absent when the ' +
+          'dataflow publishes none.',
       ),
     codelist_filter: z
       .string()
