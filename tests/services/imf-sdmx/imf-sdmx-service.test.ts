@@ -1,10 +1,13 @@
 /**
  * @fileoverview Tests for ImfSdmxService — DSD resolution via the dataflow's own
  * `structure` URN, codelist resolution across all three reference paths, dimension
- * labels from the concept schemes, the dataflow-vs-DSD identity merge, and the
- * availability-constraint parse. Covers #10 (codelists resolve for ER's suffixed
+ * labels from the concept schemes, the dataflow-vs-DSD identity merge, the
+ * availability-constraint parse, and per-series attribute decoding. Covers #10
+ * (codelists resolve for ER's suffixed
  * DSD_ER_PUB and IIP's shared DSD_BOP), #12 (the flow's own name/version/agency
- * are preserved; the DSD's version/id are exposed additively), #20 (dimensions
+ * are preserved; the DSD's version/id are exposed additively), #15 (attributes
+ * are keyed per series, and coded attributes are resolved rather than read as
+ * their index), #20 (dimensions
  * whose codelist no naming convention can name), #26 (per-dimension code listing
  * capped, with the pre-cap count preserved), #28 (dimension labels), and #30 (a
  * shared DSD does not hand one flow another flow's description).
@@ -1266,5 +1269,230 @@ describe('ImfSdmxService.fetchDataflows error boundary (#24)', () => {
 
     const err = await svc.fetchDataflows(ctx).catch((e: unknown) => e);
     expect((err as Error).message.toLowerCase()).not.toContain('not found');
+  });
+});
+
+// --- #15: series attributes belong to the series that carries them ---------------
+
+/**
+ * The live `USA.NGDP_RPCH+NGDPD.A` payload, trimmed to three periods. Two series
+ * share one attribute definition list and point at different entries in it:
+ * NGDPD is scale `"9"`, NGDP_RPCH the `"0"` no-scale sentinel. The attribute
+ * entries are INDICES into `values`, which is why DECIMALS_DISPLAYED reads as a
+ * plain `0` unless it is resolved — the series displays three decimals.
+ */
+const WEO_TWO_SERIES = {
+  data: {
+    dataSets: [
+      {
+        series: {
+          '0:0:0': {
+            attributes: [0, 0, 0, '9/30/2025'],
+            observations: { '0': ['21375275000000'], '1': ['23725650000000'] },
+          },
+          '0:1:0': {
+            attributes: [1, 0, 0, '9/30/2025'],
+            observations: { '0': ['-2.081277'], '1': ['6.151865'] },
+          },
+        },
+      },
+    ],
+    structures: [
+      {
+        attributes: {
+          series: [
+            { id: 'SCALE', values: [{ id: '9' }, { id: '0' }] },
+            { id: 'DECIMALS_DISPLAYED', values: [{ id: '3' }] },
+            { id: 'OVERLAP', values: [{ id: 'OL' }] },
+            { id: 'COUNTRY_UPDATE_DATE' },
+          ],
+          observation: [],
+        },
+        dimensions: {
+          series: [
+            { id: 'COUNTRY', values: [{ id: 'USA' }] },
+            { id: 'INDICATOR', values: [{ id: 'NGDPD' }, { id: 'NGDP_RPCH' }] },
+            { id: 'FREQUENCY', values: [{ id: 'A' }] },
+          ],
+          observation: [{ id: 'TIME_PERIOD', values: [{ value: '2020' }, { value: '2021' }] }],
+        },
+      },
+    ],
+  },
+};
+
+describe('ImfSdmxService.fetchData series attributes (#15)', () => {
+  let svc: ImfSdmxService;
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    fetchWithTimeout.mockImplementation(() =>
+      Promise.resolve({
+        status: 200,
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify(WEO_TWO_SERIES)),
+      }),
+    );
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+  });
+
+  const query = async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    return svc.fetchData(
+      'IMF.RES',
+      'WEO',
+      '9.0.0',
+      'USA.NGDP_RPCH+NGDPD.A',
+      undefined,
+      undefined,
+      ctx,
+    );
+  };
+
+  it('keys each decoded series to its own attributes', async () => {
+    const result = await query();
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.scale).toBe('9');
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.scale).toBe('0');
+  });
+
+  it('covers every series present in the observations', async () => {
+    const result = await query();
+
+    const observed = new Set(result.observations.map((obs) => obs.series_key));
+    expect([...observed].sort()).toEqual(['USA.NGDPD.A', 'USA.NGDP_RPCH.A']);
+    for (const key of observed) {
+      expect(result.seriesAttributesByKey[key]).toBeDefined();
+    }
+  });
+
+  it('describes the first series in the flat field, not whichever was decoded last', async () => {
+    const result = await query();
+
+    expect(result.seriesAttributes).toEqual(result.seriesAttributesByKey['USA.NGDPD.A']);
+  });
+
+  it('resolves DECIMALS_DISPLAYED through the attribute definition, not as its index', async () => {
+    const result = await query();
+
+    // The entry is index 0 into values [{ id: "3" }] — reading it straight
+    // reports a series that displays three decimals as displaying none.
+    expect(result.seriesAttributes.decimals).toBe(3);
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.decimals).toBe(3);
+  });
+
+  it('reports null attributes for a series the payload describes none for', async () => {
+    fetchWithTimeout.mockImplementation(() =>
+      Promise.resolve({
+        status: 200,
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              data: {
+                dataSets: [{ series: { '0:0:0': { observations: { '0': ['1.5'] } } } }],
+                structures: WEO_TWO_SERIES.data.structures,
+              },
+            }),
+          ),
+      }),
+    );
+
+    const result = await query();
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']).toEqual({
+      unit: null,
+      scale: null,
+      decimals: null,
+    });
+  });
+
+  it('decodes a wide result in time proportional to its series count', async () => {
+    // A `*` key on a wide dataflow resolves to tens of thousands of series, so
+    // any per-series step that walks the accumulated set makes the decode
+    // quadratic and the query unanswerable. The bound is ~60x the linear cost,
+    // wide enough that only a change in the growth curve trips it.
+    const count = 20_000;
+    const series: Record<string, unknown> = {};
+    for (let i = 0; i < count; i++) {
+      series[`${i}:0:0`] = { attributes: [i % 2, 0, 0, 'x'], observations: { '0': ['1.5'] } };
+    }
+    fetchWithTimeout.mockImplementation(() =>
+      Promise.resolve({
+        status: 200,
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              data: {
+                dataSets: [{ series }],
+                structures: [
+                  {
+                    ...WEO_TWO_SERIES.data.structures[0],
+                    dimensions: {
+                      ...WEO_TWO_SERIES.data.structures[0].dimensions,
+                      series: [
+                        {
+                          id: 'COUNTRY',
+                          values: Array.from({ length: count }, (_, i) => ({ id: `C${i}` })),
+                        },
+                        { id: 'INDICATOR', values: [{ id: 'NGDPD' }] },
+                        { id: 'FREQUENCY', values: [{ id: 'A' }] },
+                      ],
+                    },
+                  },
+                ],
+              },
+            }),
+          ),
+      }),
+    );
+
+    const started = performance.now();
+    const result = await query();
+    const elapsedMs = performance.now() - started;
+
+    expect(Object.keys(result.seriesAttributesByKey)).toHaveLength(count);
+    expect(elapsedMs).toBeLessThan(1500);
+  });
+
+  it('reads an attribute that ships no values as the literal it carries', async () => {
+    // Not every series attribute is coded. Where the definition omits `values`
+    // the series entry IS the value, so a decode that only ever indexes into a
+    // definition reports nothing for the attributes SDMX carries inline.
+    fetchWithTimeout.mockImplementation(() =>
+      Promise.resolve({
+        status: 200,
+        ok: true,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              data: {
+                dataSets: [
+                  { series: { '0:0:0': { attributes: ['4'], observations: { '0': ['1.5'] } } } },
+                ],
+                structures: [
+                  {
+                    ...WEO_TWO_SERIES.data.structures[0],
+                    attributes: {
+                      series: [{ id: 'DECIMALS_DISPLAYED' }],
+                      observation: [],
+                    },
+                  },
+                ],
+              },
+            }),
+          ),
+      }),
+    );
+
+    const result = await query();
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.decimals).toBe(4);
   });
 });

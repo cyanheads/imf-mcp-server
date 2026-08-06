@@ -77,7 +77,20 @@ export interface DataQueryResult {
   endPeriod?: string;
   key: string;
   observations: Observation[];
+  /**
+   * Attributes of the FIRST series decoded. A `+` or `*` key resolves to several
+   * series whose unit/scale/decimals differ (WEO's NGDPD is scale 9, NGDP_RPCH
+   * scale 0), so this single record describes one of them and must not be applied
+   * to the rest — read `seriesAttributesByKey` whenever more than one series came
+   * back.
+   */
   seriesAttributes: SeriesAttributes;
+  /**
+   * Attributes of every decoded series, keyed by its decoded series key
+   * (`"USA.NGDPD.A"`). One entry per series present in `observations`; a series
+   * the upstream payload carries no attributes for maps to all-null.
+   */
+  seriesAttributesByKey: Record<string, SeriesAttributes>;
   startPeriod?: string;
 }
 

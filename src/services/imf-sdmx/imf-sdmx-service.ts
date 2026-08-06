@@ -1,9 +1,11 @@
 /**
  * @fileoverview IMF SDMX 3.0 REST API service — fetches dataflows, data structures,
  * and observations from api.imf.org. Implements caching via ctx.state and retry.
- * A flow's own name, version, agency, and description survive a shared DSD; the
- * SDMX 2.1 availability constraint is parsed for no-data enrichment, listing a
- * dimension's codes up to AVAILABILITY_CODE_CAP alongside the pre-cap total.
+ * A flow's own name, version, agency, and description survive a shared DSD;
+ * series attributes are decoded per series and keyed by series key, so a
+ * multi-series key does not collapse to one record; the SDMX 2.1 availability
+ * constraint is parsed for no-data enrichment, listing a dimension's codes up to
+ * AVAILABILITY_CODE_CAP alongside the pre-cap total.
  * @module services/imf-sdmx/imf-sdmx-service
  */
 
@@ -424,6 +426,12 @@ export class ImfSdmxService {
    * Returns parsed availability info (series_count, per-dimension codes, time range).
    * The 2.1 endpoint path is derived from the configured 3.0 base URL.
    *
+   * Pass an empty `firstDimensionCode` for the dataflow-wide constraint. That form
+   * is the only one that separates a dataflow publishing nothing from a single
+   * uncovered code: a key-scoped constraint reports `series_count: 0` and an empty
+   * cube region for both, while the unscoped one reports the dataflow's own total
+   * and the codes that do have data.
+   *
    * Never throws — returns null on any failure so callers can degrade gracefully.
    */
   async fetchAvailabilityConstraint(
@@ -732,7 +740,9 @@ export class ImfSdmxService {
 
     const series = dataset?.series ?? {};
     const observations: Observation[] = [];
-    let seriesAttributes: SeriesAttributes = { unit: null, scale: null, decimals: null };
+    const seriesAttributesByKey: Record<string, SeriesAttributes> = {};
+    /** The flat field describes the first series decoded only — see DataQueryResult. */
+    let firstSeriesAttributes: SeriesAttributes | undefined;
 
     // Series-level dimensions for decoding the colon-separated series key ("0:0:0").
     const seriesDims = structure?.dimensions?.series ?? [];
@@ -747,15 +757,25 @@ export class ImfSdmxService {
       });
       const decodedSeriesKey = seriesCodeParts.join('.');
 
-      // Extract series-level attributes for the first series we find
-      if (seriesData.attributes) {
-        const attrs = seriesData.attributes;
-        seriesAttributes = {
-          unit: this.resolveAttrValue(unitIdx, attrs, seriesAttrs),
-          scale: this.resolveAttrValue(scaleIdx, attrs, seriesAttrs),
-          decimals: this.resolveDecimalsValue(decimalsIdx, attrs),
-        };
-      }
+      /**
+       * Attributes belong to the series that carries them. Assigning them to one
+       * shared variable inside this loop let the last series decoded overwrite
+       * every earlier one, so a `USA.NGDPD+NGDP_RPCH.A` query reported a single
+       * scale for two series that do not share it.
+       */
+      const attrs = seriesData.attributes;
+      const decodedAttributes: SeriesAttributes = attrs
+        ? {
+            unit: this.resolveAttrValue(unitIdx, attrs, seriesAttrs),
+            scale: this.resolveAttrValue(scaleIdx, attrs, seriesAttrs),
+            decimals: this.resolveDecimalsValue(decimalsIdx, attrs, seriesAttrs),
+          }
+        : { unit: null, scale: null, decimals: null };
+      seriesAttributesByKey[decodedSeriesKey] = decodedAttributes;
+      // First write wins. Counting the map's keys here instead made the decode
+      // quadratic in series count — a `*` key on a wide dataflow resolves to
+      // tens of thousands of series, and the count was recomputed for each one.
+      firstSeriesAttributes ??= decodedAttributes;
 
       // Decode observations
       for (const [obsIdx, obsValues] of Object.entries(seriesData.observations ?? {})) {
@@ -788,7 +808,8 @@ export class ImfSdmxService {
       ...(startPeriod ? { startPeriod } : {}),
       ...(endPeriod ? { endPeriod } : {}),
       observations,
-      seriesAttributes,
+      seriesAttributes: firstSeriesAttributes ?? { unit: null, scale: null, decimals: null },
+      seriesAttributesByKey,
     };
   }
 
@@ -808,11 +829,22 @@ export class ImfSdmxService {
     return raw;
   }
 
-  private resolveDecimalsValue(attrIdx: number, attrValues: Array<string | null>): number | null {
-    if (attrIdx < 0 || attrIdx >= attrValues.length) return null;
-    const raw = attrValues[attrIdx];
-    if (raw == null) return null;
-    const n = parseInt(raw, 10);
+  /**
+   * DECIMALS_DISPLAYED is a coded attribute like the rest: the series entry holds
+   * an index into the attribute definition's `values`, not the digit count. Read
+   * straight, WEO's `[0, 0, 0, …]` against `values: [{ id: "3" }]` reports 0
+   * decimals for a series that displays 3. Resolving through the definition first
+   * — and falling back to the literal when the attribute ships no `values` — is
+   * what makes the number mean what it says.
+   */
+  private resolveDecimalsValue(
+    attrIdx: number,
+    attrValues: Array<string | null>,
+    attrDefs: Array<{ id: string; values?: Array<{ id: string; name?: string }> }>,
+  ): number | null {
+    const resolved = this.resolveAttrValue(attrIdx, attrValues, attrDefs);
+    if (resolved == null) return null;
+    const n = parseInt(resolved, 10);
     return Number.isNaN(n) ? null : n;
   }
 
