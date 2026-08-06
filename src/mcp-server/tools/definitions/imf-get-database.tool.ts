@@ -131,6 +131,14 @@ export const imfGetDatabase = tool('imf_get_database', {
       when: 'api.imf.org returns non-200 on the DSD endpoint',
       recovery: 'Retry after a short wait; the IMF SDMX 3.0 portal is occasionally slow.',
     },
+    {
+      reason: 'dataflow_list_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The dataflow catalog that dataflow_id is resolved against could not be fetched — fires before the DSD lookup is attempted',
+      retryable: true,
+      recovery:
+        'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
+    },
   ],
 
   async handler(input, ctx) {

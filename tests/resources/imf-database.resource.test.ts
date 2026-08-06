@@ -3,7 +3,7 @@
  * @module tests/resources/imf-database.resource.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -52,6 +52,22 @@ const MOCK_STRUCTURE = {
     },
   ],
 };
+
+/**
+ * The controlled error ImfSdmxService throws when the dataflow catalog fetch fails
+ * (#24). Carries the reason and hint, and nothing about the upstream endpoint.
+ */
+const dataflowListUnavailable = () =>
+  new McpError(
+    JsonRpcErrorCode.ServiceUnavailable,
+    'IMF dataflow catalog is unavailable — the upstream SDMX structure endpoint did not return a usable response.',
+    {
+      reason: 'dataflow_list_unavailable',
+      recovery: {
+        hint: 'Retry in a few moments. The IMF SDMX 3.0 portal is intermittently unavailable.',
+      },
+    },
+  );
 
 describe('imfDatabaseResource', () => {
   let mockSvc: {
@@ -145,5 +161,31 @@ describe('imfDatabaseResource', () => {
     };
 
     expect(result.dimensions[0].codelist).toHaveLength(80);
+  });
+
+  // -------------------------------------------------------------------------
+  // #24: the resource path no longer echoes the upstream URL or response body
+  // -------------------------------------------------------------------------
+
+  it('#24 surfaces a controlled dataflow_list_unavailable with no upstream detail', async () => {
+    mockSvc.findDataflow.mockRejectedValue(dataflowListUnavailable());
+    const ctx = createMockContext({ tenantId: 'test' });
+    const params = imfDatabaseResource.params.parse({ dataflow_id: 'WEO' });
+
+    const err = (await imfDatabaseResource.handler(params, ctx).then(
+      () => {
+        throw new Error('expected rejection');
+      },
+      (e: unknown) => e,
+    )) as McpError;
+
+    expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(err.data?.reason).toBe('dataflow_list_unavailable');
+
+    // The resource previously returned the upstream body verbatim under data.responseBody.
+    const wire = JSON.stringify({ message: err.message, data: err.data });
+    expect(wire).not.toContain('responseBody');
+    expect(wire).not.toContain('/structure/');
+    expect(wire).not.toContain('Fetch failed');
   });
 });

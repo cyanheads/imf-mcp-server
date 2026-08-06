@@ -3,6 +3,7 @@
  * @module tests/tools/imf-list-databases.tool.test
  */
 
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -30,6 +31,22 @@ const MOCK_DATAFLOWS = [
     description: 'Price indices',
   },
 ];
+
+/**
+ * The controlled error ImfSdmxService throws when the dataflow catalog fetch fails
+ * (#24). Carries the reason and hint, and nothing about the upstream endpoint.
+ */
+const dataflowListUnavailable = () =>
+  new McpError(
+    JsonRpcErrorCode.ServiceUnavailable,
+    'IMF dataflow catalog is unavailable — the upstream SDMX structure endpoint did not return a usable response.',
+    {
+      reason: 'dataflow_list_unavailable',
+      recovery: {
+        hint: 'Retry in a few moments. The IMF SDMX 3.0 portal is intermittently unavailable.',
+      },
+    },
+  );
 
 describe('imfListDatabases', () => {
   let mockSvc: { fetchDataflows: ReturnType<typeof vi.fn> };
@@ -186,5 +203,34 @@ describe('imfListDatabases', () => {
 
     expect(result.total_count).toBe(1);
     expect(result.dataflows[0].id).toBe('APDREO');
+  });
+
+  // -------------------------------------------------------------------------
+  // #24: dataflow-list failures are declared and controlled
+  // -------------------------------------------------------------------------
+
+  it('#24 declares dataflow_list_unavailable so the failure mode is discoverable', () => {
+    const entry = imfListDatabases.errors?.find((e) => e.reason === 'dataflow_list_unavailable');
+    expect(entry?.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(entry?.retryable).toBe(true);
+    expect(entry?.recovery).toBeTruthy();
+  });
+
+  it('#24 surfaces the service error unchanged — reason and hint reach the caller', async () => {
+    mockSvc.fetchDataflows.mockRejectedValue(dataflowListUnavailable());
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
+    const input = imfListDatabases.input.parse({});
+
+    const err = (await imfListDatabases.handler(input, ctx).then(
+      () => {
+        throw new Error('expected rejection');
+      },
+      (e: unknown) => e,
+    )) as McpError;
+
+    expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(err.data?.reason).toBe('dataflow_list_unavailable');
+    expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('Retry') });
+    expect(JSON.stringify({ message: err.message, data: err.data })).not.toContain('/structure/');
   });
 });

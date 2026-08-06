@@ -3,7 +3,7 @@
  * @module tests/tools/imf-query-dataset.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -58,6 +58,22 @@ const MOCK_QUERY_RESULT = {
   observations: MOCK_OBSERVATIONS,
   seriesAttributes: MOCK_SERIES_ATTRS,
 };
+
+/**
+ * The controlled error ImfSdmxService throws when the dataflow catalog fetch fails
+ * (#24). Carries the reason and hint, and nothing about the upstream endpoint.
+ */
+const dataflowListUnavailable = () =>
+  new McpError(
+    JsonRpcErrorCode.ServiceUnavailable,
+    'IMF dataflow catalog is unavailable — the upstream SDMX structure endpoint did not return a usable response.',
+    {
+      reason: 'dataflow_list_unavailable',
+      recovery: {
+        hint: 'Retry in a few moments. The IMF SDMX 3.0 portal is intermittently unavailable.',
+      },
+    },
+  );
 
 describe('imfQueryDataset', () => {
   let mockSvc: {
@@ -617,5 +633,31 @@ describe('imfQueryDataset', () => {
     // No longer emits the "full available series" caveat
     expect(text).not.toContain('full available series');
     expect(text).not.toContain('may extend beyond');
+  });
+
+  // -------------------------------------------------------------------------
+  // #24: dataflow-list failures are declared and not relabeled
+  // -------------------------------------------------------------------------
+
+  it('#24 declares dataflow_list_unavailable alongside structure_unavailable', () => {
+    const entry = imfQueryDataset.errors?.find((e) => e.reason === 'dataflow_list_unavailable');
+    expect(entry?.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(entry?.retryable).toBe(true);
+  });
+
+  it('#24 keeps the dataflow_list_unavailable reason instead of relabeling it structure_unavailable', async () => {
+    mockSvc.findDataflow.mockRejectedValue(dataflowListUnavailable());
+    const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+    const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.NGDP_RPCH.A' });
+
+    const err = (await imfQueryDataset.handler(input, ctx).then(
+      () => {
+        throw new Error('expected rejection');
+      },
+      (e: unknown) => e,
+    )) as McpError;
+
+    expect(err.data?.reason).toBe('dataflow_list_unavailable');
+    expect(JSON.stringify({ message: err.message, data: err.data })).not.toContain('/structure/');
   });
 });

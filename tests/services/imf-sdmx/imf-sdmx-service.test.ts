@@ -14,6 +14,7 @@
  */
 
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -374,5 +375,100 @@ describe('ImfSdmxService.fetchDataflowStructure', () => {
     expect(s.version).toBe('4.0.1'); // flow's own version
     expect(s.dsdVersion).toBe('4.0.0'); // DSD_ER_PUB's version
     expect(s.name).toBe('Exchange Rates (ER)');
+  });
+});
+
+// --- #24: dataflow-list error boundary -------------------------------------------
+
+/**
+ * The configured base URL points at a private mirror here, not the public portal —
+ * IMF_BASE_URL is user-configurable, so leaking it discloses deployment topology.
+ */
+const PRIVATE_BASE_URL = 'https://sdmx-mirror.internal.example/external/sdmx/3.0';
+const UPSTREAM_BODY = '{"statusCode":404,"message":"Resource not found","trace":"mirror-node-7"}';
+
+/**
+ * The exact shape `fetchWithTimeout` throws on a non-2xx: the resolved URL in the
+ * message plus the upstream body under both the canonical and legacy field names.
+ */
+const leakyFetchError = (url: string) =>
+  new McpError(JsonRpcErrorCode.NotFound, `Fetch failed for ${url}. Status: 404`, {
+    status: 404,
+    statusText: 'Not Found',
+    body: UPSTREAM_BODY,
+    statusCode: 404,
+    responseBody: UPSTREAM_BODY,
+    errorSource: 'FetchHttpError',
+  });
+
+/** Everything a client can read off a thrown error, flattened for substring assertions. */
+const serializeError = (err: unknown) =>
+  JSON.stringify({
+    message: err instanceof Error ? err.message : String(err),
+    data: err instanceof McpError ? err.data : undefined,
+  });
+
+describe('ImfSdmxService.fetchDataflows error boundary (#24)', () => {
+  let svc: ImfSdmxService;
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    fetchWithTimeout.mockImplementation((url: string) =>
+      Promise.reject(leakyFetchError(url as string)),
+    );
+    svc = new ImfSdmxService({} as AppConfig, {} as StorageService, PRIVATE_BASE_URL, 30_000);
+  });
+
+  it('leaks neither the configured base URL nor the upstream body into the client error', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const err = await svc.fetchDataflows(ctx).then(
+      () => {
+        throw new Error('expected fetchDataflows to reject');
+      },
+      (e: unknown) => e,
+    );
+
+    // Assert on everything the client can see, not one field.
+    const wire = serializeError(err);
+    expect(wire).not.toContain('sdmx-mirror.internal.example');
+    expect(wire).not.toContain('/structure/dataflow');
+    expect(wire).not.toContain('Resource not found');
+    expect(wire).not.toContain('mirror-node-7');
+    expect(wire).not.toContain('responseBody');
+    expect(wire).not.toContain('Fetch failed');
+  });
+
+  it('rethrows a ServiceUnavailable carrying dataflow_list_unavailable and a retry hint', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    await expect(svc.fetchDataflows(ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: {
+        reason: 'dataflow_list_unavailable',
+        recovery: { hint: expect.stringContaining('Retry') },
+      },
+    });
+  });
+
+  it('sanitizes the same failure when it surfaces through findDataflow', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const err = await svc.findDataflow('WEO', undefined, undefined, ctx).then(
+      () => {
+        throw new Error('expected findDataflow to reject');
+      },
+      (e: unknown) => e,
+    );
+
+    expect(serializeError(err)).not.toContain('sdmx-mirror.internal.example');
+    expect(err).toMatchObject({ data: { reason: 'dataflow_list_unavailable' } });
+  });
+
+  it('message avoids "not found" so callers branching on it do not misclassify availability', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const err = await svc.fetchDataflows(ctx).catch((e: unknown) => e);
+    expect((err as Error).message.toLowerCase()).not.toContain('not found');
   });
 });

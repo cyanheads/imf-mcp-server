@@ -27,6 +27,19 @@ const DATAFLOWS_CACHE_TTL = 3600; // 1 hour
 const DSD_CACHE_TTL = 86_400; // 24 hours
 
 /**
+ * Client-facing text for a failed dataflow-list fetch. Deliberately says nothing
+ * about the upstream URL or its response body: `IMF_BASE_URL` is configurable, so
+ * the resolved endpoint can name a private mirror or proxy, and the framework's
+ * raw fetch error carries both (message → origin + path, `data.body` → up to 500
+ * bytes of the upstream response). Wording avoids "not found" so callers that
+ * branch on that substring don't misclassify an availability failure.
+ */
+const DATAFLOW_LIST_UNAVAILABLE_MESSAGE =
+  'IMF dataflow catalog is unavailable — the upstream SDMX structure endpoint did not return a usable response.';
+const DATAFLOW_LIST_RECOVERY_HINT =
+  'Retry in a few moments. The IMF SDMX 3.0 portal is intermittently unavailable; if it keeps failing the upstream service is down.';
+
+/**
  * Parse an SDMX DataStructure URN into its agency / id / version parts.
  * IMF dataflows carry this URN in their `structure` field, and the referenced
  * DSD is often named independently of the flow (ER → DSD_ER_PUB, IIP → shared
@@ -68,30 +81,50 @@ export class ImfSdmxService {
       return cached;
     }
 
-    const raw = await withRetry(
-      async () => {
-        const url = `${this.baseUrl}/structure/dataflow`;
-        ctx.log.debug('Fetching dataflow list', { url });
-        const response = await fetchWithTimeout(
-          url,
-          this.timeoutMs,
-          ctx as unknown as RequestContext,
-          {
-            headers: { Accept: 'application/json' },
-            signal: ctx.signal,
-          },
-        );
-        const text = await response.text();
-        return this.parseJson<SdmxStructureResponse>(text, 'dataflow list');
-      },
-      {
-        operation: 'ImfSdmxService.fetchDataflows',
-        context: ctx as unknown as RequestContext,
-        maxRetries: 3,
-        baseDelayMs: 1000,
-        signal: ctx.signal,
-      },
-    );
+    /**
+     * Error boundary around the whole retry pipeline. Every entry point on this
+     * server reaches the dataflow list (directly or via findDataflow), so an
+     * unguarded failure here leaks the resolved upstream URL — and, on the
+     * resource path, the upstream response body — into the client error.
+     * Mirrors the boundary fetchDataflowStructure() already applies to the DSD path.
+     */
+    let raw: SdmxStructureResponse;
+    try {
+      raw = await withRetry(
+        async () => {
+          const url = `${this.baseUrl}/structure/dataflow`;
+          ctx.log.debug('Fetching dataflow list', { url });
+          const response = await fetchWithTimeout(
+            url,
+            this.timeoutMs,
+            ctx as unknown as RequestContext,
+            {
+              headers: { Accept: 'application/json' },
+              signal: ctx.signal,
+            },
+          );
+          const text = await response.text();
+          return this.parseJson<SdmxStructureResponse>(text, 'dataflow list');
+        },
+        {
+          operation: 'ImfSdmxService.fetchDataflows',
+          context: ctx as unknown as RequestContext,
+          maxRetries: 3,
+          baseDelayMs: 1000,
+          signal: ctx.signal,
+        },
+      );
+    } catch (err: unknown) {
+      // Upstream detail stays server-side; only the controlled message goes out.
+      ctx.log.error(
+        'Dataflow list fetch failed',
+        err instanceof Error ? err : new Error(String(err)),
+      );
+      throw serviceUnavailable(DATAFLOW_LIST_UNAVAILABLE_MESSAGE, {
+        reason: 'dataflow_list_unavailable',
+        recovery: { hint: DATAFLOW_LIST_RECOVERY_HINT },
+      });
+    }
 
     const dataflows = this.normalizeDataflows(raw);
     await ctx.state.set(cacheKey, dataflows, { ttl: DATAFLOWS_CACHE_TTL });

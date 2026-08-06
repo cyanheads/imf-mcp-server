@@ -232,6 +232,14 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       when: 'api.imf.org returns non-200 on the data endpoint',
       recovery: 'Retry after a short wait.',
     },
+    {
+      reason: 'dataflow_list_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The dataflow catalog that dataflow_id is resolved against could not be fetched — fires before the DSD and data lookups are attempted',
+      retryable: true,
+      recovery:
+        'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
+    },
   ],
 
   async handler(input, ctx) {

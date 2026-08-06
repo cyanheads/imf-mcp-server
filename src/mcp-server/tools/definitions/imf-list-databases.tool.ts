@@ -4,6 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
 const VINTAGE_PATTERN = /VINTAGE/i;
@@ -56,6 +57,17 @@ export const imfListDatabases = tool('imf_list_databases', {
       ),
     total_count: z.number().describe('Total number of matching dataflows returned.'),
   }),
+  errors: [
+    {
+      reason: 'dataflow_list_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The IMF SDMX structure endpoint that backs the dataflow catalog did not return a usable response',
+      retryable: true,
+      recovery:
+        'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
+    },
+  ],
+
   enrichment: {
     notice: z
       .string()
