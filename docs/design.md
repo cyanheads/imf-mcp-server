@@ -400,13 +400,27 @@ A failed second probe degrades to the previous per-code message rather than mask
 
 Series attributes were located by exact id — `UNIT`, `SCALE`, `DECIMALS_DISPLAYED` — which is the convention on IMF-authored structures and only those. Structures the IMF publishes but did not author name the same facts differently, so `NA_MAIN` reported `unit`, `scale`, and `decimals` as `null` for every series while its payload carried `DECIMALS` `2` and `UNIT_MULT` `0`, and the formatted channel dropped the `Series:` line entirely for having nothing to print.
 
-Naming the observed exceptions would have left the same defect on whatever was not sampled, so the alias sets come from the catalog rather than from the report: every dataflow's DSD attribute list, read for the ids whose `attributeRelationship.dimensions` spans the *entire* series key. A `dimensions` relationship over a proper subset of it is a different attachment level — `dimensionGroup` in the live payload, not `series` — and reading it the same way would misidentify a defect this decoder can't reach either way (see Known Limitations). The declared set is a superset of what any data response carries, so it bounds the problem — 222 dataflows over 214 distinct structures yield seven full-series-key spellings, tabulated under *Decoding series attributes* above, and three dataflows outside the IMF convention: `NA_MAIN`, `SDG`, `PCPS`.
+Naming the observed exceptions would have left the same defect on whatever was not sampled, so the alias sets come from the catalog rather than from the report: every dataflow's DSD attribute list, read for the ids whose `attributeRelationship.dimensions` spans the *entire* series key. A `dimensions` relationship over a proper subset of it is a different attachment level — `dimensionGroup` in the live payload, not `series` — and reading it the same way would misidentify a defect an index into the series array cannot reach (decision 16). The declared set is a superset of what any data response carries, so it bounds the problem — 222 dataflows over 214 distinct structures yield seven full-series-key spellings, tabulated under *Decoding series attributes* above, and three dataflows outside the IMF convention: `NA_MAIN`, `SDG`, `PCPS`.
 
 `PRECISION` and `SDG`'s `UNIT_MULT` are the near misses, and both are excluded for the same structural reason: they attach to the observation, so they sit in a different list, and an index taken from one list against the other array is meaningless rather than merely wrong.
 
 Two dataflows change what a caller sees. `NA_MAIN` reports scale `0` and 2 decimals where it reported nulls — and so renders a `Series:` line reading `no scale multiplier | 2 decimals`, its first. `SDG` reports units such as `PER_100000_POP`. `PCPS`'s `DECIMAL_DISPLAYED` is now located but carries no value upstream, so its output is unchanged until the IMF populates it.
 
 The alias list order is precedence, IMF spelling first. It is unreachable today — no dataflow declares two spellings of one concept — and exists so one that later does resolves identically on every request instead of by whichever id its payload lists first.
+
+### 16. An attribute is located by attachment level as well as by id
+
+Decision 15 found every id the portal spells `unit`, `scale`, and precision with, and still left `unit` null on most of the catalog — because the ids were only ever looked for in one of the two places the portal puts them. SDMX 3.0 buckets an attribute by how much of the series key its DSD relationship names: the whole key is `series` and lives on each series' own row, a proper subset is `dimensionGroup` and lives once per group in `dataSets[0].dimensionGroupAttributes`. Of 222 dataflows, `UNIT` or `UNIT_MEASURE` is declared against a subset on 164 and against the whole key on 2 — so the bucket the decoder read was the rare one. `scale` and precision run the other way and needed no change: never `dimensionGroup`, series-attached on 218 and 215 flows.
+
+A group key carries one colon-separated slot per declared dimension, in the same order the series key indexes and with the observation dimension last, so `WEO`'s three-dimension key produces four slots. The slots the group constrains hold an index into that dimension's `values`; the rest are empty and match anything. `":0::"` therefore reads as "INDICATOR is its first code, any country, any frequency, any period" — which is exactly what `UNIT` is declared against on `WEO`, `dimensions: ["INDICATOR"]`.
+
+Which slots a key constrains says which *relationship* the row was filed under; it does not say which *attribute* any one cell of that row describes. Half the catalog needs that distinction: 114 dataflows file group attributes over more than one subset — `FSIBSIS` puts `UNIT` under INDICATOR and `ACCOUNTS` under SECTOR + INDICATOR, `FAS` spreads ten attributes over COUNTRY, INDICATOR, and TYPE_OF_TRANSFORMATION — so a series falls in one row per subset and several rows describe it at once. Each concept is therefore taken from the bucket its own `relationship.dimensions` selects. Reading whichever row matched instead holds only while every row leaves the cells of other relationships null, which is a property of today's payloads rather than anything the format guarantees, and its failure is a plausible unit belonging to a different set of series rather than a visible gap. The relationship is ordered against the key before it names slots, since it lists its dimensions in no particular order: `QGDP_WCA` declares one against `["TYPE_OF_TRANSFORMATION", "INDICATOR"]`, the reverse of the key order.
+
+Group keys are indexed once by the slots they constrain, so a concept costs one keyed lookup per series however many groups or subsets the structure has. On a 40,000-series decode the dimension-group path adds roughly 10 ms over the same payload without one, and measures the same at 10 group keys as at 552 — the count `FSIBSIS` reaches against its 43,848 series.
+
+The series bucket wins any concept both levels describe. No structure declares one at two relationships today; the order is fixed so that one which later does is described by the statement made about it alone rather than by the one made about the set it belongs to.
+
+59 dataflows change what a caller sees, `WEO` and the regional REOs among them. `USA.NGDP_RPCH.A` reports `unit: "PT"` where it reported `null`, and a query spanning indicators gives each series its own: `USA.NGDPD.A` is `USD` at scale 9 while `USA.NGDP_RPCH.A` is `PT` unscaled. On `FSICDM`, where `UNIT` is declared against SECTOR + INDICATOR + TRANSFORMATION rather than the indicator alone, the six transformations of one distribution report separately: `USA.S12CFSI.AQ14.WQ1.Q` and its sibling quartiles are `PT` while `USA.S12CFSI.AQ14.WGTK.Q`, the kurtosis, is `_Z`. The other 105 declare a dimension-group unit their payloads never populate (see Known Limitations).
 
 ---
 
@@ -417,7 +431,8 @@ The alias list order is precedence, IMF spelling first. It is unreachable today 
 - **Shared DSDs list every flow that references them.** A `?references=all` DSD payload carries each dataflow sharing the structure, in an order the portal does not hold stable — `DSD_GFS` has returned different flows first across requests. Nothing on the payload marks which flow was asked for, so a flow's own identity (`name`, `version`, `agencyId`, `description`) is taken from the dataflow catalog entry, never from the structure payload's flow list.
 - **WEO forecast vs. historical.** WEO observations mix historical actuals and projections in a single series. The API does not flag which observations are projections vs. actuals; the `DERIVATION_TYPE` observation attribute carries this when present.
 - **SDMX 3.0 rate limits.** IMF has not published explicit rate limits for the SDMX 3.0 portal. Live testing showed no rate limiting on sequential requests, but large multi-country queries can be slow (2–10 seconds). Build with a 30-second timeout and 3-attempt retry with exponential backoff.
-- **`unit` is unreachable on most dataflows.** `UNIT` (and its aliases, decision 15) resolves as a true series-attribute only when its DSD relationship spans the whole series key. On the large majority of catalog entries — including `WEO` and `CPI` — the portal instead attaches it to a proper subset of the series dimensions, a distinct SDMX 3.0 bucket (`dimensionGroup`) the decoder does not read, so `unit` reports `null` there even though the value is present in the response. `scale`/`decimals` are not affected at comparable scale. Tracked as #33.
+- **Some dataflows declare a unit and ship no value for it.** Both attachment levels are decoded (decision 16), but a structure can declare `UNIT`, leave its `values` empty and omit `dimensionGroupAttributes` altogether — `CPI` does this for every key shape, as do `QNEA`, `MFS_*`, `IRFCL` and a long tail, and `AEA` does the same for its series attribute. `unit` is `null` there because the portal carries nothing to report, not because the decode misses it. 59 of the 164 flows that declare a dimension-group unit actually populate it.
+- **A `+` key can suppress dimension-group attributes upstream.** When a key combines codes with `+` on the very dimension a group is declared against and no position uses `*`, the portal omits `dataSets[0].dimensionGroupAttributes` entirely and ships the group definitions with empty `values` — `WEO`'s `USA.NGDP_RPCH+NGDPD.A` returns no unit for either series while `USA.NGDP_RPCH+NGDPD.*` and `*.NGDP_RPCH+NGDPD.A` return both. A `+` on any other dimension is unaffected (`USA+GBR.NGDP_RPCH.A` resolves normally). Nothing in the response distinguishes this from a flow that genuinely publishes no unit, so only a differently-shaped request recovers it — tracked as #34.
 
 ---
 
@@ -513,6 +528,39 @@ No authentication required. No API key header needed.
 | `decimals` | `DECIMALS_DISPLAYED`, `DECIMALS`, `DECIMAL_DISPLAYED` | `NA_MAIN` (`DECIMALS`), `PCPS` (`DECIMAL_DISPLAYED`) |
 
 `PRECISION` (205 structures) and `SDG`'s `UNIT_MULT` attach to the observation, not the series, so they never appear in the list these indices are taken against. No dataflow declares two spellings of one concept, so the precedence order is a tie-break that does not fire today.
+
+**Decoding dimension-group attributes.** An attribute whose DSD relationship names a proper subset of the series-key dimensions is not on any series' row. It sits in `structures[0].attributes.dimensionGroup`, and its values in `dataSets[0].dimensionGroupAttributes`, keyed by a partial dimension key:
+
+```json
+{
+  "dataSets": [{
+    "dimensionGroupAttributes": {
+      ":0::": [null, null, 0, null, null, null, null, null, null, null, null, 0, null, null, null, 0, null]
+    }
+  }],
+  "structures": [{
+    "attributes": {
+      "dimensionGroup": [
+        { "id": "FUNCTIONAL_CAT", "relationship": { "dimensions": ["INDICATOR"] }, "values": [] },
+        "…",
+        { "id": "UNIT", "relationship": { "dimensions": ["INDICATOR"] }, "values": [{ "id": "PT" }] }
+      ]
+    }
+  }]
+}
+```
+
+The key has one slot per declared dimension — series dimensions in `dimensions.series` order, then the observation dimension — so `WEO`'s `COUNTRY.INDICATOR.FREQUENCY` plus `TIME_PERIOD` gives the four slots of `":0::"`. A slot the group constrains holds an index into that dimension's `values`; every other slot is empty and matches any code. Slot 1 of `":0::"` is INDICATOR's first code, which is what pairs the row with `USA.NGDP_RPCH.A`. Each row is positional against the `dimensionGroup` definition list exactly as a series' `attributes` array is against `series`, so position 15 of the row above is `UNIT`'s entry, an index into its `values` → `"PT"`.
+
+Keys filed under different relationships share one map, so the mask alone does not say which attribute a cell belongs to. `FAS` files 184 keys constraining COUNTRY, 172 constraining INDICATOR, and 12 constraining TYPE_OF_TRANSFORMATION into the same object; a series matches one of each, and `UNIT`'s value is the one in the TYPE_OF_TRANSFORMATION row because that is the relationship `UNIT` declares. Each concept is looked up in the bucket its own relationship names, with the relationship's dimensions ordered against the key first — `QGDP_WCA` lists one of its relationships as `["TYPE_OF_TRANSFORMATION", "INDICATOR"]`, positions 2 and 1, which name slots `[1, 2]` only once sorted.
+
+| Attribute | Ids, in precedence order | Flows declaring it in `dimensionGroup` | Flows whose payload populates it |
+|:--|:--|--:|--:|
+| `unit` | `UNIT`, `UNIT_MEASURE` | 164 | 59 |
+| `scale` | `SCALE`, `UNIT_MULT` | 0 | — |
+| `decimals` | `DECIMALS_DISPLAYED`, `DECIMALS`, `DECIMAL_DISPLAYED` | 0 | — |
+
+The bucket carries far more than the three decoded concepts — `TRANSFORMATION` (143 flows), `SECTOR` (84), `ACCOUNTING_ENTRY` (69), `INDEX_TYPE` (54), `VALUATION` (52) and a long tail — none of which the tool surfaces.
 
 ### Error Patterns
 
