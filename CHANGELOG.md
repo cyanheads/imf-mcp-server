@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.9](changelog/0.2.x/0.2.9.md) — 2026-08-06
+
+imf_query_dataset resolves unit/scale/decimals by attribute concept instead of one fixed id, recovering values on NA_MAIN, SDG, and PCPS
+
 ## [0.2.8](changelog/0.2.x/0.2.8.md) — 2026-08-06
 
 imf_list_databases pages results and shortens descriptions; imf_query_dataset keeps per-series unit/scale/decimals across structuredContent and content[], resolves DECIMALS_DISPLAYED as a coded attribute, and separates an empty dataflow from an uncovered code in no_data
