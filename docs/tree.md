@@ -1,9 +1,10 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-07-11 16:56:30
+Generated on: 2026-08-06 17:08:48
 
 ```text
 imf-mcp-server/
+├── .cache/
 ├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json

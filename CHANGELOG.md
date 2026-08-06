@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.6](changelog/0.2.x/0.2.6.md) — 2026-08-06
+
+imf_get_database resolves codelists via enumeration URNs on IMF-authored dataflows, labels dimensions from the DSD concept scheme, and distinguishes a codelist_filter miss from an unresolved codelist
+
 ## [0.2.5](changelog/0.2.x/0.2.5.md) — 2026-08-06 · 🛡️ Security
 
 Security fix for a dataflow-list URL leak in error responses; imf_dataframe_query surfaces DataCanvas truncation, translates missing-table recovery, and accepts WITH … SELECT; adopt @cyanheads/mcp-ts-core ^0.11.1 (TypeScript 7, raised optional-peer floors)
