@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.10](changelog/0.2.x/0.2.10.md) — 2026-08-06
+
+imf_query_dataset decodes dimension-group attributes, recovering unit on WEO, CPI, and most of the catalog
+
 ## [0.2.9](changelog/0.2.x/0.2.9.md) — 2026-08-06
 
 imf_query_dataset matches unit/scale/decimals against every id the portal spells them with, recovering values on NA_MAIN and SDG
