@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.2.9](changelog/0.2.x/0.2.9.md) — 2026-08-06
 
-imf_query_dataset resolves unit/scale/decimals by attribute concept instead of one fixed id, recovering values on NA_MAIN, SDG, and PCPS
+imf_query_dataset matches unit/scale/decimals against every id the portal spells them with, recovering values on NA_MAIN and SDG
 
 ## [0.2.8](changelog/0.2.x/0.2.8.md) — 2026-08-06
 
