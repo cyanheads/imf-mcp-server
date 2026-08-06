@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.5-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.6-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -34,7 +34,7 @@ Five tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed c
 | Tool | Description |
 |:-----|:------------|
 | `imf_list_databases` | List all IMF SDMX dataflows available on the portal, with optional name/ID substring filtering |
-| `imf_get_database` | Fetch a dataflow's dimension list and complete codelist — resolves human terms to SDMX codes before querying |
+| `imf_get_database` | Fetch a dataflow's dimension list and a codelist preview per dimension — resolves human terms to SDMX codes before querying |
 | `imf_query_dataset` | Query a dataflow by dimension key over a time range; large result sets spill to DataCanvas |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call |
 | `imf_dataframe_query` | Run a read-only SQL SELECT across staged DataCanvas tables for multi-country comparisons and aggregations |
@@ -53,10 +53,11 @@ Entry point for every IMF query workflow — browse and filter the full dataflow
 
 Resolve human-readable terms to SDMX dimension codes before querying.
 
-- Returns all dimension IDs, positions, and their complete codelists (e.g. `"United States"` → `USA`, `"real GDP growth"` → `NGDP_RPCH`)
+- Returns every dimension ID, its position, its label from the DSD concept scheme (`WGT_TYPE` → `Weight Type`), and a codelist preview (e.g. `"United States"` → `USA`, `"real GDP growth"` → `NGDP_RPCH`)
 - Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE)
 - `key_format` field shows the exact dot-separated dimension order required by `imf_query_dataset`
 - Codelists truncated at 50 entries inline; use `codelist_filter` to search large codelists by substring (returns all matches, uncapped), or the `imf://database/{dataflow_id}` resource for the full list
+- A filter that matches nothing is reported distinctly from a codelist that could not be resolved — the two need opposite next steps
 
 ---
 

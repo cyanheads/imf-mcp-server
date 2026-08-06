@@ -7,7 +7,7 @@
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
 | `imf_list_databases` | List all IMF SDMX dataflows available on the portal. Returns id, agencyID, version, name, description. Entry point — every query requires a dataflow id. | `filter` (optional name substring), `include_vintages` (bool, default false) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
-| `imf_get_database` | Fetch a dataflow's dimension list plus the complete codelist for each dimension. Resolves human terms to SDMX codes ("United States" → USA, "real GDP growth" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
+| `imf_get_database` | Fetch a dataflow's dimension list plus a codelist preview for each dimension — first 50 entries by default, every substring match when `codelist_filter` is set, and complete codelists from the `imf://database/{dataflow_id}` resource. Resolves human terms to SDMX codes ("United States" → USA, "real GDP growth" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional), `codelist_filter` (optional substring) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, unit, scale, and status attributes. Large analytical result sets spill to DataCanvas for SQL — returns `canvas_id` + `table_name`. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call. Shows table name, row count, and column schema. | `canvas_id` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_dataframe_query` | Run a read-only SQL SELECT against a staged DataCanvas table. Enables multi-country comparisons, time-series aggregation, and cross-indicator joins without hand-rolled loops. | `canvas_id`, `sql` (one SELECT statement; a leading `WITH … SELECT` CTE is accepted) | `readOnlyHint: true`, `openWorldHint: false` |
@@ -36,8 +36,20 @@ The service applies the error boundary: a failed catalog fetch is logged with it
 
 **Output:**
 - `dataflow_id`, `agency_id`, `version`, `name`, `description`
+- `codelist_filter`: string, present only when a filter was applied — echoing it is what separates "your filter matched nothing" from "this codelist could not be resolved", since both render as an empty array
 - `key_format`: string — dimension names in order, e.g. `"COUNTRY.INDICATOR.FREQUENCY"` (agents must see this to construct keys without re-fetching the DSD)
-- `dimensions`: array of `{ id, name, position, codelist: [{ id, name }] }` — full codelist per dimension
+- `dimensions`: array of `{ id, name, position, codelist: [{ id, name }], codelist_truncated }` — `name` is the label from the DSD concept scheme (`WGT_TYPE` → `Weight Type`), falling back to the id when the structure names no concept; `codelist` is capped at 50 entries unless `codelist_filter` is set
+
+**Enrichment:**
+- `notice`: emitted when `codelist_filter` matched nothing in any dimension (names the filter and the unfiltered entry counts) or when a dimension has no resolvable codelist (names the dimensions and points at the resource). Reaches both `structuredContent` and the `content[]` trailer.
+
+**Codelist resolution.** Each dimension's codelist is resolved from the `?references=all` payload, authoritative references first:
+
+1. The dimension's `localRepresentation.enumeration` Codelist URN — present on the ESTAT- and IAEG-SDGs-authored structures the portal serves (`NA_MAIN`, `SDG`).
+2. The `coreRepresentation.enumeration` URN on the concept named by the dimension's `conceptIdentity` — the reference on IMF-authored structures, which carry no `localRepresentation`. This is what resolves the dimensions no naming convention can name: `QNEA`'s `CL_NEA_*` (codelist token differs from the DSD id), `DIP`/`IMTS`'s `COUNTERPART_COUNTRY` (reuses the primary `CL_*_COUNTRY`), and `LS`'s `CL_LS_TYPE_OF_TRANSFORMAtION` (upstream casing typo, cited verbatim in the URN).
+3. The IMF naming convention — `CL_<FLOW>_<DIM>[_PUB]` then `CL_<DIM>[_PUB]`, with the flow token taken from the DSD's own id. Retained for dimensions neither URN resolves.
+
+A URN's version routinely trails the shipped codelist's patch (`CL_CTOT_INDICATOR` cited at `2.0.0`, shipped at `2.0.1`), so lookup widens on each miss: `AGENCY:ID:VERSION` → `AGENCY:ID` → `ID`.
 
 **Error contract:**
 ```
@@ -142,7 +154,7 @@ Every reason the DataCanvas gate can raise on `query()` is mapped onto one of th
 |:-------------|:------------|:-----------|
 | `imf://database/{dataflow_id}` | Metadata for a single dataflow — dimensions, codelists, name, description. Stable reference for known dataflow IDs (WEO, BOP, CPI, etc.). | None (single record) |
 
-**Resource error behavior:** throws `notFound()` when `dataflow_id` is not in the live dataflow list, and a `serviceUnavailable` carrying `reason: 'dataflow_list_unavailable'` when the catalog itself cannot be fetched. Same output schema as `imf_get_database` (`key_format`, `dimensions` with full codelists).
+**Resource error behavior:** throws `notFound()` when `dataflow_id` is not in the live dataflow list, and a `serviceUnavailable` carrying `reason: 'dataflow_list_unavailable'` when the catalog itself cannot be fetched. Shares `imf_get_database`'s shape (`key_format`, `dimensions`) and resolution, but returns complete codelists — no 50-entry cap and no `codelist_filter`.
 
 ### Prompts
 
@@ -286,7 +298,7 @@ The portal exposes 70+ `_VINTAGE` dataflows (e.g. `WEO_2025_OCT_VINTAGE`, `CPI_2
 - **Inline path:** render `key_format`, `start_period`–`end_period` context, unit/scale, and the observations as a markdown table (time_period | value | status). Append a `truncated: true` notice with the suggestion to use `canvas_id` if applicable.
 - **Canvas spill path:** render the canvas handle summary — `canvas_id`, `table_name`, `observation_count` — plus instructions for follow-up (`imf_dataframe_describe` → `imf_dataframe_query`). Claude Desktop clients see only `content[]`; without this, they receive no usable data on spill.
 
-`imf_get_database` format: render `key_format` prominently (first line), then each dimension with its codelist entries as a markdown list. The codelist can be large — truncate at ~50 entries per dimension with a count appended.
+`imf_get_database` format: render `key_format` prominently (first line), then each dimension with its codelist entries as a markdown list. The codelist can be large — truncate at 50 entries per dimension and name the two ways to reach the rest (`codelist_filter`, the resource). A dimension with no entries renders one of two lines depending on whether `codelist_filter` is echoed in the result: a filter miss, or a codelist that could not be resolved.
 
 ### 8. Caching strategy
 
