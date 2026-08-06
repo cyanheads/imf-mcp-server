@@ -6,15 +6,35 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `imf_list_databases` | List all IMF SDMX dataflows available on the portal. Returns id, agencyID, version, name, description. Entry point — every query requires a dataflow id. | `filter` (optional name substring), `include_vintages` (bool, default false) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
+| `imf_list_databases` | List IMF SDMX dataflows available on the portal, one page at a time. Returns id, agencyID, version, name, and a shortened description. Entry point — every query requires a dataflow id. | `filter` (optional name substring), `include_vintages` (bool, default false), `limit` (1–200, default 50), `offset` (default 0) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_get_database` | Fetch a dataflow's dimension list plus a codelist preview for each dimension — first 50 entries by default, every substring match when `codelist_filter` is set, and complete codelists from the `imf://database/{dataflow_id}` resource. Resolves human terms to SDMX codes ("United States" → USA, "real GDP growth" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional), `codelist_filter` (optional substring) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
-| `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, unit, scale, and status attributes. Large analytical result sets spill to DataCanvas for SQL — returns `canvas_id` + `table_name`. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, and status, plus unit/scale/decimals per series. Large analytical result sets spill to DataCanvas for SQL — returns `canvas_id` + `table_name`. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call. Shows table name, row count, and column schema. | `canvas_id` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_dataframe_query` | Run a read-only SQL SELECT against a staged DataCanvas table. Enables multi-country comparisons, time-series aggregation, and cross-indicator joins without hand-rolled loops. | `canvas_id`, `sql` (one SELECT statement; a leading `WITH … SELECT` CTE is accepted) | `readOnlyHint: true`, `openWorldHint: false` |
 
 ### Tool Details
 
 #### `imf_list_databases`
+
+**Input constraints:**
+- `filter`: string — case-insensitive substring, matched against id, name, and the **untruncated** description, so a term that survives only in the full text still finds its dataflow.
+- `limit`: integer 1–200, default 50. `offset`: integer ≥ 0, default 0. Both are rejected out of range rather than clamped — a silently-capped limit reads as a complete result.
+
+**Output:**
+- `dataflows`: array of `{ id, agency_id, version, name, description? }` — this page only
+- `total_count`: matches for `filter` + `include_vintages`, before `limit`/`offset`
+- `returned_count`: length of `dataflows`; `offset`: matches skipped before this page
+
+**Enrichment:**
+- `notice`: emitted when the filter matched nothing (names the filter and the unfiltered total), when `offset` sits past the end of the match set, or when matches remain beyond this page — the last names the exact next `offset`.
+
+**Paging and description shortening.** The catalog is the first call of every workflow, and an unfiltered one used to return all 103 non-vintage dataflows with full descriptions in both channels: 116 KB, of which descriptions were 45.6 KB (median 341 characters, maximum 1,519). That is spent before the caller has chosen anything.
+
+Two independent cuts apply. Descriptions are truncated to 200 characters with a trailing `…`; nothing is lost, because `imf_get_database` and the `imf://database/{dataflow_id}` resource return the full text for the one dataflow the caller picks, and `filter` still searches the untruncated string. Results are then paged at 50 by default.
+
+A page must be recognizable as a page — that is what `total_count` alongside `returned_count`, the notice naming the next `offset`, and the `showing N–M` heading in `format()` are for. A bare count above a shorter list is how a page gets read as the whole catalog.
+
+Rejected: a `verbose` boolean toggling full descriptions. One flag instead of two, but an agent that does not already know the catalog is 103 entries deep has no reason to reach for it, so the expensive shape would stay the default.
 
 **Error contract:**
 ```
@@ -76,8 +96,9 @@ errors: [
 
 **Output (inline, no canvas spill):**
 - `dataflow_id`, `key`, `start_period`, `end_period`
-- `observations`: array of `{ time_period: string, value: number | null, status: string | null }`
-- `series_attributes`: `{ unit: string | null, scale: string | null, decimals: number | null }`
+- `observations`: array of `{ series_key: string, time_period: string, value: number | null, status: string | null }`
+- `series_attributes`: `{ unit: string | null, scale: string | null, decimals: number | null }` — the **first** series in the result
+- `series_metadata`: array of `{ series_key, unit, scale, decimals }`, present only when the query resolved to more than one series
 - `observation_count`: number
 - `truncated`: boolean (true when result was trimmed to preview budget; set `canvas_id` to retrieve full set)
 
@@ -85,6 +106,7 @@ errors: [
 - `canvas_id`: string — pass to `imf_dataframe_query` / `imf_dataframe_describe`
 - `table_name`: string
 - `observation_count`: number
+- `series_metadata` — as above, describing the whole staged table rather than the inline preview
 - `truncated: true`
 
 **Error contract:**
@@ -94,8 +116,8 @@ errors: [
     when: 'dataflow_id does not match any known dataflow',
     recovery: 'Call imf_list_databases to browse available dataflow IDs.' },
   { reason: 'no_data', code: NotFound,
-    when: 'Key is structurally valid but the dataflow holds no series for this code combination',
-    recovery: 'Check the availability context in the error — if series_count is 0 the code has no coverage; if series_count > 0 the combination is wrong and available_codes names the codes that do have data, stating how many of a dimension it is showing when the list is capped.' },
+    when: 'Key is structurally valid but the dataflow holds no series for this code combination, or the dataflow publishes no series at all',
+    recovery: 'Read the availability context in the error. An empty dataflow means no key will return data — call imf_list_databases and pick another dataflow. Otherwise, series_count 0 means the code itself has no coverage and dataflow_availability names codes that do, while series_count above 0 means the combination is wrong and available_codes names the codes that have data, stating how many of a dimension it shows when the list is capped.' },
   { reason: 'no_data_in_range', code: NotFound,
     when: 'The key returned observations but start_period/end_period excluded every one of them',
     recovery: 'The key is valid — widen start_period/end_period to overlap the period range reported in the error, or omit both to get the full series.' },
@@ -217,7 +239,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 
 1. **Config and server setup** — `src/config/server-config.ts` with `IMF_BASE_URL`, `IMF_REQUEST_TIMEOUT_MS`; canvas accessor wired in `setup()`
 2. **ImfSdmxService** — `fetchDataflows()`, `fetchDataStructure()`, `fetchData()` with retry, timeout, SDMX-JSON parse; dimension key builder; observation decoder (position index → time label)
-3. **`imf_list_databases`** — list + name-filter; inline preview (the full list fits)
+3. **`imf_list_databases`** — list + name-filter, paged with `limit`/`offset` and shortened descriptions (the full catalog does not fit a single response worth spending)
 4. **`imf_get_database`** — DSD fetch with `?references=all`; dimensions + codelists; local name→code resolution
 5. **`imf_query_dataset`** — key validation, data fetch, observation decode, spillover for large results
 6. **`imf_dataframe_describe` + `imf_dataframe_query`** — canvas query pair (no-op when canvas disabled)
@@ -342,6 +364,38 @@ The `no_data` enrichment is the caller's only view of coverage — no tool expos
 
 Annotating rather than suppressing the sample. Suppression removes the only coverage-grounded code list the caller ever sees, and the remaining route — searching `imf_get_database` — cannot answer coverage by construction: `PIP`'s `ACCOUNTING_ENTRY` codelist runs past the 50-entry preview while exactly two of its codes have data. Mid-size dimensions are the common case and the one where a sample earns its tokens: 20 of `PIP`'s 46 covered indicators is enough to spot a mistyped code, where 20 of 210 countries is not — but the annotation costs nothing in either case, and neither misleads.
 
+### 12. Series attributes belong to a series, not to a query
+
+`+` and `*` keys are the tool's main analytical shape, and the series they resolve to do not share attributes: in `USA.NGDPD+NGDP_RPCH.A`, `NGDPD` carries `SCALE` `9` while `NGDP_RPCH` carries the `0` sentinel. One flat `series_attributes` record therefore describes at most one of them. Attributes are decoded per series and keyed by decoded series key, and everything downstream — the inline payload, the canvas rows, the rendered table — reads them through that key, so a row can only receive its own series' unit and scale.
+
+The output stays additive rather than redefining the existing field: `series_attributes` keeps working for the single-series case that dominates, and a query resolving to more than one series carries `series_metadata` alongside it, one entry per distinct `series_key`. A caller that never issues a multi-series key sees an unchanged response, and one that does gets a list keyed to the same `series_key` its observations carry. `series_attributes` describes the first series in that case, and its `.describe()` says so — an unlabeled "one of them" is what made the field misleading in the first place.
+
+`DECIMALS_DISPLAYED` is decoded the same way as the other coded attributes. The series entry holds an index into the attribute definition's `values`, not the digit count: WEO's `[0, 0, 0, …]` against `values: [{ id: "3" }]` reads as 0 decimals for a series that displays 3. Reading it straight was reporting the index.
+
+### 13. The formatted channel carries what the structured one does
+
+Clients differ in which surface they forward, so an attribute present only in `structuredContent` is invisible to half of them. The `Series:` line used to be gated on a *meaningful* scale, which meant a series with the `0` sentinel and no unit rendered nothing at all — dropping `decimals` with it, and leaving a `content[]`-only client with no precision or scale information for the most common WEO shape.
+
+The sentinel and the suppression are separable concerns. A bare `0` beside a value is genuinely misleading — it reads as an observation of zero or a multiplier of zero — but the fix for that is to name it, not to drop the line: scale `0` renders as `no scale multiplier`, and every other attribute renders beside it. `structuredContent` still carries the raw upstream code, so nothing is normalized away before the structured channel. A multi-series result renders the same facts as a per-series table instead of a single line.
+
+The line is omitted only when the series has no attributes at all, which is the one case where there is nothing to say.
+
+### 14. An empty dataflow is a different failure from an uncovered code
+
+The `no_data` availability enrichment (decision 10) blamed the caller's first dimension code whenever `series_count` was 0. For a dataflow that publishes nothing — several recent `_VINTAGE` flows, reachable through `include_vintages: true` — every code produces that message, so the recovery ("try a different code") is a loop with no exit.
+
+The discriminator is not visible in the key-scoped constraint. `availableconstraint/EER/TUR..` (an uncovered country in a dataflow holding 732 series) and `availableconstraint/CPI_2026_MAY_VINTAGE/USA..` (an empty dataflow) return the same document apart from the ids: `series_count: 0` and a `<str:CubeRegion include="true"/>` with no `KeyValue` children. An empty cube region therefore distinguishes nothing.
+
+The dataflow-wide constraint does. `availableconstraint/{flow}/` reports the flow's own series count — 732 for `EER`, 0 for `CPI_2026_MAY_VINTAGE` — and, when non-zero, a cube region naming codes that do have data. So a `series_count: 0` result triggers one further request, only on a path that already has no data to return:
+
+| Key-scoped `series_count` | Dataflow-wide `series_count` | Diagnosis |
+|--:|--:|:--|
+| 0 | 0 | The dataflow is empty — recovery points at `imf_list_databases`, never at another code |
+| 0 | > 0 | The code is uncovered — recovery keeps its wording and now names codes that do have data |
+| > 0 | not requested | The combination is wrong (decision 10, unchanged) |
+
+A failed second probe degrades to the previous per-code message rather than masking the diagnosis, matching how the first probe already degrades.
+
 ---
 
 ## Known Limitations
@@ -434,6 +488,8 @@ No authentication required. No API key header needed.
 ```
 
 **Decoding observations:** Series key `"0:0:0"` = indices into each series dimension's `values` array. Observation key `"0"` = index into `structures[0].dimensions.observation[0].values` → time label. Observation value `["-0.257"]` = `[OBS_VALUE, ...attribute_values]` (attribute order from `structures[0].attributes.observation`).
+
+**Decoding series attributes:** a series' `attributes` array is positional against `structures[0].attributes.series`, and each entry is an *index* into that definition's `values` — not the value. `SCALE` `[{ id: "9" }, { id: "0" }]` with an entry of `0` means scale 9, and `DECIMALS_DISPLAYED` `[{ id: "3" }]` with an entry of `0` means three decimals. An attribute definition that ships no `values` (e.g. `COUNTRY_UPDATE_DATE`) carries its literal inline instead, so the decode resolves through `values` when present and falls back to the raw entry when not. Every series in a multi-series response points into the same definition list at different indices — which is why the attributes are per series.
 
 ### Error Patterns
 
