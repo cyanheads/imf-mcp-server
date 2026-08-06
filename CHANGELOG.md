@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.2.11](changelog/0.2.x/0.2.11.md) — 2026-08-06
 
-imf_query_dataset recovers unit/scale/decimals a + key with no * suppresses upstream, via one bounded attributes-only probe request
+imf_query_dataset recovers the unit a + key with no * suppresses upstream, via one bounded attributes-only probe request
 
 ## [0.2.10](changelog/0.2.x/0.2.10.md) — 2026-08-06
 
