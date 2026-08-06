@@ -12,8 +12,12 @@
  * capped, with the pre-cap count preserved), #28 (dimension labels), #30 (a
  * shared DSD does not hand one flow another flow's description), #32 (unit,
  * scale, and precision decode the same whichever of the portal's ids name them),
- * and #33 (an attribute declared against a subset of the series key resolves from
- * the dimension group covering each series).
+ * #33 (an attribute declared against a subset of the series key resolves from
+ * the dimension group covering each series), and #34 (a group the portal empties
+ * because the key combines codes with `+` on a dimension it is declared against
+ * is recovered by one bounded attributes-only request under a wildcard key —
+ * and every other key shape, including the many dataflows that declare a unit
+ * and publish none, still costs exactly one request).
  *
  * Fixtures are modeled on the live api.imf.org SDMX 3.0 response shapes: dataflow
  * `structure` is a URN string; `localRepresentation.enumeration` is a Codelist URN
@@ -2158,5 +2162,457 @@ describe('ImfSdmxService.fetchData dimension-group attributes (#33)', () => {
     expect(result.seriesAttributesByKey['C7.IND7.A']?.unit).toBe('U7');
     expect(result.seriesAttributesByKey['C150.IND5.A']?.unit).toBe('U5');
     expect(elapsedMs).toBeLessThan(1500);
+  });
+});
+
+// --- #34: the portal ships the declared group empty for a + key with no * -------
+
+/** A codelist of `size` synthetic codes, as `?references=all` ships them. */
+const codelistOf = (id: string, size: number) => ({
+  id,
+  agencyID: 'IMF.RES',
+  version: '1.0.0',
+  codes: Array.from({ length: size }, (_, i) => ({
+    id: `${id}_${i}`,
+    names: { en: `${id} ${i}` },
+  })),
+});
+
+/**
+ * `WEO`'s three dimensions with their live codelist sizes: 210 countries, 145
+ * indicators, and a frequency list of 2. Sizes are what the probe picks its
+ * widen position by, so they are the point of the fixture — widening COUNTRY
+ * costs 220 KB against FREQUENCY's 6.5 KB on the live portal.
+ */
+const WEO34_DSD = {
+  data: {
+    dataStructures: [
+      {
+        id: 'DSD_WEO',
+        agencyID: 'IMF.RES',
+        version: '9.0.0',
+        names: { en: 'World Economic Outlook' },
+        dataStructureComponents: {
+          dimensionList: {
+            dimensions: [
+              {
+                id: 'COUNTRY',
+                position: 0,
+                localRepresentation: {
+                  enumeration:
+                    'urn:sdmx:org.sdmx.infomodel.codelist.Codelist=IMF.RES:CL_WEO_COUNTRY(1.0.0)',
+                },
+              },
+              {
+                id: 'INDICATOR',
+                position: 1,
+                localRepresentation: {
+                  enumeration:
+                    'urn:sdmx:org.sdmx.infomodel.codelist.Codelist=IMF.RES:CL_WEO_INDICATOR(1.0.0)',
+                },
+              },
+              {
+                id: 'FREQUENCY',
+                position: 2,
+                localRepresentation: {
+                  enumeration:
+                    'urn:sdmx:org.sdmx.infomodel.codelist.Codelist=IMF.RES:CL_WEO_FREQUENCY(1.0.0)',
+                },
+              },
+            ],
+          },
+        },
+      },
+    ],
+    codelists: [
+      codelistOf('CL_WEO_COUNTRY', 210),
+      codelistOf('CL_WEO_INDICATOR', 145),
+      codelistOf('CL_WEO_FREQUENCY', 2),
+    ],
+  },
+};
+
+const WEO34_DATAFLOW_LIST = {
+  data: {
+    dataflows: [
+      {
+        id: 'WEO',
+        agencyID: 'IMF.RES',
+        version: '9.0.0',
+        names: { en: 'World Economic Outlook (WEO)' },
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=IMF.RES:DSD_WEO(9.0+.0)',
+      },
+    ],
+  },
+};
+
+/**
+ * The live `USA.NGDP_RPCH+NGDPD.A` response: two series with their own scale and
+ * precision, `UNIT` declared against INDICATOR and shipped with no values, and
+ * no `dimensionGroupAttributes` at all.
+ */
+const weo34Suppressed = () =>
+  weoDimensionGroupFixture({
+    countries: ['USA'],
+    indicators: ['NGDPD', 'NGDP_RPCH'],
+    series: { '0:0:0': [0, 0, 0, '9/30/2025'], '0:1:0': [1, 0, 0, '9/30/2025'] },
+    unitCodes: [],
+    dimensionGroupAttributes: {},
+  });
+
+/**
+ * What the same series come back as under a wildcard key: the group definitions
+ * carry their codes and every group has a row. `indicators` is listed in the
+ * reverse order of the suppressed response on purpose — the live portal does
+ * reorder a dimension's `values` between two differently-shaped requests for the
+ * same series, so a recovered value carried by index rather than by code lands
+ * on the wrong series.
+ */
+const weo34Probe = () =>
+  weoDimensionGroupFixture({
+    countries: ['USA'],
+    indicators: ['NGDP_RPCH', 'NGDPD'],
+    series: { '0:0:0': [1, 0, 0, '9/30/2025'], '0:1:0': [0, 0, 0, '9/30/2025'] },
+    unitCodes: ['PT', 'USD'],
+    dimensionGroupAttributes: { ':0::': groupRow(0), ':1::': groupRow(1) },
+  });
+
+describe('ImfSdmxService.fetchData suppressed dimension groups (#34)', () => {
+  let svc: ImfSdmxService;
+  let requested: string[];
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    requested = [];
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+  });
+
+  /**
+   * Serves the four requests a repaired query makes: the dataflow catalog, the
+   * DSD the widen position is sized against, the data response, and the probe.
+   * `probe` may be a payload, or a thrower standing in for an upstream that
+   * fails, times out, or answers with something unparseable.
+   */
+  const serve = (main: unknown, probe: unknown | (() => never), dsd: unknown = WEO34_DSD) => {
+    fetchWithTimeout.mockImplementation((url: string) => {
+      requested.push(url);
+      if (url.includes('/structure/datastructure/')) return Promise.resolve(mkResp(200, dsd));
+      if (/\/structure\/dataflow\/[^/]+\//.test(url)) return Promise.resolve(mkResp(204, null));
+      if (url.includes('/structure/dataflow'))
+        return Promise.resolve(mkResp(200, WEO34_DATAFLOW_LIST));
+      if (url.includes('measures=none')) {
+        if (typeof probe === 'function') return Promise.reject(new Error('probe unavailable'));
+        return Promise.resolve(mkResp(200, probe));
+      }
+      return Promise.resolve(mkResp(200, main));
+    });
+  };
+
+  const query = (key: string) =>
+    svc.fetchData(
+      'IMF.RES',
+      'WEO',
+      '9.0.0',
+      key,
+      undefined,
+      undefined,
+      createMockContext({ tenantId: 'test' }),
+    );
+
+  /** The data requests only — the catalog and DSD reads are cached and not the cost in question. */
+  const dataRequests = () => requested.filter((url) => url.includes('/data/dataflow/'));
+  const probeRequests = () => dataRequests().filter((url) => url.includes('measures=none'));
+
+  it('reports the units of a + key with no * that the * form reports', async () => {
+    serve(weo34Suppressed(), weo34Probe());
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']).toEqual({
+      unit: 'USD',
+      scale: '9',
+      decimals: 3,
+    });
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']).toEqual({
+      unit: 'PT',
+      scale: '0',
+      decimals: 3,
+    });
+  });
+
+  it('keeps every observation the query asked for', async () => {
+    serve(weo34Suppressed(), weo34Probe());
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.A');
+
+    // The probe answers a metadata question; it must not add, drop, or reorder
+    // a single row of the result the caller asked for.
+    expect(result.observations).toEqual([
+      { series_key: 'USA.NGDPD.A', time_period: '2023', value: 1.5, status: null },
+      { series_key: 'USA.NGDP_RPCH.A', time_period: '2023', value: 1.5, status: null },
+    ]);
+  });
+
+  it('makes exactly one probe request for one query', async () => {
+    serve(weo34Suppressed(), weo34Probe());
+
+    await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(probeRequests()).toHaveLength(1);
+    expect(dataRequests()).toHaveLength(2);
+  });
+
+  it('widens the smallest codelist outside the group, not the dimension carrying it', async () => {
+    // Any * restores the values, so the position is a pure cost choice: FREQUENCY
+    // at 2 codes over INDICATOR at 145 (and it carries the group) and COUNTRY at 210.
+    serve(weo34Suppressed(), weo34Probe());
+
+    await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(probeRequests()[0]).toContain(encodeURIComponent('USA.NGDP_RPCH+NGDPD.*'));
+  });
+
+  it('does not probe a key whose groups already carry their values', async () => {
+    serve(
+      weoDimensionGroupFixture({
+        countries: ['USA'],
+        indicators: ['NGDPD', 'NGDP_RPCH'],
+        series: { '0:0:0': [0, 0, 0, '9/30/2025'], '0:1:0': [1, 0, 0, '9/30/2025'] },
+        unitCodes: ['USD', 'PT'],
+        dimensionGroupAttributes: { ':0::': groupRow(0), ':1::': groupRow(1) },
+      }),
+      weo34Probe(),
+    );
+
+    const result = await query('USA.NGDPD+NGDP_RPCH.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBe('USD');
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.unit).toBe('PT');
+    expect(probeRequests()).toHaveLength(0);
+  });
+
+  it('does not probe a key that already carries a *', async () => {
+    // A * is what makes the portal emit the values, so this response is already
+    // as complete as the portal will make it — a second request cannot improve it.
+    serve(weo34Suppressed(), weo34Probe());
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.*');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBeNull();
+    expect(probeRequests()).toHaveLength(0);
+  });
+
+  it('does not probe a key with no + on it, however empty the group came back', async () => {
+    // Around a hundred dataflows declare a unit and publish none, and their every
+    // response looks exactly like a suppressed one. Only the + shape is repairable,
+    // so probing on the empty group alone spends a request per query on all of
+    // them and always ends in the same null.
+    const single = weoDimensionGroupFixture({
+      countries: ['USA'],
+      indicators: ['NGDPD'],
+      series: { '0:0:0': [0, 0, 0, '9/30/2025'] },
+      unitCodes: [],
+      dimensionGroupAttributes: {},
+    });
+    serve(single, weo34Probe());
+
+    const result = await query('USA.NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBeNull();
+    expect(result.observations).toHaveLength(1);
+    expect(probeRequests()).toHaveLength(0);
+    expect(dataRequests()).toHaveLength(1);
+  });
+
+  it('does not probe a + that falls outside the dimensions the group is declared against', async () => {
+    // WEO declares UNIT against INDICATOR, and the portal suppresses only for a +
+    // there — USA+GBR.NGDP_RPCH.A resolves normally upstream. A + elsewhere is
+    // therefore never the cause of an empty group, and a probe cannot repair it.
+    const plusOnCountry = weoDimensionGroupFixture({
+      countries: ['GBR', 'USA'],
+      indicators: ['NGDPD'],
+      series: { '0:0:0': [0, 0, 0, '9/30/2025'], '1:0:0': [0, 0, 0, '9/30/2025'] },
+      unitCodes: [],
+      dimensionGroupAttributes: {},
+    });
+    serve(plusOnCountry, weo34Probe());
+
+    const result = await query('USA+GBR.NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBeNull();
+    expect(result.seriesAttributesByKey['GBR.NGDPD.A']?.unit).toBeNull();
+    expect(probeRequests()).toHaveLength(0);
+  });
+
+  it('probes a + on the group dimension even when another position also carries one', async () => {
+    const bothPlus = weoDimensionGroupFixture({
+      countries: ['GBR', 'USA'],
+      indicators: ['NGDPD', 'NGDP_RPCH'],
+      series: {
+        '0:0:0': [0, 0, 0, '9/30/2025'],
+        '0:1:0': [1, 0, 0, '9/30/2025'],
+        '1:0:0': [0, 0, 0, '9/30/2025'],
+        '1:1:0': [1, 0, 0, '9/30/2025'],
+      },
+      unitCodes: [],
+      dimensionGroupAttributes: {},
+    });
+    serve(bothPlus, weo34Probe());
+
+    const result = await query('USA+GBR.NGDP_RPCH+NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBe('USD');
+    expect(result.seriesAttributesByKey['GBR.NGDP_RPCH.A']?.unit).toBe('PT');
+    expect(probeRequests()).toHaveLength(1);
+    // The + list on COUNTRY is carried into the probe; only FREQUENCY widens.
+    expect(probeRequests()[0]).toContain(encodeURIComponent('USA+GBR.NGDP_RPCH+NGDPD.*'));
+  });
+
+  it('widens a larger codelist rather than the group dimension when the group carries the smallest', async () => {
+    // Widening the dimension the group is declared against multiplies the group
+    // rows themselves, so it is excluded however cheap its codelist looks. Here
+    // INDICATOR holds 2 codes against FREQUENCY's 12 — smallest of the three, and
+    // still not the one to widen.
+    const narrowIndicatorDsd = structuredClone(WEO34_DSD);
+    narrowIndicatorDsd.data.codelists = [
+      codelistOf('CL_WEO_COUNTRY', 210),
+      codelistOf('CL_WEO_INDICATOR', 2),
+      codelistOf('CL_WEO_FREQUENCY', 12),
+    ];
+    serve(weo34Suppressed(), weo34Probe(), narrowIndicatorDsd);
+
+    await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(probeRequests()[0]).toContain(encodeURIComponent('USA.NGDP_RPCH+NGDPD.*'));
+  });
+
+  it('does not probe a group the payload declares without a relationship', async () => {
+    // Nothing then says which slots of a group key describe the attribute, so no
+    // response of any shape could be read for it — and the request would be spent
+    // on a value that could not be placed.
+    const noRelationship = weo34Suppressed();
+    noRelationship.data.structures[0].attributes.dimensionGroup = [
+      { id: 'UNIT', values: [] as Array<{ id: string }> },
+    ];
+    serve(noRelationship, weo34Probe());
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBeNull();
+    expect(probeRequests()).toHaveLength(0);
+  });
+
+  it('does not probe a payload that declares no dimension group at all', async () => {
+    serve(WEO_TWO_SERIES, weo34Probe());
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']).toEqual({
+      unit: null,
+      scale: '9',
+      decimals: 3,
+    });
+    expect(probeRequests()).toHaveLength(0);
+  });
+
+  it('leaves the unit null when the probe carries nothing either', async () => {
+    // A dataflow that declares a unit and genuinely publishes none — CPI and a
+    // long tail — looks identical in one response. It costs one bounded request
+    // and ends where it started: null, and a successful query.
+    serve(weo34Suppressed(), weo34Suppressed());
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBeNull();
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.unit).toBeNull();
+    expect(result.observations).toHaveLength(2);
+    expect(probeRequests()).toHaveLength(1);
+  });
+
+  it('answers the query when the probe fails, rather than failing with it', async () => {
+    serve(weo34Suppressed(), () => {
+      throw new Error('unreachable');
+    });
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']).toEqual({
+      unit: null,
+      scale: '9',
+      decimals: 3,
+    });
+    expect(result.observations).toHaveLength(2);
+    // One attempt, no retry — a failing probe may not multiply into a retry budget.
+    expect(probeRequests()).toHaveLength(1);
+  });
+
+  it('answers the query when the structure the widen position is sized against does not resolve', async () => {
+    fetchWithTimeout.mockImplementation((url: string) => {
+      requested.push(url);
+      if (url.includes('/structure/dataflow') && !url.includes('/WEO/'))
+        return Promise.resolve(mkResp(200, WEO34_DATAFLOW_LIST));
+      // Neither the DSD nor the dataflow fallback yields a structure.
+      if (url.includes('/structure/')) return Promise.resolve(mkResp(200, { data: {} }));
+      return Promise.resolve(mkResp(200, weo34Suppressed()));
+    });
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBeNull();
+    expect(result.observations).toHaveLength(2);
+    expect(probeRequests()).toHaveLength(0);
+  });
+
+  it('does not probe a key that matched no series', async () => {
+    const empty = weo34Suppressed();
+    empty.data.dataSets[0].series = {};
+    serve(empty, weo34Probe());
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(result.observations).toHaveLength(0);
+    expect(probeRequests()).toHaveLength(0);
+  });
+
+  it('reads a probe row filed under a different dimension subset as another concept', async () => {
+    // PPI declares UNIT against TYPE_OF_TRANSFORMATION and files other groups
+    // under other subsets, so the probe response carries rows that match no
+    // slot UNIT names. Reading whichever row matched would pin one unit to
+    // series it says nothing about.
+    const probe = weo34Probe();
+    probe.data.dataSets[0].dimensionGroupAttributes = {
+      ...probe.data.dataSets[0].dimensionGroupAttributes,
+      '0:::': groupRow(1),
+    };
+    serve(weo34Suppressed(), probe);
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.unit).toBe('PT');
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBe('USD');
+  });
+
+  it('keeps a series attribute the payload does carry ahead of the probe', async () => {
+    // The probe recovers the group statement only. A concept the series' own row
+    // answers is the narrower statement and stays the one reported.
+    const main = weo34Suppressed();
+    main.data.structures[0].attributes.series = [
+      { id: 'SCALE', values: [{ id: '9' }, { id: '0' }] },
+      { id: 'DECIMALS_DISPLAYED', values: [{ id: '3' }] },
+      { id: 'OVERLAP', values: [{ id: 'OL' }] },
+      { id: 'UNIT', values: [{ id: 'XDC' }] },
+    ];
+    main.data.dataSets[0].series['0:0:0'].attributes = [0, 0, 0, 0];
+    serve(main, weo34Probe());
+
+    const result = await query('USA.NGDP_RPCH+NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBe('XDC');
   });
 });

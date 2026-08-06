@@ -207,8 +207,6 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     'Key format: dot-separated codes in DSD keyPosition order (e.g. USA.NGDP_RPCH.A for WEO). ' +
     'Every position must carry a code: use + to combine codes (e.g. USA+GBR.NGDP_RPCH.A) ' +
     'and * to match every code at a position (e.g. *.NGDP_RPCH.A for all countries). ' +
-    'A key that uses + but no * can come back with unit null on every series; putting * in ' +
-    'one position (e.g. USA.NGDP_RPCH+NGDPD.* instead of ...A) returns the units. ' +
     'Codelists from imf_get_database enumerate the code universe, not actual coverage — ' +
     'valid codes can still return no_data if the combination has no series. ' +
     'start_period and end_period must be valid period strings (YYYY, YYYY-SN, YYYY-QN, ' +

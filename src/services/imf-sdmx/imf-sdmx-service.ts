@@ -7,7 +7,10 @@
  * are located across every id the portal spells them with rather than one each
  * and in both places the portal attaches them — a series' own attribute row and
  * the dimension group its declared relationship names, which is where most of
- * the catalog puts UNIT;
+ * the catalog puts UNIT. A group the portal ships empty because the key
+ * combines codes with `+` on a dimension that group is declared against is
+ * recovered by one attributes-only request for the same series under a wildcard
+ * key, which is the shape that makes the portal emit the group values;
  * the SDMX 2.1 availability constraint is parsed for no-data enrichment, listing
  * a dimension's codes up to AVAILABILITY_CODE_CAP alongside the pre-cap total.
  * @module services/imf-sdmx/imf-sdmx-service
@@ -31,6 +34,7 @@ import type {
   SdmxAttributeDef,
   SdmxConcept,
   SdmxDataResponse,
+  SdmxStructure,
   SdmxStructureResponse,
   SeriesAttributes,
 } from './types.js';
@@ -189,6 +193,187 @@ function buildDimensionGroupLookup(
     // series key says nothing about; projecting it as empty makes the lookup
     // miss rather than pair a series with a group it is not in.
     buckets.get(slots.join(','))?.get(slots.map((index) => seriesKeyParts[index] ?? '').join(':'));
+}
+
+/**
+ * Query string that strips a data response down to the attributes it carries.
+ *
+ * `measures=none` drops every observation value and `attributes=series` drops
+ * the observation-attached attribute rows, leaving the structure block, one
+ * bare row per series, and `dataSets[0].dimensionGroupAttributes` — which is
+ * the only part the group probe reads. Both are SDMX 3.0 REST parameters the
+ * portal honours; an unrecognized parameter is ignored rather than rejected, so
+ * the reduction was confirmed against the payload rather than assumed.
+ *
+ * The pair is what bounds the probe. `measures=none` alone still returns an
+ * observation row per period wherever a dataflow carries observation
+ * attributes, which on `PPI` is 85 KB against the 4 KB this returns.
+ */
+const ATTRIBUTES_ONLY_QUERY = 'attributes=series&measures=none';
+
+/** Longest a group probe may take before it is abandoned and the query answers without it. */
+const GROUP_PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * One dimension-group attribute recovered from a probe response, addressed the
+ * way both responses agree on.
+ *
+ * A group key indexes each dimension's `values` list, and the portal does not
+ * hold that list in a stable order between two differently-shaped requests for
+ * the same series — `PPI` returns TYPE_OF_TRANSFORMATION as `["IX",
+ * "POP_PCH_PT"]` for one key and the reverse for the other. Carrying the codes
+ * rather than the indices is what keeps the recovered value on the series it
+ * describes.
+ */
+interface GroupAttributeOverlay {
+  /** Resolved value, keyed by the codes those dimensions take, joined by ':'. */
+  byCodes: Map<string, string>;
+  /** Ids of the dimensions the attribute is declared against, in key order. */
+  dimensions: string[];
+}
+
+/** Recovered group attributes, per concept. Absent concepts were not recovered. */
+type DimensionGroupOverlay = Partial<Record<keyof SeriesAttributes, GroupAttributeOverlay>>;
+
+/** Every decoded concept, typed so a lookup over the alias table stays exhaustive. */
+const SERIES_ATTRIBUTE_CONCEPTS = Object.keys(SERIES_ATTRIBUTE_ALIASES) as Array<
+  keyof SeriesAttributes
+>;
+
+/** Digit count from an already-resolved attribute value, or null when it is not a number. */
+function toDecimals(value: string | null): number | null {
+  if (value == null) return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Concepts the payload declares a dimension group for and then ships nothing in.
+ *
+ * A group attribute's cell is an index into its definition's `values`, so a
+ * definition with no `values` cannot resolve for any series no matter which
+ * group row matches. That is the shape the portal returns when a key combines
+ * codes with `+` on the very dimension the group is declared against and no
+ * position uses `*`: `WEO`'s `USA.NGDP_RPCH+NGDPD.A` ships the definitions
+ * empty and omits `dimensionGroupAttributes` altogether, while `PPI`'s
+ * `USA.PPI.POP_PCH_PT+IX.A` ships the block with the rows of other groups and
+ * the same empty definition. Both reduce to one statement — declared,
+ * unresolvable — so neither payload shape is matched on.
+ *
+ * It is a necessary condition and not a sufficient one. A dataflow that
+ * declares a unit and genuinely publishes none (`CPI`, `LS`, and a long tail —
+ * around a hundred of them) presents identically here, and no request of any
+ * shape recovers a value for it. `plusOnGroupDimension` is what tells the two
+ * apart.
+ *
+ * A definition without a relationship is skipped: nothing then says which slots
+ * of a group key describe it, so a differently-shaped request cannot help.
+ */
+function suppressedGroupConcepts(
+  structure: SdmxStructure | undefined,
+): Array<keyof SeriesAttributes> {
+  const defs = structure?.attributes?.dimensionGroup ?? [];
+  if (defs.length === 0) return [];
+  return SERIES_ATTRIBUTE_CONCEPTS.filter((concept) => {
+    const def = defs[findSeriesAttrIndex(defs, SERIES_ATTRIBUTE_ALIASES[concept])];
+    if (!def?.relationship?.dimensions?.length) return false;
+    return (def.values?.length ?? 0) === 0;
+  });
+}
+
+/** Ids of every dimension the given suppressed groups are declared against. */
+function suppressedGroupDimensions(
+  structure: SdmxStructure | undefined,
+  concepts: Array<keyof SeriesAttributes>,
+): Set<string> {
+  const defs = structure?.attributes?.dimensionGroup ?? [];
+  return new Set(
+    concepts.flatMap(
+      (concept) =>
+        defs[findSeriesAttrIndex(defs, SERIES_ATTRIBUTE_ALIASES[concept])]?.relationship
+          ?.dimensions ?? [],
+    ),
+  );
+}
+
+/**
+ * Whether the key combines codes with `+` at a position the suppressed group is
+ * declared against — the one key shape that makes the portal ship a group it
+ * would otherwise populate.
+ *
+ * This is what keeps the probe off ordinary traffic. An empty group alone does
+ * not distinguish a suppressed response from the ~100 dataflows that declare a
+ * unit and publish none, whose every response carries the same empty group: a
+ * literal single-code key on each flow that declares one fired a probe on 35 of
+ * the 65 that returned series and recovered a value on none, since their `*`
+ * form ships the group empty too.
+ *
+ * Requiring the `+` drops no recovery, because it is the portal's own trigger.
+ * Across 30 dataflows that do populate the group, a `+` on any dimension the
+ * group is *not* declared against left the values intact (`WEO`'s
+ * `USA+GBR.NGDP_RPCH.A` resolves normally), and a `+` on one it *is* declared
+ * against emptied them every time — down to a degenerate `NGDPD+NGDPD`.
+ *
+ * A key whose segment count disagrees with the payload's own series dimensions
+ * cannot be positioned against them, and `widenedProbeKey` could not build a
+ * probe key for it either.
+ */
+function plusOnGroupDimension(
+  key: string,
+  structure: SdmxStructure | undefined,
+  concepts: Array<keyof SeriesAttributes>,
+): boolean {
+  const segments = key.split('.');
+  const seriesDims = structure?.dimensions?.series ?? [];
+  if (segments.length !== seriesDims.length) return false;
+
+  const groupDimensions = suppressedGroupDimensions(structure, concepts);
+  return segments.some(
+    (segment, index) => segment.includes('+') && groupDimensions.has(seriesDims[index]?.id ?? ''),
+  );
+}
+
+/**
+ * The key to probe with: the original with one position widened to `*`.
+ *
+ * Any `*` in the key is enough to make the portal emit the group values, so the
+ * choice of position is purely a cost question — and an expensive one. Widening
+ * is measured against the live portal at 6.5 KB for `WEO`'s FREQUENCY, 80 KB
+ * for its INDICATOR, and 220 KB for its COUNTRY; on `GFS_BS`, COUNTRY reaches
+ * 2 MB over 17 seconds. So the position is the one whose codelist is smallest —
+ * the frequency dimension for two thirds of the catalogue's flows and a narrow
+ * indicator or transformation dimension for the rest. Across every flow that
+ * declares a dimension-group unit, the chosen codelist holds at most 34 codes,
+ * which is what keeps the probe a few kilobytes rather than a few hundred.
+ *
+ * Dimensions the suppressed groups are declared against are excluded, since
+ * widening one of those multiplies the group rows themselves rather than just
+ * the series. Returns undefined when no other position has a resolved codelist
+ * to size — the query then answers exactly as it does without the probe.
+ */
+function widenedProbeKey(
+  key: string,
+  dimensions: Dimension[],
+  structure: SdmxStructure | undefined,
+  concepts: Array<keyof SeriesAttributes>,
+): string | undefined {
+  const segments = key.split('.');
+  if (segments.length !== dimensions.length) return;
+
+  const groupDimensions = suppressedGroupDimensions(structure, concepts);
+
+  let position = -1;
+  let smallest = Number.POSITIVE_INFINITY;
+  for (const [index, dimension] of dimensions.entries()) {
+    if (groupDimensions.has(dimension.id)) continue;
+    const size = dimension.codelist.length;
+    if (size === 0 || size >= smallest) continue;
+    smallest = size;
+    position = index;
+  }
+  if (position < 0) return;
+
+  return segments.map((segment, index) => (index === position ? '*' : segment)).join('.');
 }
 
 /** An SDMX artefact reference: the agency / id / version triple a URN encodes. */
@@ -550,7 +735,166 @@ export class ImfSdmxService {
       },
     );
 
-    return this.decodeObservations(raw, dataflowId, key, startPeriod, endPeriod);
+    const overlay = await this.fetchGroupAttributeOverlay(
+      raw,
+      agencyId,
+      dataflowId,
+      version,
+      key,
+      ctx,
+      effectiveSignal,
+    );
+
+    return this.decodeObservations(raw, dataflowId, key, startPeriod, endPeriod, overlay);
+  }
+
+  /**
+   * Recover dimension-group attributes the portal declared and shipped empty,
+   * by asking for the same series under a key with one position widened to `*`.
+   *
+   * The response cannot be repaired after the fact — the values are simply not
+   * in it — so the only recovery is a differently-shaped request. This one is
+   * shaped to carry the attributes and nothing else: a single GET, no retry,
+   * its own short timeout, `ATTRIBUTES_ONLY_QUERY` so no observation comes
+   * back, and the cheapest position to widen (see `widenedProbeKey`). Measured
+   * live, it adds ~6.5 KB and ~0.25 s on `WEO` and ~4 KB on `PPI`, to queries
+   * that would otherwise report no unit at all.
+   *
+   * Every exit is the query answering as it does today. A probe that fails,
+   * times out, is aborted, or comes back with nothing returns undefined, and
+   * the concepts stay `null` — it is an addition to the success path, so it may
+   * never turn one into a failure.
+   *
+   * It fires only for the shape it can fix. A key that already carries a `*` is
+   * already the shape the probe would build, so its response is as complete as
+   * the portal will make it; a payload with no series has nothing to annotate;
+   * a payload whose groups carry values needs no help; and a key with no `+` on
+   * a dimension the empty group is declared against was never suppressed, so
+   * there is nothing in a second response for it to gain
+   * (`plusOnGroupDimension`). Together those keep every ordinary query — any
+   * key the portal answered completely, on any dataflow — at exactly one
+   * upstream request.
+   */
+  private async fetchGroupAttributeOverlay(
+    raw: SdmxDataResponse,
+    agencyId: string,
+    dataflowId: string,
+    version: string,
+    key: string,
+    ctx?: Context,
+    signal?: AbortSignal,
+  ): Promise<DimensionGroupOverlay | undefined> {
+    // The DSD sizes the codelists the widen position is chosen by, and it is
+    // read through ctx.state's cache; without a context there is nothing to
+    // choose on.
+    if (!ctx) return;
+    if (key.includes('*')) return;
+
+    const dataStructure = raw.data?.structures?.[0];
+    const concepts = suppressedGroupConcepts(dataStructure);
+    if (concepts.length === 0) return;
+    if (!plusOnGroupDimension(key, dataStructure, concepts)) return;
+    // Last, because it is the only guard that walks the payload: a wide + key
+    // resolves to thousands of series, and the cheap tests above have already
+    // rejected every response shape but the one this can repair.
+    if (Object.keys(raw.data?.dataSets?.[0]?.series ?? {}).length === 0) return;
+
+    try {
+      const structure = await this.fetchDataflowStructure(dataflowId, agencyId, version, ctx);
+      const probeKey = widenedProbeKey(key, structure.dimensions, dataStructure, concepts);
+      if (!probeKey) return;
+
+      const url = `${this.baseUrl}/data/dataflow/${encodeURIComponent(agencyId)}/${encodeURIComponent(dataflowId)}/${encodeURIComponent(version)}/${encodeURIComponent(probeKey)}?${ATTRIBUTES_ONLY_QUERY}`;
+      ctx.log.debug('Probing for suppressed dimension-group attributes', {
+        url,
+        concepts,
+      });
+      const response = await fetchWithTimeout(
+        url,
+        Math.min(this.timeoutMs, GROUP_PROBE_TIMEOUT_MS),
+        ctx as unknown as RequestContext,
+        {
+          headers: { Accept: 'application/json' },
+          ...(signal ? { signal } : {}),
+        },
+      );
+      const probe = this.parseJson<SdmxDataResponse>(
+        await response.text(),
+        'dimension-group probe',
+      );
+      return this.buildGroupOverlay(probe, concepts);
+    } catch (err: unknown) {
+      ctx.log.debug('Dimension-group probe returned nothing usable', {
+        dataflowId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+  }
+
+  /**
+   * Index a probe response's group rows by the codes they describe, per concept.
+   *
+   * The rows are read exactly as the main decode reads its own: a row belongs to
+   * a concept only when the slots it constrains are the slots that concept's
+   * relationship names, so a structure filing several attributes over different
+   * dimension subsets cannot hand one of them another subset's row. What
+   * differs is the address — each row's constrained slots are resolved to their
+   * dimension codes here, because the two responses index their `values` lists
+   * independently.
+   *
+   * A relationship naming the observation dimension, or one the probe's own
+   * series dimensions do not carry, is dropped: a series key says nothing about
+   * those, so no series could be shown to be in the group.
+   */
+  private buildGroupOverlay(
+    raw: SdmxDataResponse,
+    concepts: Array<keyof SeriesAttributes>,
+  ): DimensionGroupOverlay | undefined {
+    const structure = raw.data?.structures?.[0];
+    const defs = structure?.attributes?.dimensionGroup ?? [];
+    const rows = Object.entries(raw.data?.dataSets?.[0]?.dimensionGroupAttributes ?? {});
+    if (defs.length === 0 || rows.length === 0) return;
+
+    const seriesDims = structure?.dimensions?.series ?? [];
+    const slotOrder = [...seriesDims, ...(structure?.dimensions?.observation ?? [])].map(
+      (dim) => dim.id,
+    );
+
+    const overlay: DimensionGroupOverlay = {};
+    for (const concept of concepts) {
+      const attrIdx = findSeriesAttrIndex(defs, SERIES_ATTRIBUTE_ALIASES[concept]);
+      const slots = dimensionGroupSlots(defs[attrIdx], slotOrder);
+      if (!slots || slots.some((slot) => slot < 0 || slot >= seriesDims.length)) continue;
+
+      const byCodes = new Map<string, string>();
+      for (const [groupKey, row] of rows) {
+        const parts = groupKey.split(':');
+        const constrained = parts.flatMap((part, index) => (part === '' ? [] : [index]));
+        if (constrained.length !== slots.length) continue;
+        if (constrained.some((slot, index) => slot !== slots[index])) continue;
+
+        const value = this.resolveAttrValue(attrIdx, row, defs);
+        if (value == null) continue;
+
+        const codes = slots.map((slot) => {
+          const dimension = seriesDims[slot];
+          const valueIdx = Number.parseInt(parts[slot] ?? '', 10);
+          const code = dimension?.values[valueIdx];
+          return code?.id ?? code?.value ?? parts[slot] ?? '';
+        });
+        byCodes.set(codes.join(':'), value);
+      }
+
+      if (byCodes.size > 0) {
+        overlay[concept] = {
+          dimensions: slots.map((slot) => seriesDims[slot]?.id ?? ''),
+          byCodes,
+        };
+      }
+    }
+
+    return Object.keys(overlay).length > 0 ? overlay : undefined;
   }
 
   // ---------------------------------------------------------------------------
@@ -853,6 +1197,7 @@ export class ImfSdmxService {
     key: string,
     startPeriod?: string,
     endPeriod?: string,
+    overlay?: DimensionGroupOverlay,
   ): DataQueryResult {
     const dataset = raw.data?.dataSets?.[0];
     const structure = raw.data?.structures?.[0];
@@ -900,6 +1245,33 @@ export class ImfSdmxService {
     const groupRowOf = (slots: number[] | undefined, keyParts: string[]) =>
       (slots && groupRowFor?.(slots, keyParts)) ?? NO_ATTRIBUTE_ROW;
 
+    /**
+     * The same group statement, recovered from a probe response when this one
+     * declared the group and shipped it empty. Positioned against THIS payload's
+     * series dimensions, since the overlay is addressed by dimension id and
+     * code — the two responses order their `values` lists independently.
+     */
+    const overlayPositions = new Map<keyof SeriesAttributes, number[]>();
+    if (overlay) {
+      const seriesDimIds = seriesDims.map((dim) => dim.id);
+      for (const concept of SERIES_ATTRIBUTE_CONCEPTS) {
+        const entry = overlay[concept];
+        if (!entry) continue;
+        const positions = entry.dimensions.map((id) => seriesDimIds.indexOf(id));
+        if (positions.some((position) => position < 0)) continue;
+        overlayPositions.set(concept, positions);
+      }
+    }
+    const overlayValueOf = (concept: keyof SeriesAttributes, codeParts: string[]) => {
+      const positions = overlayPositions.get(concept);
+      if (!positions) return null;
+      return (
+        overlay?.[concept]?.byCodes.get(
+          positions.map((position) => codeParts[position] ?? '').join(':'),
+        ) ?? null
+      );
+    };
+
     const series = dataset?.series ?? {};
     const observations: Observation[] = [];
     const seriesAttributesByKey: Record<string, SeriesAttributes> = {};
@@ -936,7 +1308,10 @@ export class ImfSdmxService {
        *
        * The series row still wins any concept both lists somehow carry: a
        * relationship over the whole key describes one series, a group describes
-       * a set of them, and the narrower statement is the one to keep.
+       * a set of them, and the narrower statement is the one to keep. The
+       * probe overlay is last of all: it is the same group statement this
+       * payload should have carried, so it answers only where the payload
+       * itself said nothing.
        */
       const decodedAttributes: SeriesAttributes = {
         unit:
@@ -945,21 +1320,24 @@ export class ImfSdmxService {
             groupUnitIdx,
             groupRowOf(groupUnitSlots, seriesKeyParts),
             groupAttrs,
-          ),
+          ) ??
+          overlayValueOf('unit', seriesCodeParts),
         scale:
           this.resolveAttrValue(scaleIdx, attrs, seriesAttrs) ??
           this.resolveAttrValue(
             groupScaleIdx,
             groupRowOf(groupScaleSlots, seriesKeyParts),
             groupAttrs,
-          ),
+          ) ??
+          overlayValueOf('scale', seriesCodeParts),
         decimals:
           this.resolveDecimalsValue(decimalsIdx, attrs, seriesAttrs) ??
           this.resolveDecimalsValue(
             groupDecimalsIdx,
             groupRowOf(groupDecimalsSlots, seriesKeyParts),
             groupAttrs,
-          ),
+          ) ??
+          toDecimals(overlayValueOf('decimals', seriesCodeParts)),
       };
       seriesAttributesByKey[decodedSeriesKey] = decodedAttributes;
       // First write wins. Counting the map's keys here instead made the decode
@@ -1039,10 +1417,7 @@ export class ImfSdmxService {
     attrValues: Array<string | number | null>,
     attrDefs: Array<{ id: string; values?: Array<{ id: string; name?: string }> }>,
   ): number | null {
-    const resolved = this.resolveAttrValue(attrIdx, attrValues, attrDefs);
-    if (resolved == null) return null;
-    const n = parseInt(resolved, 10);
-    return Number.isNaN(n) ? null : n;
+    return toDecimals(this.resolveAttrValue(attrIdx, attrValues, attrDefs));
   }
 
   private parseJson<T>(text: string, context: string): T {
