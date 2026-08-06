@@ -211,7 +211,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 - Dimension codes are positional — order is defined per-DSD, not globally uniform across dataflows
 - Country codes are ISO 3-letter (USA, GBR, DEU, …), not ISO 2-letter
 - Observations returned in compact SDMX-JSON format: indexed by position (e.g. `"0":["-0.257"]`) requiring resolution against `structures[0].dimensions.observation[0].values` for time labels
-- Attribute data carried per-series (SCALE, DECIMALS_DISPLAYED, UNIT, IFS_FLAG) and per-observation (STATUS, PRECISION)
+- Attribute data carried per-series (SCALE, DECIMALS_DISPLAYED, UNIT, IFS_FLAG) and per-observation (STATUS, PRECISION) — the series-level ids are not uniform across the catalog (see decision 15)
 - DataCanvas (DuckDB) for large analytical result sets — opt-in via `CANVAS_PROVIDER_TYPE=duckdb`
 
 ---
@@ -370,7 +370,7 @@ Annotating rather than suppressing the sample. Suppression removes the only cove
 
 The output stays additive rather than redefining the existing field: `series_attributes` keeps working for the single-series case that dominates, and a query resolving to more than one series carries `series_metadata` alongside it, one entry per distinct `series_key`. A caller that never issues a multi-series key sees an unchanged response, and one that does gets a list keyed to the same `series_key` its observations carry. `series_attributes` describes the first series in that case, and its `.describe()` says so — an unlabeled "one of them" is what made the field misleading in the first place.
 
-`DECIMALS_DISPLAYED` is decoded the same way as the other coded attributes. The series entry holds an index into the attribute definition's `values`, not the digit count: WEO's `[0, 0, 0, …]` against `values: [{ id: "3" }]` reads as 0 decimals for a series that displays 3. Reading it straight was reporting the index.
+The precision attribute — `DECIMALS_DISPLAYED` on an IMF-authored structure, and see decision 15 for the rest — is decoded the same way as the other coded attributes. The series entry holds an index into the attribute definition's `values`, not the digit count: WEO's `[0, 0, 0, …]` against `values: [{ id: "3" }]` reads as 0 decimals for a series that displays 3. Reading it straight was reporting the index.
 
 ### 13. The formatted channel carries what the structured one does
 
@@ -396,6 +396,18 @@ The dataflow-wide constraint does. `availableconstraint/{flow}/` reports the flo
 
 A failed second probe degrades to the previous per-code message rather than masking the diagnosis, matching how the first probe already degrades.
 
+### 15. An attribute is located by concept, not by one id
+
+Series attributes were located by exact id — `UNIT`, `SCALE`, `DECIMALS_DISPLAYED` — which is the convention on IMF-authored structures and only those. Structures the IMF publishes but did not author name the same facts differently, so `NA_MAIN` reported `unit`, `scale`, and `decimals` as `null` for every series while its payload carried `DECIMALS` `2` and `UNIT_MULT` `0`, and the formatted channel dropped the `Series:` line entirely for having nothing to print.
+
+Naming the observed exceptions would have left the same defect on whatever was not sampled, so the alias sets come from the catalog rather than from the report: every dataflow's DSD attribute list, read for the ids whose `attributeRelationship.dimensions` spans the *entire* series key. A `dimensions` relationship over a proper subset of it is a different attachment level — `dimensionGroup` in the live payload, not `series` — and reading it the same way would misidentify a defect this decoder can't reach either way (see Known Limitations). The declared set is a superset of what any data response carries, so it bounds the problem — 222 dataflows over 214 distinct structures yield seven full-series-key spellings, tabulated under *Decoding series attributes* above, and three dataflows outside the IMF convention: `NA_MAIN`, `SDG`, `PCPS`.
+
+`PRECISION` and `SDG`'s `UNIT_MULT` are the near misses, and both are excluded for the same structural reason: they attach to the observation, so they sit in a different list, and an index taken from one list against the other array is meaningless rather than merely wrong.
+
+Two dataflows change what a caller sees. `NA_MAIN` reports scale `0` and 2 decimals where it reported nulls — and so renders a `Series:` line reading `no scale multiplier | 2 decimals`, its first. `SDG` reports units such as `PER_100000_POP`. `PCPS`'s `DECIMAL_DISPLAYED` is now located but carries no value upstream, so its output is unchanged until the IMF populates it.
+
+The alias list order is precedence, IMF spelling first. It is unreachable today — no dataflow declares two spellings of one concept — and exists so one that later does resolves identically on every request instead of by whichever id its payload lists first.
+
 ---
 
 ## Known Limitations
@@ -405,6 +417,7 @@ A failed second probe degrades to the previous per-code message rather than mask
 - **Shared DSDs list every flow that references them.** A `?references=all` DSD payload carries each dataflow sharing the structure, in an order the portal does not hold stable — `DSD_GFS` has returned different flows first across requests. Nothing on the payload marks which flow was asked for, so a flow's own identity (`name`, `version`, `agencyId`, `description`) is taken from the dataflow catalog entry, never from the structure payload's flow list.
 - **WEO forecast vs. historical.** WEO observations mix historical actuals and projections in a single series. The API does not flag which observations are projections vs. actuals; the `DERIVATION_TYPE` observation attribute carries this when present.
 - **SDMX 3.0 rate limits.** IMF has not published explicit rate limits for the SDMX 3.0 portal. Live testing showed no rate limiting on sequential requests, but large multi-country queries can be slow (2–10 seconds). Build with a 30-second timeout and 3-attempt retry with exponential backoff.
+- **`unit` is unreachable on most dataflows.** `UNIT` (and its aliases, decision 15) resolves as a true series-attribute only when its DSD relationship spans the whole series key. On the large majority of catalog entries — including `WEO` and `CPI` — the portal instead attaches it to a proper subset of the series dimensions, a distinct SDMX 3.0 bucket (`dimensionGroup`) the decoder does not read, so `unit` reports `null` there even though the value is present in the response. `scale`/`decimals` are not affected at comparable scale. Tracked as #33.
 
 ---
 
@@ -490,6 +503,16 @@ No authentication required. No API key header needed.
 **Decoding observations:** Series key `"0:0:0"` = indices into each series dimension's `values` array. Observation key `"0"` = index into `structures[0].dimensions.observation[0].values` → time label. Observation value `["-0.257"]` = `[OBS_VALUE, ...attribute_values]` (attribute order from `structures[0].attributes.observation`).
 
 **Decoding series attributes:** a series' `attributes` array is positional against `structures[0].attributes.series`, and each entry is an *index* into that definition's `values` — not the value. `SCALE` `[{ id: "9" }, { id: "0" }]` with an entry of `0` means scale 9, and `DECIMALS_DISPLAYED` `[{ id: "3" }]` with an entry of `0` means three decimals. An attribute definition that ships no `values` (e.g. `COUNTRY_UPDATE_DATE`) carries its literal inline instead, so the decode resolves through `values` when present and falls back to the raw entry when not. Every series in a multi-series response points into the same definition list at different indices — which is why the attributes are per series.
+
+**Series attribute ids.** Which id names unit, scale, or precision depends on who authored the structure. A sweep of every dataflow's DSD attribute list (222 dataflows over 214 distinct structures) found seven series-attached spellings across the three concepts:
+
+| Decoded attribute | Ids, in precedence order | Structures declaring the non-primary id |
+|:--|:--|:--|
+| `unit` | `UNIT`, `UNIT_MEASURE` | `SDG` (IAEG-SDGs) |
+| `scale` | `SCALE`, `UNIT_MULT` | `NA_MAIN` (ESTAT) |
+| `decimals` | `DECIMALS_DISPLAYED`, `DECIMALS`, `DECIMAL_DISPLAYED` | `NA_MAIN` (`DECIMALS`), `PCPS` (`DECIMAL_DISPLAYED`) |
+
+`PRECISION` (205 structures) and `SDG`'s `UNIT_MULT` attach to the observation, not the series, so they never appear in the list these indices are taken against. No dataflow declares two spellings of one concept, so the precedence order is a tie-break that does not fire today.
 
 ### Error Patterns
 
