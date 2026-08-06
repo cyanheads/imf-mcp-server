@@ -71,8 +71,8 @@ errors: [
 #### `imf_query_dataset`
 
 **Input constraints:**
-- `key`: string — dot-separated dimension codes in DSD `keyPosition` order. Use `+` to specify multiple codes per position (e.g. `USA+GBR.NGDP_RPCH.A`). Omit a trailing dimension position to wildcard it. Country codes are ISO 3-letter (USA, not US). Call `imf_get_database` first to obtain the correct `key_format` and valid codes.
-- `start_period` / `end_period`: string — format matches the dataflow's frequency: `YYYY` (annual), `YYYY-QN` (quarterly, e.g. `2023-Q1`), `YYYY-MM` (monthly). Omit either to use the full available range. Malformed values and reversed ranges (`start_period > end_period`) are rejected before the upstream call.
+- `key`: string — dot-separated dimension codes in DSD `keyPosition` order, one segment per dimension. Use `+` to combine codes at one position (e.g. `USA+GBR.NGDP_RPCH.A`) and `*` to match every code at a position (e.g. `*.NGDP_RPCH.A`). Every position needs a code or a `*`; a blank segment (`USA..A`) is rejected as `empty_key_segment`, and an omitted position is rejected as `key_dimension_mismatch`. Country codes are ISO 3-letter (USA, not US). Call `imf_get_database` first to obtain the correct `key_format` and valid codes.
+- `start_period` / `end_period`: string — `YYYY` (annual), `YYYY-SN` (semi-annual), `YYYY-QN` (quarterly, e.g. `2023-Q1`), `YYYY-MM` (monthly), or `YYYY-MM-DD` (daily), independent of the dataflow's own frequency. Every label the portal emits is also accepted as a bound, so an observation's `time_period` round-trips. Omit either to use the full available range. Malformed values and reversed ranges are rejected before the upstream call.
 
 **Output (inline, no canvas spill):**
 - `dataflow_id`, `key`, `start_period`, `end_period`
@@ -94,14 +94,20 @@ errors: [
     when: 'dataflow_id does not match any known dataflow',
     recovery: 'Call imf_list_databases to browse available dataflow IDs.' },
   { reason: 'no_data', code: NotFound,
-    when: 'Key is structurally valid but returns an empty dataset (HTTP 200, no series) — typically an unknown dimension code or no data for the time range',
-    recovery: 'Verify dimension codes with imf_get_database; check that start_period/end_period overlap available data.' },
+    when: 'Key is structurally valid but the dataflow holds no series for this code combination',
+    recovery: 'Check the availability context in the error — if series_count is 0 the code has no coverage; if series_count > 0 the combination is wrong and available_codes names the codes that do have data, stating how many of a dimension it is showing when the list is capped.' },
+  { reason: 'no_data_in_range', code: NotFound,
+    when: 'The key returned observations but start_period/end_period excluded every one of them',
+    recovery: 'The key is valid — widen start_period/end_period to overlap the period range reported in the error, or omit both to get the full series.' },
   { reason: 'key_dimension_mismatch', code: ValidationError,
     when: 'Number of dot-separated segments in key does not match the dataflow\'s DSD dimension count',
     recovery: 'Call imf_get_database to get the correct key_format for this dataflow, then reconstruct the key.' },
+  { reason: 'empty_key_segment', code: ValidationError,
+    when: 'A dot-separated position in key is empty or blank, which matches no series upstream',
+    recovery: 'Put * at that position to match every code there, or a code from imf_get_database to pin it.' },
   { reason: 'invalid_period_format', code: ValidationError,
     when: 'start_period or end_period is not one of the recognized period formats',
-    recovery: 'Use YYYY (annual), YYYY-QN (quarterly, e.g. 2023-Q1), or YYYY-MM (monthly).' },
+    recovery: 'Use YYYY (annual), YYYY-SN (semi-annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly), or YYYY-MM-DD (daily).' },
   { reason: 'invalid_period_range', code: ValidationError,
     when: 'start_period is later than end_period',
     recovery: 'Provide start_period less than or equal to end_period (chronological order).' },
@@ -308,12 +314,41 @@ The portal exposes 70+ `_VINTAGE` dataflows (e.g. `WEO_2025_OCT_VINTAGE`, `CPI_2
 
 Use `ctx.state` for in-process per-tenant caching; TTL-backed via the `ttl` option on `ctx.state.set`.
 
+### 9. Period bounds are date spans, compared by overlap
+
+A period label names an interval, not an instant: `2023` is January–December, `2023-Q1` is January–March. Both bounds resolve to the span of dates they name, and an observation is kept when its own span overlaps `[start.lo, end.hi]`.
+
+Comparing normalized label *strings* instead — the earlier approach — made the two bounds behave differently at the same granularity gap: `start_period: "2023"` admitted `2023-M01` because `"2023" <= "2023-01"`, while `end_period: "2023"` rejected it because `"2023-01" > "2023"`, dropping every month of the final year.
+
+Overlap rather than containment for the reverse case (a bound finer than the data, e.g. quarterly bounds against annual observations): containment would silently drop the observation straddling the bound, which is the same class of quiet data loss the change exists to remove. Overlap also makes `start_period` and `end_period` symmetric, and a range that genuinely selects nothing is now diagnosed rather than misreported (decision 10).
+
+The same spans back input validation: a range is reversed only when `start.lo > end.hi`, so a mixed-granularity forward range (`start_period: "2023-Q2"`, `end_period: "2023"`) is accepted rather than read as reversed.
+
+Spans are keyed on dates rather than months because not every frequency the portal publishes is monthly or coarser. The recognized label set is derived from the portal rather than assumed: sweeping the `FREQUENCY` availability constraint over every dataflow in the catalog turns up five codes with data — `A`, `S`, `Q`, `M`, `D` — emitting `2023`, `2023-S1`, `2023-Q1`, `2023-M01`, and `2023-01-05` respectively. `PIP` is the semi-annual flow; `IRFCL` and `CCI` are the daily ones. (`CL_FREQ` also enumerates `W`, `H`, `B` and others; no dataflow publishes them, and the flows the constraint reports nothing for return no series either.) A date key is the plain integer `YYYYMMDD` — ordering is the only operation the comparison performs, so the closing edge of a month, quarter, half-year, or year is day 31 with no calendar lookup: no real date inside that month sorts above it and none in the next month sorts below.
+
+An unparsed label is kept rather than filtered, because dropping data over an unrecognized label shape is worse than ignoring the bound for it. Left silent, though, that fallback reproduces exactly the loss the string comparison caused — the response echoes a range it did not apply. So the success path carries a `notice` naming how many observations were returned unfiltered and a sample of their labels, and a shape the portal adds later surfaces instead of quietly widening a range.
+
+### 10. `no_data` distinguishes coverage from range
+
+Two unrelated causes used to share one reason. Period filtering is client-side, so a valid key with a non-overlapping range emptied the result *after* the fetch and was reported as `no_data` — whose availability enrichment then listed the caller's own codes as the ones that do have data, refuting the diagnosis it accompanied.
+
+The handler now checks the pre-filter observation count. Non-empty before filtering and empty after is `no_data_in_range`: it reports the requested range, the range the response actually spans, and the count excluded, and skips the availability probe entirely (both a wasted round-trip and a misleading answer for a range problem). `no_data` keeps the coverage diagnosis and the enrichment, for a key the dataflow genuinely has no series for.
+
+### 11. Availability discloses its own listing cap
+
+The `no_data` enrichment is the caller's only view of coverage — no tool exposes the availability endpoint, and `imf_get_database` answers a different question (the code universe, not what has data). A 20-code cap keeps the message bounded, but an unannotated slice presents itself as the complete set, so a caller that does not find its own valid code in the list concludes the code is uncovered.
+
+`AvailabilityDimension` therefore carries the pre-cap `count` alongside the `codes` slice, and the message states both: `INDICATOR: 20 of 46 codes with data shown (…)`. A dimension inside the cap prints its codes plain, and reads as complete because it is.
+
+Annotating rather than suppressing the sample. Suppression removes the only coverage-grounded code list the caller ever sees, and the remaining route — searching `imf_get_database` — cannot answer coverage by construction: `PIP`'s `ACCOUNTING_ENTRY` codelist runs past the 50-entry preview while exactly two of its codes have data. Mid-size dimensions are the common case and the one where a sample earns its tokens: 20 of `PIP`'s 46 covered indicators is enough to spot a mistyped code, where 20 of 210 countries is not — but the annotation costs nothing in either case, and neither misleads.
+
 ---
 
 ## Known Limitations
 
 - **No `IFS` monolithic database.** The legacy IFS (exchange rates, reserves, money, prices, interest rates in one cube) no longer exists on `api.imf.org`. Equivalent data exists in component databases: `ER`, `IL`, `CPI`, `MFS_*`. Agents migrating from legacy IMF client code will need to update their database codes.
-- **Empty series on bad keys.** A dimension key with unknown codes returns HTTP 200 with an empty dataset (`series` absent from the dataset) rather than a 4xx error. The service layer must detect this and surface it as a `no_data` error with a suggestion to verify codes via `imf_get_database`.
+- **Empty series on bad keys.** A dimension key with unknown codes returns HTTP 200 with an empty dataset (`series` absent from the dataset) rather than a 4xx error. The service layer must detect this and surface it as a `no_data` error carrying availability context. An empty key segment behaves the same way upstream, so it is rejected locally as `empty_key_segment` rather than sent and misreported.
+- **Shared DSDs list every flow that references them.** A `?references=all` DSD payload carries each dataflow sharing the structure, in an order the portal does not hold stable — `DSD_GFS` has returned different flows first across requests. Nothing on the payload marks which flow was asked for, so a flow's own identity (`name`, `version`, `agencyId`, `description`) is taken from the dataflow catalog entry, never from the structure payload's flow list.
 - **WEO forecast vs. historical.** WEO observations mix historical actuals and projections in a single series. The API does not flag which observations are projections vs. actuals; the `DERIVATION_TYPE` observation attribute carries this when present.
 - **SDMX 3.0 rate limits.** IMF has not published explicit rate limits for the SDMX 3.0 portal. Live testing showed no rate limiting on sequential requests, but large multi-country queries can be slow (2–10 seconds). Build with a 30-second timeout and 3-attempt retry with exponential backoff.
 
@@ -357,10 +392,11 @@ No authentication required. No API key header needed.
 
 ### Key Syntax
 
-- Codes are dot-separated, one per dimension, in DSD `keyPosition` order
-- Wildcard: omit trailing dimensions or use `+` to combine codes (e.g. `USA+GBR.NGDP_RPCH.A`)
+- Codes are dot-separated, one per dimension, in DSD `keyPosition` order — every position present, none blank
+- `*` wildcards a position (`USA.CPI._T.*.M` → 6 series where `USA.CPI._T.IX.M` → 1); `+` combines codes at one position (`USA+GBR.NGDP_RPCH.A`)
+- An empty segment is **not** a wildcard: `USA.CPI._T..M` returns HTTP 200 with zero series upstream
 - Country codes are **ISO 3-letter** (USA, GBR, DEU, JPN, CHN, …)
-- Frequency codes: `A` = annual, `Q` = quarterly, `M` = monthly
+- Frequency codes with data anywhere in the catalog: `A` = annual (`2023`), `S` = semi-annual (`2023-S1`), `Q` = quarterly (`2023-Q1`), `M` = monthly (`2023-M01`), `D` = daily (`2023-01-05`). `CL_FREQ` enumerates more (`W`, `H`, `B`, …); no dataflow publishes them
 
 ### Response Shape (Compact SDMX-JSON)
 
