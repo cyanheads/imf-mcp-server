@@ -121,12 +121,29 @@ export interface SdmxAttributeDef {
 }
 
 /**
+ * Coverage of a single dimension in an availability constraint.
+ *
+ * `count` is always the full number of codes the constraint reports; `codes` is
+ * the leading slice of them that fits the listing cap. The two are separate
+ * fields because the slice on its own reads as the whole set — a caller that
+ * does not find its own valid code in an unannotated list concludes the code is
+ * uncovered. `codes.length < count` is the signal that more exist; the two are
+ * equal when the list is complete.
+ */
+export interface AvailabilityDimension {
+  /** Codes with data, up to the listing cap — a prefix of the set when capped. */
+  codes: string[];
+  /** Number of codes with data, before any listing cap. */
+  count: number;
+}
+
+/**
  * Parsed result from the SDMX 2.1 availableconstraint endpoint.
  * Used to enrich no_data errors with actual coverage information.
  */
 export interface AvailabilityResult {
-  /** Per-dimension lists of codes that actually have data (from cube region KeyValues). */
-  available_codes: Record<string, string[]>;
+  /** Per-dimension coverage that actually has data (from cube region KeyValues). */
+  available_codes: Record<string, AvailabilityDimension>;
   /** Total series count for the queried constraint. 0 = code not covered at all. */
   series_count: number;
   /** Latest period with data, if present in the constraint annotations. */

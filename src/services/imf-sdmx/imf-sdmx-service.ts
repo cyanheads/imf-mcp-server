@@ -1,6 +1,9 @@
 /**
  * @fileoverview IMF SDMX 3.0 REST API service — fetches dataflows, data structures,
  * and observations from api.imf.org. Implements caching via ctx.state and retry.
+ * A flow's own name, version, agency, and description survive a shared DSD; the
+ * SDMX 2.1 availability constraint is parsed for no-data enrichment, listing a
+ * dimension's codes up to AVAILABILITY_CODE_CAP alongside the pre-cap total.
  * @module services/imf-sdmx/imf-sdmx-service
  */
 
@@ -11,6 +14,7 @@ import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type {
+  AvailabilityDimension,
   AvailabilityResult,
   CodelistEntry,
   Dataflow,
@@ -26,6 +30,15 @@ import type {
 
 const DATAFLOWS_CACHE_TTL = 3600; // 1 hour
 const DSD_CACHE_TTL = 86_400; // 24 hours
+
+/**
+ * Most codes a dimension may list in an availability constraint — a message-size
+ * bound, since WEO's COUNTRY carries 210 codes with data and INDICATOR 145.
+ * `count` always carries the pre-cap total so the formatter can say how many of
+ * how many it is showing; an unannotated slice is what let a caller read its own
+ * valid code as uncovered.
+ */
+const AVAILABILITY_CODE_CAP = 20;
 
 /**
  * Client-facing text for a failed dataflow-list fetch. Deliberately says nothing
@@ -291,10 +304,12 @@ export class ImfSdmxService {
     }
 
     // Pin identity to the dataflow's OWN values — a shared DSD (IIP → DSD_BOP)
-    // must not overwrite the flow's public name/version/agency. Dimensions and
-    // key_format legitimately flow from the (possibly shared) DSD. The DSD's own
-    // version/id are surfaced additively as dsdVersion/dsdId for callers.
-    const mergedDescription = structure.description ?? dataflow.description;
+    // must not overwrite the flow's public name/version/agency/description.
+    // Dimensions and key_format legitimately flow from the (possibly shared)
+    // DSD. The DSD's own version/id are surfaced additively as dsdVersion/dsdId.
+    // Description falls back to the structure's only when the flow carries none,
+    // so imf_get_database reports what imf_list_databases reports for the same id.
+    const mergedDescription = dataflow.description ?? structure.description;
     return {
       ...structure,
       dataflowId,
@@ -439,8 +454,7 @@ export class ImfSdmxService {
         },
       );
 
-      if (!response.ok) return null;
-
+      // fetchWithTimeout throws on any non-2xx, so a returned response is always ok.
       const xml = await response.text();
       return this.parseAvailabilityXml(xml);
     } catch {
@@ -471,7 +485,7 @@ export class ImfSdmxService {
     const time_period_end = tpeMatch?.[1]?.trim() ?? null;
 
     // Cube region KeyValues: <com:KeyValue id="DIMENSION"> <com:Value>CODE</com:Value> ... </com:KeyValue>
-    const available_codes: Record<string, string[]> = {};
+    const available_codes: Record<string, AvailabilityDimension> = {};
     for (const kvMatch of xml.matchAll(
       /<com:KeyValue\s+id="([^"]+)"[^>]*>([\s\S]*?)<\/com:KeyValue>/gi,
     )) {
@@ -484,8 +498,11 @@ export class ImfSdmxService {
         .filter(Boolean);
 
       if (values.length > 0) {
-        // Cap per-dimension value lists to avoid bloating the error message
-        available_codes[dimId] = values.slice(0, 20);
+        // count is pre-cap; codes may be a prefix of it — see AvailabilityDimension.
+        available_codes[dimId] = {
+          count: values.length,
+          codes: values.slice(0, AVAILABILITY_CODE_CAP),
+        };
       }
     }
 
@@ -659,8 +676,18 @@ export class ImfSdmxService {
     // Build key format string from sorted dimension ids
     const keyFormat = dimensions.map((d) => d.id).join('.');
 
-    // Get name from dataflow if available
-    const df = dataflows[0];
+    /**
+     * Fall back to the dataflow entry only when it is the one being normalized.
+     * A `?references=all` DSD payload lists every flow sharing the structure, in
+     * an order the portal does not hold stable (DSD_GFS lists its six flows, and
+     * which comes first varies between requests), so `dataflows[0]` is an
+     * arbitrary sibling — reading name or description off it hands the caller
+     * another flow's identity. The match resolves on the fallback path, where
+     * `id` is the dataflow id; on the DSD path `id` is the DSD's own id, which
+     * no dataflow entry carries, so nothing matches and the DSD's own values
+     * stand. Either way fetchDataflowStructure() pins the flow's identity on top.
+     */
+    const df = dataflows.find((f) => f.id === id);
     const name = dsd.names?.en ?? df?.names?.en ?? id;
     const description = dsd.descriptions?.en ?? df?.descriptions?.en;
 

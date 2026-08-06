@@ -77,7 +77,13 @@ export const imfGetDatabase = tool('imf_get_database', {
         'Identifier of the underlying DSD, e.g. DSD_BOP. Several dataflows can share one DSD.',
       ),
     name: z.string().describe('Human-readable dataflow name.'),
-    description: z.string().optional().describe('Extended description, if available.'),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        "This dataflow's own description, matching what imf_list_databases reports for the " +
+          "same id — not the shared DSD's. Absent when the dataflow publishes none.",
+      ),
     codelist_filter: z
       .string()
       .optional()

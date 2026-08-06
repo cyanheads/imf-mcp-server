@@ -1,11 +1,13 @@
 /**
  * @fileoverview Tests for ImfSdmxService — DSD resolution via the dataflow's own
  * `structure` URN, codelist resolution across all three reference paths, dimension
- * labels from the concept schemes, and the dataflow-vs-DSD identity merge. Covers
- * #10 (codelists resolve for ER's suffixed DSD_ER_PUB and IIP's shared DSD_BOP),
- * #12 (the flow's own name/version/agency are preserved; the DSD's version/id are
- * exposed additively), #20 (dimensions whose codelist no naming convention can
- * name), and #28 (dimension labels).
+ * labels from the concept schemes, the dataflow-vs-DSD identity merge, and the
+ * availability-constraint parse. Covers #10 (codelists resolve for ER's suffixed
+ * DSD_ER_PUB and IIP's shared DSD_BOP), #12 (the flow's own name/version/agency
+ * are preserved; the DSD's version/id are exposed additively), #20 (dimensions
+ * whose codelist no naming convention can name), #26 (per-dimension code listing
+ * capped, with the pre-cap count preserved), #28 (dimension labels), and #30 (a
+ * shared DSD does not hand one flow another flow's description).
  *
  * Fixtures are modeled on the live api.imf.org SDMX 3.0 response shapes: dataflow
  * `structure` is a URN string; `localRepresentation.enumeration` is a Codelist URN
@@ -57,10 +59,35 @@ const BOP_INDICATOR_CODES = Array.from({ length: 979 }, (_, i) => ({
   names: { en: `BOP indicator ${i}` },
 }));
 
+/**
+ * The three flows sharing DSD_BOP live carry distinct descriptions, and the DSD
+ * itself ships none — so whichever flow the structure payload happens to list
+ * first is the one whose description leaks onto the other two (#30).
+ */
+const IIP_DESCRIPTION =
+  'The International Investment Position (IIP) is a statistical statement that shows at a point in time the value of financial assets of residents of an economy that are claims on nonresidents.';
+const BOP_DESCRIPTION =
+  'The Balance of Payments (BOP) is a statistical statement that summarizes transactions between residents and nonresidents during a period.';
+const SPE_DESCRIPTION =
+  'Special Purpose Entities (SPEs) dataset provides detailed information on cross-border positions of resident SPEs.';
+
+/**
+ * Some DSDs do publish a description of their own (`DSD_FM`, `DSD_ED`, `DSD_EQ`
+ * live). CTOT is the fixture where the flow and its DSD both carry one and the
+ * two differ, which is the only arrangement in which the precedence between them
+ * is observable at all.
+ */
+const CTOT_FLOW_DESCRIPTION =
+  "The Commodity Terms of Trade (CTOT) dataset measures the windfall gains and losses of income associated with changes in world prices of a country's commodity exports and imports.";
+const CTOT_DSD_DESCRIPTION = 'Data Structure Definition for Commodity Terms of Trade.';
+
 const DATAFLOW_LIST = {
   data: {
     dataflows: [
       {
+        // Constructed inversion of the live shape (where the ER flow carries the
+        // description and DSD_ER_PUB carries none) so the fallback branch — flow
+        // has none, structure does — is exercised at all (#30).
         id: 'ER',
         agencyID: 'IMF.STA',
         version: '4.0.1',
@@ -74,7 +101,37 @@ const DATAFLOW_LIST = {
         agencyID: 'IMF.STA',
         version: '13.0.0',
         names: { en: 'International Investment Position (IIP)' },
+        descriptions: { en: IIP_DESCRIPTION },
         // IIP legitimately reuses the shared Balance of Payments structure.
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=IMF.STA:DSD_BOP(24.0+.0)',
+      },
+      {
+        id: 'BOP',
+        agencyID: 'IMF.STA',
+        version: '21.0.0',
+        names: { en: 'Balance of Payments (BOP)' },
+        descriptions: { en: BOP_DESCRIPTION },
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=IMF.STA:DSD_BOP(24.0+.0)',
+      },
+      {
+        id: 'SPE',
+        agencyID: 'IMF.STA',
+        version: '13.0.0',
+        names: { en: 'Special Purpose Entities (SPEs)' },
+        descriptions: { en: SPE_DESCRIPTION },
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=IMF.STA:DSD_BOP(24.0+.0)',
+      },
+      {
+        // Shares DSD_BOP and publishes no description of its own. Neither it nor
+        // the DSD has one, so there is nothing to report — and the siblings the
+        // payload lists are not a substitute (#30).
+        id: 'BOPQ',
+        agencyID: 'IMF.STA',
+        version: '2.0.0',
+        names: { en: 'Balance of Payments, Quarterly (BOPQ)' },
         structure:
           'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=IMF.STA:DSD_BOP(24.0+.0)',
       },
@@ -110,6 +167,9 @@ const DATAFLOW_LIST = {
         agencyID: 'IMF.RES',
         version: '5.0.1',
         names: { en: 'Commodity Terms of Trade (CTOT)' },
+        // Its DSD publishes a description too, and a different one — the only
+        // shape in which the flow-over-structure precedence is observable (#30).
+        descriptions: { en: CTOT_FLOW_DESCRIPTION },
         structure:
           'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=IMF.RES:DSD_CTOT(6.0+.0)',
       },
@@ -142,6 +202,9 @@ const DATAFLOW_LIST = {
   },
 };
 
+/** The one description DSD_ER_PUB publishes for itself — ER's flow entry has none. */
+const ER_DSD_DESCRIPTION = 'Bilateral and effective exchange rate structure.';
+
 /** DSD_ER_PUB — suffixed DSD; INDICATOR codelist carries the `_PUB` suffix. */
 const ER_DSD = {
   data: {
@@ -151,6 +214,7 @@ const ER_DSD = {
         agencyID: 'IMF.STA',
         version: '4.0.0',
         names: { en: 'Exchange Rates (ER)' },
+        descriptions: { en: ER_DSD_DESCRIPTION },
         dataStructureComponents: {
           dimensionList: {
             dimensions: [
@@ -207,9 +271,19 @@ const ER_DSD = {
   },
 };
 
-/** DSD_BOP — shared structure; note NO CL_IIP_INDICATOR exists, only CL_BOP_INDICATOR. */
+/**
+ * DSD_BOP — shared structure; note NO CL_IIP_INDICATOR exists, only CL_BOP_INDICATOR.
+ * Ships no `descriptions` of its own and, as `?references=all` does live, lists every
+ * flow that references it — IIP first, which is the sibling whose description used to
+ * be handed to BOP and SPE (#30). The portal does not hold that order stable.
+ */
 const BOP_DSD = {
   data: {
+    dataflows: [
+      { id: 'IIP', agencyID: 'IMF.STA', version: '13.0.0', descriptions: { en: IIP_DESCRIPTION } },
+      { id: 'BOP', agencyID: 'IMF.STA', version: '21.0.0', descriptions: { en: BOP_DESCRIPTION } },
+      { id: 'SPE', agencyID: 'IMF.STA', version: '13.0.0', descriptions: { en: SPE_DESCRIPTION } },
+    ],
     dataStructures: [
       {
         id: 'DSD_BOP',
@@ -365,6 +439,7 @@ const CTOT_DSD = {
         agencyID: 'IMF.RES',
         version: '6.0.0',
         names: { en: 'Commodity Terms of Trade (CTOT)' },
+        descriptions: { en: CTOT_DSD_DESCRIPTION },
         dataStructureComponents: {
           dimensionList: {
             dimensions: [
@@ -929,6 +1004,173 @@ describe('ImfSdmxService.fetchDataflowStructure', () => {
     expect(s.version).toBe('4.0.1'); // flow's own version
     expect(s.dsdVersion).toBe('4.0.0'); // DSD_ER_PUB's version
     expect(s.name).toBe('Exchange Rates (ER)');
+  });
+
+  // -- #30: description follows the flow, not the shared structure --------------
+
+  it('#30 returns the queried flow’s own description when a shared DSD lists a sibling first', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    // DSD_BOP ships no description and lists IIP first, so IIP's text is what
+    // leaked onto every other flow sharing the structure.
+    const bop = await svc.fetchDataflowStructure('BOP', undefined, undefined, ctx);
+    expect(bop.description).toBe(BOP_DESCRIPTION);
+    expect(bop.description).not.toContain('International Investment Position');
+
+    const spe = await svc.fetchDataflowStructure('SPE', undefined, undefined, ctx);
+    expect(spe.description).toBe(SPE_DESCRIPTION);
+    expect(spe.description).not.toContain('International Investment Position');
+  });
+
+  it('#30 leaves the first-listed flow’s own description intact (IIP → DSD_BOP)', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    const s = await svc.fetchDataflowStructure('IIP', undefined, undefined, ctx);
+
+    expect(s.description).toBe(IIP_DESCRIPTION);
+  });
+
+  it('#30 keeps every other identity field pinned to the flow while fixing description (#12)', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    const s = await svc.fetchDataflowStructure('SPE', undefined, undefined, ctx);
+
+    expect(s.name).toBe('Special Purpose Entities (SPEs)');
+    expect(s.version).toBe('13.0.0');
+    expect(s.agencyId).toBe('IMF.STA');
+    expect(s.dsdId).toBe('DSD_BOP');
+    expect(s.dsdVersion).toBe('24.0.0');
+    // Dimensions still come from the shared DSD.
+    expect(s.keyFormat).toBe('COUNTRY.INDICATOR.FREQUENCY');
+  });
+
+  it('#30 falls back to the structure’s description only when the flow publishes none (ER)', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    const s = await svc.fetchDataflowStructure('ER', undefined, undefined, ctx);
+
+    expect(s.description).toBe(ER_DSD_DESCRIPTION);
+  });
+
+  it('#30 prefers the flow’s description over its DSD’s when both publish one (CTOT)', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    const s = await svc.fetchDataflowStructure('CTOT', undefined, undefined, ctx);
+
+    expect(s.description).toBe(CTOT_FLOW_DESCRIPTION);
+    expect(s.description).not.toBe(CTOT_DSD_DESCRIPTION);
+  });
+
+  it('#30 reports no description at all rather than a sibling’s when neither flow nor DSD has one', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    const s = await svc.fetchDataflowStructure('BOPQ', undefined, undefined, ctx);
+
+    // DSD_BOP lists IIP, BOP and SPE; every one of them would be a fabrication here.
+    expect(s.description).toBeUndefined();
+    expect(s.name).toBe('Balance of Payments, Quarterly (BOPQ)');
+  });
+});
+
+// --- #26: availability constraint parsing ----------------------------------------
+
+/** Builds an availableconstraint response with the annotation and cube-region shapes IMF emits. */
+function availabilityXml(seriesCount: number, dimensions: Record<string, string[]>): string {
+  const keyValues = Object.entries(dimensions)
+    .map(
+      ([dim, codes]) =>
+        `<com:KeyValue id="${dim}">${codes.map((c) => `<com:Value>${c}</com:Value>`).join('')}</com:KeyValue>`,
+    )
+    .join('');
+  return `<?xml version="1.0" encoding="utf-8"?>
+<mes:Structure xmlns:mes="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message" xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">
+  <str:ContentConstraint xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure">
+    <com:Annotations>
+      <com:Annotation id="series_count"><com:AnnotationTitle>${seriesCount}</com:AnnotationTitle></com:Annotation>
+      <com:Annotation id="time_period_start"><com:AnnotationTitle>1980-01-01</com:AnnotationTitle></com:Annotation>
+      <com:Annotation id="time_period_end"><com:AnnotationTitle>2032-01-01</com:AnnotationTitle></com:Annotation>
+    </com:Annotations>
+    <str:CubeRegion>${keyValues}</str:CubeRegion>
+  </str:ContentConstraint>
+</mes:Structure>`;
+}
+
+/** WEO's live COUNTRY coverage is 210 codes — well past the 20-code listing cap. */
+const TWO_HUNDRED_TEN_COUNTRIES = Array.from(
+  { length: 210 },
+  (_, i) => `C${String(i).padStart(3, '0')}`,
+);
+/** A dimension right at the cap still lists in full. */
+const TWENTY_CODES = Array.from({ length: 20 }, (_, i) => `X${String(i).padStart(2, '0')}`);
+
+describe('ImfSdmxService.fetchAvailabilityConstraint (#26)', () => {
+  let svc: ImfSdmxService;
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+  });
+
+  const constrain = (dimensions: Record<string, string[]>, seriesCount = 8200) => {
+    fetchWithTimeout.mockImplementation(() =>
+      Promise.resolve({
+        status: 200,
+        ok: true,
+        text: () => Promise.resolve(availabilityXml(seriesCount, dimensions)),
+      }),
+    );
+  };
+
+  it('keeps the pre-cap count for a dimension past the listing cap, and caps the codes', async () => {
+    constrain({ COUNTRY: TWO_HUNDRED_TEN_COUNTRIES, FREQUENCY: ['A'] });
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const result = await svc.fetchAvailabilityConstraint('WEO', 'USA', ctx);
+
+    // count is what the constraint reported; codes is the leading slice of it.
+    expect(result?.available_codes.COUNTRY?.count).toBe(210);
+    expect(result?.available_codes.COUNTRY?.codes).toHaveLength(20);
+    expect(result?.available_codes.COUNTRY?.codes[0]).toBe('C000');
+  });
+
+  it('lists a dimension in full when its codes fit the cap, so a short list reads as complete', async () => {
+    constrain({ FREQUENCY: ['A', 'M', 'Q'], INDICATOR: TWENTY_CODES });
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const result = await svc.fetchAvailabilityConstraint('CPI', 'USA', ctx);
+
+    expect(result?.available_codes.FREQUENCY).toEqual({ count: 3, codes: ['A', 'M', 'Q'] });
+    // Exactly at the cap — codes.length === count, so it renders unannotated.
+    expect(result?.available_codes.INDICATOR?.count).toBe(20);
+    expect(result?.available_codes.INDICATOR?.codes).toHaveLength(20);
+  });
+
+  it('reports a dimension one past the cap as capped, so 21 never reads as 20', async () => {
+    constrain({ INDICATOR: [...TWENTY_CODES, 'X20'] });
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const result = await svc.fetchAvailabilityConstraint('CPI', 'USA', ctx);
+
+    expect(result?.available_codes.INDICATOR?.count).toBe(21);
+    expect(result?.available_codes.INDICATOR?.codes).toHaveLength(20);
+  });
+
+  it('carries the series count and time range alongside the per-dimension coverage', async () => {
+    constrain({ FREQUENCY: ['A'] }, 0);
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const result = await svc.fetchAvailabilityConstraint('EER', 'TUR', ctx);
+
+    expect(result?.series_count).toBe(0);
+    expect(result?.time_period_start).toBe('1980-01-01');
+    expect(result?.time_period_end).toBe('2032-01-01');
+  });
+
+  it('returns null rather than throwing when the availability lookup fails', async () => {
+    fetchWithTimeout.mockRejectedValue(new Error('upstream down'));
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    await expect(svc.fetchAvailabilityConstraint('WEO', 'USA', ctx)).resolves.toBeNull();
   });
 });
 
