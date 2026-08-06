@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.7](changelog/0.2.x/0.2.7.md) — 2026-08-06
+
+imf_query_dataset compares period bounds as date spans, distinguishes no_data from no_data_in_range, documents the * wildcard, and discloses the availability listing cap; imf_get_database no longer inherits a shared DSD's sibling description
+
 ## [0.2.6](changelog/0.2.x/0.2.6.md) — 2026-08-06
 
 imf_get_database resolves codelists via enumeration URNs on IMF-authored dataflows, labels dimensions from the DSD concept scheme, and distinguishes a codelist_filter miss from an unresolved codelist
