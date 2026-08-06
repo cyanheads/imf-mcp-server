@@ -1,5 +1,7 @@
 /**
- * @fileoverview Tool: imf_get_database — fetch a dataflow's dimension list and codelists.
+ * @fileoverview Tool: imf_get_database — fetch a dataflow's dimension list with a
+ * labelled, capped codelist preview per dimension, and a notice separating a
+ * codelist_filter that matched nothing from a codelist that could not be resolved.
  * @module mcp-server/tools/definitions/imf-get-database.tool
  */
 
@@ -14,10 +16,13 @@ const IMF_DATA_PORTAL = 'https://data.imf.org/';
 
 export const imfGetDatabase = tool('imf_get_database', {
   description:
-    "Fetch a dataflow's dimension list and complete codelist for each dimension. " +
+    "Fetch a dataflow's dimension list with a codelist preview for each dimension. " +
     'Resolves human-readable terms to SDMX codes (e.g. "United States" → USA, ' +
     '"real GDP growth" → NGDP_RPCH). ' +
     'Required before imf_query_dataset — SDMX keys are opaque without codelist lookups. ' +
+    `Each codelist is capped at the first ${MAX_CODELIST_ENTRIES} entries by default; ` +
+    'set codelist_filter to return every entry matching a substring, or read the ' +
+    'imf://database/{dataflow_id} resource for complete codelists. ' +
     'Country codes are ISO 3-letter (USA, GBR, DEU), not ISO 2-letter (US, GB, DE). ' +
     'The key_format field shows the exact dimension order required by imf_query_dataset. ' +
     'Note: codelists enumerate the code universe, not actual coverage — valid codes can still ' +
@@ -73,6 +78,13 @@ export const imfGetDatabase = tool('imf_get_database', {
       ),
     name: z.string().describe('Human-readable dataflow name.'),
     description: z.string().optional().describe('Extended description, if available.'),
+    codelist_filter: z
+      .string()
+      .optional()
+      .describe(
+        'Echo of the codelist_filter that produced this result. Absent when no filter was applied — ' +
+          'an empty codelist then means the codelist could not be resolved, not that the filter missed.',
+      ),
     key_format: z
       .string()
       .describe(
@@ -84,7 +96,12 @@ export const imfGetDatabase = tool('imf_get_database', {
         z
           .object({
             id: z.string().describe('Dimension identifier used in the key, e.g. COUNTRY.'),
-            name: z.string().describe('Human-readable dimension name.'),
+            name: z
+              .string()
+              .describe(
+                'Human-readable dimension label from the DSD concept scheme, e.g. Weight Type for WGT_TYPE. ' +
+                  'Falls back to the dimension id when the structure names no concept.',
+              ),
             position: z.number().describe('Zero-based position in the key string.'),
             codelist: z
               .array(
@@ -100,7 +117,9 @@ export const imfGetDatabase = tool('imf_get_database', {
               .describe(
                 'Valid codes for this dimension. ' +
                   `Up to ${MAX_CODELIST_ENTRIES} entries shown when no codelist_filter is set; ` +
-                  'use codelist_filter to search large codelists or the imf://database resource for the full list.',
+                  'use codelist_filter to search large codelists or the imf://database resource for the full list. ' +
+                  'Empty means the filter matched nothing when codelist_filter is echoed back, ' +
+                  'and that the codelist could not be resolved when it is not — see notice.',
               ),
             codelist_truncated: z
               .boolean()
@@ -140,6 +159,16 @@ export const imfGetDatabase = tool('imf_get_database', {
         'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
     },
   ],
+
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Populated when a codelist_filter matched no entries anywhere, or when a dimension has no ' +
+          'resolvable codelist — the two produce the same empty array and need opposite next steps.',
+      ),
+  },
 
   async handler(input, ctx) {
     const svc = getImfSdmxService();
@@ -202,6 +231,29 @@ export const imfGetDatabase = tool('imf_get_database', {
       };
     });
 
+    /**
+     * An empty codelist has two causes that render identically but need opposite
+     * next steps — broaden the filter, or fall back to the resource. The notice
+     * names which one applies; the codelist_filter echo lets format() do the same
+     * per dimension.
+     */
+    if (codelistFilterLower && dimensions.every((d) => d.codelist.length === 0)) {
+      const counts = structure.dimensions.map((d) => `${d.id} (${d.codelist.length})`).join(', ');
+      ctx.enrich.notice(
+        `No codes matched codelist_filter "${input.codelist_filter}" in any dimension. ` +
+          `Unfiltered entry counts: ${counts}. ` +
+          `Try a shorter or broader substring, or omit codelist_filter to browse the first ${MAX_CODELIST_ENTRIES} entries per dimension.`,
+      );
+    } else if (!codelistFilterLower) {
+      const unresolved = dimensions.filter((d) => d.codelist.length === 0).map((d) => d.id);
+      if (unresolved.length > 0) {
+        ctx.enrich.notice(
+          `No codelist resolved for ${unresolved.join(', ')} — this response lists no codes for ${unresolved.length === 1 ? 'that position' : 'those positions'} of the key. ` +
+            `Read imf://database/${structure.dataflowId}, which returns every codelist the structure ships, uncapped.`,
+        );
+      }
+    }
+
     return {
       dataflow_id: structure.dataflowId,
       agency_id: structure.agencyId,
@@ -210,6 +262,7 @@ export const imfGetDatabase = tool('imf_get_database', {
       ...(structure.dsdId ? { structure_ref: structure.dsdId } : {}),
       name: structure.name,
       ...(structure.description ? { description: structure.description } : {}),
+      ...(input.codelist_filter ? { codelist_filter: input.codelist_filter } : {}),
       key_format: structure.keyFormat,
       dimensions,
       source: `Source: International Monetary Fund, ${structure.name}, ${IMF_DATA_PORTAL}`,
@@ -229,6 +282,11 @@ export const imfGetDatabase = tool('imf_get_database', {
       lines.push(dsdParts.join(' | '));
     }
     if (result.description) lines.push(`\n${result.description}`);
+    if (result.codelist_filter) {
+      lines.push(
+        `**Codelist filter:** \`${result.codelist_filter}\` — codes below are every match, not the first ${MAX_CODELIST_ENTRIES}.`,
+      );
+    }
     lines.push(`\n**Key format:** \`${result.key_format}\``);
     lines.push('\n### Dimensions\n');
 
@@ -245,8 +303,13 @@ export const imfGetDatabase = tool('imf_get_database', {
             `_(truncated at ${MAX_CODELIST_ENTRIES} entries — use codelist_filter to search, or imf://database/{dataflow_id} for the full list)_`,
           );
         }
+      } else if (result.codelist_filter) {
+        // The two empty causes need opposite next steps, so they render as
+        // different lines. What to do about each is stated once — in the filter
+        // header above, or in the enrichment notice — not repeated per dimension.
+        lines.push(`_(no matches for codelist_filter \`${result.codelist_filter}\`)_`);
       } else {
-        lines.push('_(no codelist entries available)_');
+        lines.push('_(no codelist resolved — see notice)_');
       }
       lines.push('');
     }

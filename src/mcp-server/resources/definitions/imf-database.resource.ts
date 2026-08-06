@@ -11,7 +11,8 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
   name: 'imf-database',
   title: 'IMF Dataflow Metadata',
   description:
-    'Metadata for a single IMF SDMX dataflow — dimensions with full codelists, key_format, name, and description. ' +
+    'Metadata for a single IMF SDMX dataflow — dimensions with their concept-scheme labels and ' +
+    'full codelists, key_format, name, and description. ' +
     'Stable URI-addressable reference for known dataflow IDs (WEO, BOP, CPI, etc.).',
   mimeType: 'application/json',
   params: z.object({

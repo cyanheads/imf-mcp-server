@@ -163,6 +163,33 @@ describe('imfDatabaseResource', () => {
     expect(result.dimensions[0].codelist).toHaveLength(80);
   });
 
+  it('#28 surfaces the concept label for each dimension rather than repeating the id', async () => {
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dataflowId: 'CTOT',
+      name: 'Commodity Terms of Trade (CTOT)',
+      dimensions: [
+        {
+          id: 'WGT_TYPE',
+          name: 'Weight Type',
+          position: 0,
+          codelist: [{ id: 'FIXED', name: 'Fixed weights' }],
+        },
+        ...MOCK_STRUCTURE.dimensions.slice(1),
+      ],
+    });
+
+    const ctx = createMockContext({ tenantId: 'test' });
+    const params = imfDatabaseResource.params.parse({ dataflow_id: 'CTOT' });
+    const result = (await imfDatabaseResource.handler(params, ctx)) as {
+      dimensions: Array<{ id: string; name: string }>;
+    };
+
+    // The resource shares normalizeDsd() with the tool, so the label reaches it too.
+    expect(result.dimensions[0]).toMatchObject({ id: 'WGT_TYPE', name: 'Weight Type' });
+    expect(result.dimensions.every((d) => d.name !== d.id)).toBe(true);
+  });
+
   // -------------------------------------------------------------------------
   // #24: the resource path no longer echoes the upstream URL or response body
   // -------------------------------------------------------------------------

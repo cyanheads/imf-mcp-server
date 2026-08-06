@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/imf-sdmx/imf-sdmx-service.js', () => ({
@@ -355,6 +355,172 @@ describe('imfGetDatabase', () => {
 
     expect(result.dimensions[0].codelist).toHaveLength(50);
     expect(result.dimensions[0].codelist_truncated).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // #27: a filter miss and an unresolved codelist are distinguishable
+  // -------------------------------------------------------------------------
+
+  /** Both causes render `codelist: []` with `codelist_truncated: false`. */
+  const emptyEverywhere = () => ({
+    ...MOCK_STRUCTURE,
+    dimensions: MOCK_STRUCTURE.dimensions.map((d) => ({ ...d, codelist: [] })),
+  });
+
+  it('#27 emits a notice naming the filter and the unfiltered counts when nothing matches', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({
+      dataflow_id: 'WEO',
+      codelist_filter: 'zzzznomatch',
+    });
+    const result = await imfGetDatabase.handler(input, ctx);
+
+    expect(result.dimensions.every((d) => d.codelist.length === 0)).toBe(true);
+
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('zzzznomatch');
+    // The unfiltered counts are what tell the caller the codes exist and the
+    // filter is what missed — COUNTRY has 2, INDICATOR 1, FREQUENCY 1.
+    expect(notice).toContain('COUNTRY (2)');
+    expect(notice).toContain('INDICATOR (1)');
+  });
+
+  it('#27 emits a different notice, pointing at the resource, when a dimension has no resolvable codelist', async () => {
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dimensions: [
+        { id: 'COUNTERPART_COUNTRY', name: 'Counterpart Country', position: 0, codelist: [] },
+        ...MOCK_STRUCTURE.dimensions.slice(1),
+      ],
+    });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO' });
+    const result = await imfGetDatabase.handler(input, ctx);
+
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('COUNTERPART_COUNTRY');
+    expect(notice).toContain('imf://database/WEO');
+    // The filter-miss wording must not appear — it would send the caller the wrong way.
+    expect(notice).not.toContain('codelist_filter');
+    // And no filter echo, which is the structured signal for this cause.
+    expect((result as { codelist_filter?: string }).codelist_filter).toBeUndefined();
+  });
+
+  it('#27 emits no notice when every dimension resolves and no filter is set', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO' });
+    await imfGetDatabase.handler(input, ctx);
+
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('#27 emits no notice when a filter matches somewhere, even though other dimensions come back empty', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    // "united" hits both COUNTRY codes and neither INDICATOR nor FREQUENCY. The
+    // call succeeded, so the filter-miss notice must stay silent — firing it on
+    // any empty dimension rather than all of them turns a good result into a
+    // false alarm, and the per-dimension line already says which missed.
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: 'united' });
+    const result = await imfGetDatabase.handler(input, ctx);
+
+    expect(result.dimensions.map((d) => d.codelist.length)).toEqual([2, 0, 0]);
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('#27 separates the two causes in structuredContent AND content[] end to end', async () => {
+    mockSvc.fetchDataflowStructure.mockResolvedValue(emptyEverywhere());
+
+    const filtered = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      codelist_filter: 'zzzznomatch',
+    });
+    const unfiltered = await runToolContract(imfGetDatabase, { dataflow_id: 'WEO' });
+
+    const sc = (r: typeof filtered) => r.structuredContent as Record<string, unknown>;
+    const text = (r: typeof filtered) =>
+      (r.content as Array<{ type: string; text?: string }>).map((b) => b.text ?? '').join('\n');
+
+    // structuredContent: the notice and the filter echo both land on the wire.
+    expect(sc(filtered).notice).toContain('zzzznomatch');
+    expect(sc(filtered).codelist_filter).toBe('zzzznomatch');
+    expect(sc(unfiltered).notice).toContain('No codelist resolved');
+    expect(sc(unfiltered).codelist_filter).toBeUndefined();
+
+    // content[]: the per-dimension line discriminates the cause and the
+    // enrichment trailer carries the remediation — both reach content[].
+    expect(text(filtered)).toContain('zzzznomatch');
+    expect(text(unfiltered)).toContain('imf://database/WEO');
+    expect(text(filtered)).not.toContain('no codelist resolved');
+    expect(text(unfiltered)).not.toContain('zzzznomatch');
+  });
+
+  it('#27 echoes codelist_filter so the two empty causes differ in structuredContent', async () => {
+    mockSvc.fetchDataflowStructure.mockResolvedValue(emptyEverywhere());
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const filtered = await imfGetDatabase.handler(
+      imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: 'zzzznomatch' }),
+      ctx,
+    );
+    const unfiltered = await imfGetDatabase.handler(
+      imfGetDatabase.input.parse({ dataflow_id: 'WEO' }),
+      createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors }),
+    );
+
+    // Identical dimension payloads — the echo is the only structured difference.
+    expect(filtered.dimensions).toEqual(unfiltered.dimensions);
+    expect((filtered as { codelist_filter?: string }).codelist_filter).toBe('zzzznomatch');
+    expect((unfiltered as { codelist_filter?: string }).codelist_filter).toBeUndefined();
+  });
+
+  it('#27 renders the two empty causes as different lines in content[]', () => {
+    const base = {
+      dataflow_id: 'BOP',
+      agency_id: 'IMF.STA',
+      version: '1.0.0',
+      name: 'Balance of Payments',
+      key_format: 'COUNTRY',
+      dimensions: [
+        {
+          id: 'COUNTRY',
+          name: 'Country',
+          position: 0,
+          codelist: [],
+          codelist_truncated: false,
+        },
+      ],
+      source: 'Source: International Monetary Fund, Balance of Payments, https://data.imf.org/',
+    };
+
+    const filtered = (
+      imfGetDatabase.format!({ ...base, codelist_filter: 'zzzznomatch' })[0] as { text: string }
+    ).text;
+    const unfiltered = (imfGetDatabase.format!(base)[0] as { text: string }).text;
+
+    expect(filtered).not.toBe(unfiltered);
+    // Each line names its own cause; neither repeats the remediation, which the
+    // filter header and the enrichment notice already carry once.
+    expect(filtered).toContain('no matches for codelist_filter `zzzznomatch`');
+    expect(unfiltered).toContain('no codelist resolved');
+    expect(filtered).not.toContain('no codelist resolved');
+    expect(unfiltered).not.toContain('zzzznomatch');
+    // The old single line said neither thing.
+    expect(filtered).not.toContain('no codelist entries available');
+    expect(unfiltered).not.toContain('no codelist entries available');
+  });
+
+  // -------------------------------------------------------------------------
+  // #19: the description matches the default response
+  // -------------------------------------------------------------------------
+
+  it('#19 description states the cap and names both complete-retrieval paths', () => {
+    const d = imfGetDatabase.description;
+    // The default response is a preview, not the complete codelist it used to promise.
+    expect(d).not.toContain('dimension list and complete codelist');
+    expect(d).toContain('codelist preview');
+    expect(d).toContain(`capped at the first ${50} entries`);
+    // Both retrieval paths named, so a capped caller knows where to go.
+    expect(d).toContain('codelist_filter');
+    expect(d).toContain('imf://database/{dataflow_id}');
   });
 
   it('truncation notice in format output names the escape hatch', () => {
