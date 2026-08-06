@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** imf-mcp-server
-**Version:** 0.2.7
+**Version:** 0.2.8
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.11.1`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/sdk` ^1.30.0
@@ -218,7 +218,7 @@ src/
       types.ts                          # Domain types for dataflows and observations
   mcp-server/
     tools/definitions/
-      imf-list-databases.tool.ts       # List all dataflows with optional filter
+      imf-list-databases.tool.ts       # List dataflows, paged, with optional filter
       imf-get-database.tool.ts         # Fetch DSD — dimension list and codelists
       imf-query-dataset.tool.ts        # Query by key + time range; spills to canvas
       imf-dataframe-describe.tool.ts   # List canvas tables and schema

@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.7-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.8-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -33,7 +33,7 @@ Five tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed c
 
 | Tool | Description |
 |:-----|:------------|
-| `imf_list_databases` | List all IMF SDMX dataflows available on the portal, with optional name/ID substring filtering |
+| `imf_list_databases` | List IMF SDMX dataflows available on the portal, a page at a time, with optional name/ID substring filtering |
 | `imf_get_database` | Fetch a dataflow's dimension list and a codelist preview per dimension — resolves human terms to SDMX codes before querying |
 | `imf_query_dataset` | Query a dataflow by dimension key over a time range; large result sets spill to DataCanvas |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call |
@@ -41,11 +41,13 @@ Five tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed c
 
 ### `imf_list_databases`
 
-Entry point for every IMF query workflow — browse and filter the full dataflow catalog.
+Entry point for every IMF query workflow — browse and filter the dataflow catalog, a page at a time.
 
 - Hundreds of dataflows covering WEO projections, balance of payments, CPI, exchange rates, money/finance statistics, and national accounts
 - Vintage (historical snapshot) dataflows excluded by default; set `include_vintages=true` to include them
-- Case-insensitive substring filter across ID, name, and description
+- Case-insensitive substring filter across ID, name, and description — matched against the full description, not the shortened one returned
+- Paged: `limit` (default 50, max 200) and `offset`. `total_count` is the number of matches, `returned_count` the size of the page, and a notice names the next `offset` while matches remain
+- Descriptions are cut to 200 characters here; `imf_get_database` and the `imf://database/{dataflow_id}` resource return the full text for the dataflow you settle on
 
 ---
 
@@ -69,8 +71,10 @@ Query an IMF SDMX dataflow by dimension key over a time range.
 - `+` combines codes at one position (e.g. `USA+GBR+DEU.NGDP_RPCH.A`); `*` matches every code at a position (`*.NGDP_RPCH.A` for all countries, `CAN.*.A` for every indicator). Every position needs a code or a `*` — a blank segment matches nothing upstream and is rejected
 - `start_period` / `end_period` accept `YYYY`, `YYYY-SN`, `YYYY-QN`, `YYYY-MM`, or `YYYY-MM-DD` whatever the series frequency, and cover the whole period they name — `end_period: 2023` includes `2023-M12` and `2023-Q4`
 - Returns observations with `time_period`, `value`, `status`, and series attributes (`unit`, `scale`, `decimals`). Period labels come back as upstream emits them — `2023`, `2023-S1`, `2023-Q1`, `2023-M01`, `2023-01-05` — and any of them can be passed straight back in as a bound
+- A key resolving to several series carries `series_metadata`, one `unit`/`scale`/`decimals` entry per `series_key`, because attributes differ between them: in `USA.NGDPD+NGDP_RPCH.A`, `NGDPD` is scale `9` while `NGDP_RPCH` is unscaled. Canvas rows carry their own series' attributes too. A single-series query keeps the flat `series_attributes` and no list
+- Scale `0` is the upstream sentinel for "no multiplier" — formatted output names it rather than printing a bare `0`, and `structuredContent` keeps the raw code
 - Large multi-country or long time-range queries automatically spill to DataCanvas — `canvas_id` and `table_name` are returned for SQL follow-up
-- `no_data` errors include availability context from the upstream constraint endpoint: `series_count=0` means the code has no coverage in the dataflow; `series_count>0` means the combination is wrong and `available_codes` lists what does have data per dimension, stating how many of how many it is showing when a dimension is too long to list in full
+- `no_data` errors include availability context from the upstream constraint endpoint: a dataflow that publishes no series at all is reported as such and points at a different dataflow, since no key would work; otherwise `series_count=0` means the code has no coverage and `dataflow_availability` names codes that do, while `series_count>0` means the combination is wrong and `available_codes` lists what does have data per dimension, stating how many of how many it is showing when a dimension is too long to list in full
 - A valid key whose data lies entirely outside the requested range fails as `no_data_in_range`, reporting the range the series actually spans — the fix is the range, not the key
 
 ---
