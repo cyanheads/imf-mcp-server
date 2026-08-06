@@ -18,6 +18,7 @@ import type {
   DataQueryResult,
   Dimension,
   Observation,
+  SdmxConcept,
   SdmxDataResponse,
   SdmxStructureResponse,
   SeriesAttributes,
@@ -39,24 +40,52 @@ const DATAFLOW_LIST_UNAVAILABLE_MESSAGE =
 const DATAFLOW_LIST_RECOVERY_HINT =
   'Retry in a few moments. The IMF SDMX 3.0 portal is intermittently unavailable; if it keeps failing the upstream service is down.';
 
+/** An SDMX artefact reference: the agency / id / version triple a URN encodes. */
+interface ArtefactRef {
+  agencyId: string;
+  id: string;
+  version: string;
+}
+
+/** Every SDMX URN ends `<Class>=AGENCY:ID(VERSION)`. */
+const ARTEFACT_URN = /([A-Za-z]+)=([^:]+):([^(]+)\(([^)]+)\)/;
+
 /**
- * Parse an SDMX DataStructure URN into its agency / id / version parts.
- * IMF dataflows carry this URN in their `structure` field, and the referenced
- * DSD is often named independently of the flow (ER → DSD_ER_PUB, IIP → shared
- * DSD_BOP) — so the URN is the authoritative DSD reference, not a `DSD_<flow>` guess.
+ * Parse an SDMX artefact URN of the given class into its agency / id / version
+ * parts. One parser covers the DataStructure references on dataflows and the
+ * Codelist references on dimensions and concepts; a URN of a different class
+ * does not parse.
  *
  * @example
- * parseDsdUrn('urn:sdmx:...DataStructure=IMF.STA:DSD_BOP(24.0+.0)')
+ * parseArtefactUrn('urn:sdmx:...DataStructure=IMF.STA:DSD_BOP(24.0+.0)', 'DataStructure')
  * // → { agencyId: 'IMF.STA', id: 'DSD_BOP', version: '24.0.0' }
  */
-function parseDsdUrn(urn: string): { agencyId: string; id: string; version: string } | undefined {
-  const match = /DataStructure=([^:]+):([^(]+)\(([^)]+)\)/.exec(urn);
+function parseArtefactUrn(urn: string, artefact: string): ArtefactRef | undefined {
+  const match = ARTEFACT_URN.exec(urn);
   if (!match) return;
-  const [, agencyId, id, rawVersion] = match;
-  if (!agencyId || !id || !rawVersion) return;
-  // IMF encodes the DSD version with a wildcard marker (e.g. "24.0+.0"); strip
-  // the "+" to get the concrete version the datastructure endpoint resolves.
+  const [, artefactClass, agencyId, id, rawVersion] = match;
+  if (artefactClass !== artefact || !agencyId || !id || !rawVersion) return;
+  // IMF encodes versions with a wildcard marker (e.g. "24.0+.0"); strip the "+"
+  // to get the concrete version the structure endpoints resolve.
   return { agencyId, id, version: rawVersion.replace(/\+/g, '') };
+}
+
+/**
+ * Parse a Concept URN, which appends the concept id to the scheme reference:
+ * `Concept=AGENCY:SCHEME(VERSION).CONCEPT_ID`.
+ *
+ * @example
+ * parseConceptUrn('urn:sdmx:...Concept=IMF.RES:CS_CTOT(4.0+.0).WGT_TYPE')
+ * // → { agencyId: 'IMF.RES', schemeId: 'CS_CTOT', conceptId: 'WGT_TYPE' }
+ */
+function parseConceptUrn(
+  urn: string,
+): { agencyId: string; schemeId: string; conceptId: string } | undefined {
+  const match = /Concept=([^:]+):([^(]+)\(([^)]+)\)\.(.+)$/.exec(urn);
+  if (!match) return;
+  const [, agencyId, schemeId, , conceptId] = match;
+  if (!agencyId || !schemeId || !conceptId) return;
+  return { agencyId, schemeId, conceptId };
 }
 
 export class ImfSdmxService {
@@ -231,7 +260,9 @@ export class ImfSdmxService {
     // legacy `DSD_<flow>` guess returns HTTP 204 for those and burns the retry
     // budget before falling through. The fallback (dataflow endpoint with
     // references=all) covers flows whose URN is absent or unparseable.
-    const dsdRef = dataflow.structure ? parseDsdUrn(dataflow.structure) : undefined;
+    const dsdRef = dataflow.structure
+      ? parseArtefactUrn(dataflow.structure, 'DataStructure')
+      : undefined;
 
     const fallback = () =>
       this.fetchDataflowStructureFallback(dataflowId, dataflow.agencyId, dataflow.version, ctx);
@@ -501,6 +532,40 @@ export class ImfSdmxService {
       }
     }
 
+    /**
+     * Build a concept map so each dimension can reach its concept, which carries
+     * the human-readable label and — on IMF-authored DSDs — the authoritative
+     * codelist reference. A dimension's `conceptIdentity` URN cites the scheme
+     * with a wildcard version (`CS_NEA(2.0+.0)`) while the shipped scheme is
+     * concrete (`2.0.0`), so version is not a usable key component.
+     */
+    const conceptMap = new Map<string, SdmxConcept>();
+    for (const cs of raw.data?.conceptSchemes ?? []) {
+      for (const concept of cs.concepts ?? []) {
+        if (cs.agencyID) conceptMap.set(`${cs.agencyID}:${cs.id}.${concept.id}`, concept);
+        conceptMap.set(`${cs.id}.${concept.id}`, concept);
+      }
+    }
+
+    /** Resolve a Codelist URN against the shipped codelists, widening the key on each miss. */
+    const codelistFromUrn = (urn: string | undefined): CodelistEntry[] | undefined => {
+      if (!urn) return;
+      const ref = parseArtefactUrn(urn, 'Codelist');
+      if (!ref) return;
+      // The URN's version routinely trails the shipped codelist's patch
+      // (CL_CTOT_INDICATOR cited at 2.0.0, shipped at 2.0.1), so an exact-version
+      // miss is normal — fall back to the agency-qualified id, then the bare id.
+      for (const key of [
+        `${ref.agencyId}:${ref.id}:${ref.version}`,
+        `${ref.agencyId}:${ref.id}`,
+        ref.id,
+      ]) {
+        const found = clMap.get(key);
+        if (found && found.length > 0) return found;
+      }
+      return;
+    };
+
     const dsd = dsds[0];
     if (!dsd) return;
 
@@ -511,14 +576,14 @@ export class ImfSdmxService {
       (a, b) => (a.position ?? a.keyPosition ?? 0) - (b.position ?? b.keyPosition ?? 0),
     );
 
-    // Flow token for IMF naming-convention codelist lookup comes from the DSD's
-    // OWN id, not the queried dataflow id — IIP shares DSD_BOP, whose codelists
-    // are CL_BOP_*, and ER → DSD_ER_PUB carries a publication suffix. IMF SDMX 3.0
-    // does not populate localRepresentation.enumeration, so codelists are resolved
-    // by convention: CL_<FLOW>_<DIM> / CL_<FLOW>_<DIM>_PUB (flow-specific) then
-    // CL_<DIM> / CL_<DIM>_PUB (shared). The flow token is tried both with the
-    // suffix (DSD_ER_PUB → ER_PUB) and stripped (→ ER), so CL_ER_INDICATOR_PUB
-    // resolves for ER and CL_BOP_INDICATOR for IIP.
+    /**
+     * Flow token for the IMF naming-convention fallback. It comes from the DSD's
+     * OWN id, not the queried dataflow id — IIP shares DSD_BOP, whose codelists
+     * are CL_BOP_*, and ER → DSD_ER_PUB carries a publication suffix. The
+     * convention is CL_<FLOW>_<DIM> / CL_<FLOW>_<DIM>_PUB (flow-specific) then
+     * CL_<DIM> / CL_<DIM>_PUB (shared), with the flow token tried both with the
+     * suffix (DSD_ER_PUB → ER_PUB) and stripped (→ ER).
+     */
     const resolvedDsdId = dsd.id ?? id;
     const flowCore = resolvedDsdId.replace(/^DSD_/, '');
     const flowBase = flowCore.replace(/_PUB$/i, '');
@@ -526,45 +591,55 @@ export class ImfSdmxService {
 
     const dimensions: Dimension[] = sorted.map((d, idx) => {
       const dimId = d.id ?? `DIM_${idx}`;
-      let codelist: CodelistEntry[] = [];
 
-      // Concept ID extracted from the conceptIdentity URN (e.g. FREQ from
-      // "urn:sdmx:...CS_MASTER_SYSTEM(1.0).FREQ") — some shared codelists key off
-      // the concept rather than the dimension id (FREQUENCY dim → CL_FREQ codelist).
-      const conceptId =
-        typeof d.conceptIdentity === 'string' ? d.conceptIdentity.replace(/^.*\./, '') : undefined;
-      const nameTokens = [
-        ...new Set([dimId, ...(conceptId && conceptId !== dimId ? [conceptId] : [])]),
-      ];
+      // The dimension's concept carries its label and, on IMF-authored DSDs, the
+      // only machine-readable codelist reference.
+      const conceptRef =
+        typeof d.conceptIdentity === 'string' ? parseConceptUrn(d.conceptIdentity) : undefined;
+      const concept = conceptRef
+        ? (conceptMap.get(
+            `${conceptRef.agencyId}:${conceptRef.schemeId}.${conceptRef.conceptId}`,
+          ) ?? conceptMap.get(`${conceptRef.schemeId}.${conceptRef.conceptId}`))
+        : undefined;
 
-      // 1. IMF naming convention (primary path — enumeration is null on SDMX 3.0).
-      // Flow-specific candidates (both suffix variants) first, then shared.
-      const conventionKeys: string[] = [];
-      for (const ft of flowTokens) {
-        for (const nt of nameTokens) {
-          conventionKeys.push(`CL_${ft}_${nt}`, `CL_${ft}_${nt}_PUB`);
-        }
-      }
-      for (const nt of nameTokens) {
-        conventionKeys.push(`CL_${nt}`, `CL_${nt}_PUB`);
-      }
-      for (const k of conventionKeys) {
-        const found = clMap.get(k);
-        if (found && found.length > 0) {
-          codelist = found;
-          break;
-        }
-      }
+      /**
+       * Codelist resolution, authoritative references first:
+       * 1. The dimension's own `localRepresentation.enumeration` URN — present on
+       *    the ESTAT- and IAEG-SDGs-authored structures (NA_MAIN, SDG).
+       * 2. The concept's `coreRepresentation.enumeration` URN — the reference on
+       *    IMF-authored structures, which omit `localRepresentation` entirely.
+       *    This resolves the dimensions whose codelist the naming convention
+       *    cannot name: QNEA's CL_NEA_* (flow token differs from the DSD id),
+       *    DIP/IMTS's COUNTERPART_COUNTRY (reuses the primary CL_*_COUNTRY), and
+       *    LS's CL_LS_TYPE_OF_TRANSFORMAtION (upstream casing typo, cited verbatim).
+       * 3. The IMF naming convention — for dimensions neither URN resolves.
+       */
+      let codelist =
+        codelistFromUrn(d.localRepresentation?.enumeration) ??
+        codelistFromUrn(concept?.coreRepresentation?.enumeration) ??
+        [];
 
-      // 2. Explicit enumeration reference (fallback for servers that populate it)
-      const enumRef = d.localRepresentation?.enumeration;
-      if (codelist.length === 0 && enumRef) {
-        const enumKeys = [
-          `${enumRef.agencyID ?? ''}:${enumRef.id ?? ''}:${enumRef.version ?? ''}`,
-          `${enumRef.agencyID ?? ''}:${enumRef.id ?? ''}`,
-          enumRef.id ?? '',
+      if (codelist.length === 0) {
+        // Some shared codelists key off the concept rather than the dimension id
+        // (FREQUENCY dim → CL_FREQ codelist), so both tokens are tried.
+        const nameTokens = [
+          ...new Set([
+            dimId,
+            ...(conceptRef?.conceptId && conceptRef.conceptId !== dimId
+              ? [conceptRef.conceptId]
+              : []),
+          ]),
         ];
-        for (const k of enumKeys) {
+        const conventionKeys: string[] = [];
+        for (const ft of flowTokens) {
+          for (const nt of nameTokens) {
+            conventionKeys.push(`CL_${ft}_${nt}`, `CL_${ft}_${nt}_PUB`);
+          }
+        }
+        for (const nt of nameTokens) {
+          conventionKeys.push(`CL_${nt}`, `CL_${nt}_PUB`);
+        }
+        for (const k of conventionKeys) {
           const found = clMap.get(k);
           if (found && found.length > 0) {
             codelist = found;
@@ -575,7 +650,7 @@ export class ImfSdmxService {
 
       return {
         id: dimId,
-        name: dimId,
+        name: concept?.names?.en ?? dimId,
         position: d.position ?? d.keyPosition ?? idx,
         codelist,
       };

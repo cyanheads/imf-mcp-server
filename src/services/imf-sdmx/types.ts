@@ -168,7 +168,14 @@ export interface SdmxStructureResponse {
             /** Legacy SDMX 2.1 position field — absent on IMF SDMX 3.0. */
             keyPosition?: number;
             localRepresentation?: {
-              enumeration?: { id?: string; agencyID?: string; version?: string };
+              /**
+               * Codelist URN, e.g.
+               * `"urn:sdmx:...Codelist=IMF:CL_AREA(1.17.0)"`. Present on the
+               * ESTAT- and IAEG-SDGs-authored structures the IMF portal serves
+               * (NA_MAIN, SDG); absent entirely on IMF-authored ones, which
+               * carry the reference on the concept instead.
+               */
+              enumeration?: string;
             };
           }>;
         };
@@ -184,5 +191,29 @@ export interface SdmxStructureResponse {
         names?: Record<string, string>;
       }>;
     }>;
+    /**
+     * Concept schemes shipped by `?references=all`. Each concept carries the
+     * dimension's human-readable label and, on IMF-authored structures, the
+     * authoritative codelist reference under `coreRepresentation.enumeration`.
+     */
+    conceptSchemes?: Array<{
+      id: string;
+      agencyID?: string;
+      version?: string;
+      concepts?: Array<SdmxConcept>;
+    }>;
   };
+}
+
+/** A single concept: the dimension's label plus its codelist reference. */
+export interface SdmxConcept {
+  /**
+   * Default representation for this concept. On IMF-authored DSDs the
+   * `enumeration` URN here is the only machine-readable codelist reference —
+   * the dimension itself carries no `localRepresentation`.
+   */
+  coreRepresentation?: { enumeration?: string };
+  id: string;
+  /** Localized labels, keyed by language tag. `codes[]` and `dataflows[]` use the same shape. */
+  names?: Record<string, string>;
 }
