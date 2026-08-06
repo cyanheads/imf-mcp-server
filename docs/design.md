@@ -10,9 +10,24 @@
 | `imf_get_database` | Fetch a dataflow's dimension list plus the complete codelist for each dimension. Resolves human terms to SDMX codes ("United States" → USA, "real GDP growth" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, unit, scale, and status attributes. Large analytical result sets spill to DataCanvas for SQL — returns `canvas_id` + `table_name`. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call. Shows table name, row count, and column schema. | `canvas_id` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
-| `imf_dataframe_query` | Run a read-only SQL SELECT against a staged DataCanvas table. Enables multi-country comparisons, time-series aggregation, and cross-indicator joins without hand-rolled loops. | `canvas_id`, `sql` (must be a SELECT statement) | `readOnlyHint: true`, `openWorldHint: false` |
+| `imf_dataframe_query` | Run a read-only SQL SELECT against a staged DataCanvas table. Enables multi-country comparisons, time-series aggregation, and cross-indicator joins without hand-rolled loops. | `canvas_id`, `sql` (one SELECT statement; a leading `WITH … SELECT` CTE is accepted) | `readOnlyHint: true`, `openWorldHint: false` |
 
 ### Tool Details
+
+#### `imf_list_databases`
+
+**Error contract:**
+```
+errors: [
+  { reason: 'dataflow_list_unavailable', code: ServiceUnavailable, retryable: true,
+    when: 'The IMF SDMX structure endpoint that backs the dataflow catalog did not return a usable response',
+    recovery: 'Retry in a few moments; the catalog is cached for an hour once it succeeds.' },
+]
+```
+
+The service applies the error boundary: a failed catalog fetch is logged with its upstream detail and rethrown as a controlled `serviceUnavailable`. Neither the resolved URL (`IMF_BASE_URL` is configurable and can name a private mirror) nor the upstream response body reaches the client. Every tool and the resource reach the catalog, so all four declare this reason.
+
+---
 
 #### `imf_get_database`
 
@@ -33,6 +48,9 @@ errors: [
   { reason: 'structure_unavailable', code: ServiceUnavailable,
     when: 'api.imf.org returns non-200 on the DSD endpoint',
     recovery: 'Retry after a short wait; the IMF SDMX 3.0 portal is occasionally slow.' },
+  { reason: 'dataflow_list_unavailable', code: ServiceUnavailable, retryable: true,
+    when: 'The dataflow catalog that dataflow_id is resolved against could not be fetched',
+    recovery: 'Retry in a few moments; the catalog is cached for an hour once it succeeds.' },
 ]
 ```
 
@@ -78,6 +96,9 @@ errors: [
   { reason: 'structure_unavailable', code: ServiceUnavailable,
     when: 'api.imf.org returns non-200 on the data endpoint',
     recovery: 'Retry after a short wait.' },
+  { reason: 'dataflow_list_unavailable', code: ServiceUnavailable, retryable: true,
+    when: 'The dataflow catalog that dataflow_id is resolved against could not be fetched',
+    recovery: 'Retry in a few moments; the catalog is cached for an hour once it succeeds.' },
 ]
 ```
 
@@ -89,13 +110,31 @@ errors: [
 ```
 errors: [
   { reason: 'canvas_not_found', code: NotFound,
-    when: 'canvas_id does not match any registered DataCanvas table (expired, wrong session, or canvas disabled)',
-    recovery: 'Re-run imf_query_dataset to obtain a fresh canvas_id; ensure CANVAS_PROVIDER_TYPE=duckdb is set.' },
+    when: 'canvas_id does not match any registered DataCanvas session (expired, wrong session, or canvas disabled)',
+    recovery: 'Re-run imf_query_dataset to obtain a fresh canvas_id.' },
 ]
 ```
 
-**Additional constraint on `imf_dataframe_query`:**
-- `sql`: must start with `SELECT` (enforced via Zod `.regex(/^\s*SELECT\s/i)` or handler validation). DML and DDL are rejected with `ValidationError` (reason `invalid_sql`).
+**Additional error contract on `imf_dataframe_query`:**
+```
+errors: [
+  { reason: 'missing_table', code: NotFound,
+    when: 'The canvas exists but sql references a table that is not staged on it',
+    recovery: 'Call imf_dataframe_describe to list staged tables, or re-run imf_query_dataset to stage the source data again.' },
+  { reason: 'invalid_sql', code: ValidationError,
+    when: 'sql is not a single SELECT statement, or is SELECT-shaped but fails to prepare',
+    recovery: 'Send exactly one SELECT (or WITH … SELECT) statement and check names against imf_dataframe_describe.' },
+  { reason: 'sql_not_permitted', code: ValidationError,
+    when: 'sql parses as SELECT but the read-only gate refuses it — external-data/PRAGMA table function, system catalog, or a non-allowlisted plan operator',
+    recovery: 'Query only the tables listed by imf_dataframe_describe using plain SELECT features.' },
+]
+```
+
+Every reason the DataCanvas gate can raise on `query()` is mapped onto one of these four before it leaves the handler. The framework's own hints name `registerTable()` / `describe()`, which no MCP client can call.
+
+**Additional constraints on `imf_dataframe_query`:**
+- `sql`: one statement, starting with `SELECT` or `WITH`. The handler's `/^\s*(?:SELECT|WITH)\b/i` shape check runs *before* canvas acquisition so `invalid_sql` stays reachable when the canvas is disabled; it deliberately mirrors the framework gate's own `isSelectShaped` test. Statement typing is authoritative in the framework, which parses with DuckDB — `WITH … SELECT` types as `SELECT`, `WITH … INSERT` types as `INSERT` and is rejected.
+- Output carries `truncated`. DataCanvas caps a result at the canvas row limit (default 10,000) and reports no pre-cap total, so `row_count` is the number of *materialized* rows and equals the cap when `truncated` is true. `format()` appends a paging note in the same case.
 
 ### Resources
 
@@ -103,7 +142,7 @@ errors: [
 |:-------------|:------------|:-----------|
 | `imf://database/{dataflow_id}` | Metadata for a single dataflow — dimensions, codelists, name, description. Stable reference for known dataflow IDs (WEO, BOP, CPI, etc.). | None (single record) |
 
-**Resource error behavior:** throws `notFound()` when `dataflow_id` is not in the live dataflow list. Same output schema as `imf_get_database` (`key_format`, `dimensions` with full codelists).
+**Resource error behavior:** throws `notFound()` when `dataflow_id` is not in the live dataflow list, and a `serviceUnavailable` carrying `reason: 'dataflow_list_unavailable'` when the catalog itself cannot be fetched. Same output schema as `imf_get_database` (`key_format`, `dimensions` with full codelists).
 
 ### Prompts
 
