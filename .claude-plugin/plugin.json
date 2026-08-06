@@ -1,6 +1,6 @@
 {
   "name": "imf-mcp-server",
-  "version": "0.2.10",
+  "version": "0.2.11",
   "description": "Query IMF SDMX 3.0 macroeconomic data — hundreds of dataflows across 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads"
