@@ -4,7 +4,10 @@
  * A flow's own name, version, agency, and description survive a shared DSD;
  * series attributes are decoded per series and keyed by series key, so a
  * multi-series key does not collapse to one record, and unit / scale / decimals
- * are located across every id the portal spells them with rather than one each;
+ * are located across every id the portal spells them with rather than one each
+ * and in both places the portal attaches them — a series' own attribute row and
+ * the dimension group its declared relationship names, which is where most of
+ * the catalog puts UNIT;
  * the SDMX 2.1 availability constraint is parsed for no-data enrichment, listing
  * a dimension's codes up to AVAILABILITY_CODE_CAP alongside the pre-cap total.
  * @module services/imf-sdmx/imf-sdmx-service
@@ -25,6 +28,7 @@ import type {
   DataQueryResult,
   Dimension,
   Observation,
+  SdmxAttributeDef,
   SdmxConcept,
   SdmxDataResponse,
   SdmxStructureResponse,
@@ -97,6 +101,94 @@ function findSeriesAttrIndex(defs: Array<{ id: string }>, aliases: readonly stri
     if (idx >= 0) return idx;
   }
   return -1;
+}
+
+/**
+ * Stands in for an attribute row the payload does not carry. `resolveAttrValue`
+ * reports null for any index outside the row it is given, so an absent series
+ * row and a group lookup that found nothing both resolve without a branch.
+ */
+const NO_ATTRIBUTE_ROW: Array<string | number | null> = [];
+
+/**
+ * Slot positions of the dimensions an attribute is declared against, ordered as
+ * a dimension-group key lists them: the series dimensions, then the observation
+ * dimension. `UNIT` on `WEO` is declared against `["INDICATOR"]` and so answers
+ * `[1]` — the slot its group keys constrain.
+ *
+ * The positions are sorted because a relationship lists its dimensions in no
+ * particular order — `QGDP_WCA` declares one against
+ * `["TYPE_OF_TRANSFORMATION", "INDICATOR"]`, the reverse of the key order —
+ * while a group key is read left to right.
+ *
+ * Returns undefined when the attribute is absent or declares no relationship.
+ * Nothing then says which group's row describes a given series, and a guess is a
+ * wrong unit rather than a missing one. A relationship naming a dimension the
+ * payload does not list resolves to a position no group key can constrain, so it
+ * finds no row either.
+ */
+function dimensionGroupSlots(
+  def: SdmxAttributeDef | undefined,
+  dimensionOrder: string[],
+): number[] | undefined {
+  const dims = def?.relationship?.dimensions;
+  if (!dims || dims.length === 0) return;
+  return dims.map((id) => dimensionOrder.indexOf(id)).sort((a, b) => a - b);
+}
+
+/**
+ * Index `dataSets[0].dimensionGroupAttributes` so an attribute can be handed the
+ * row of the one group its own declared relationship names.
+ *
+ * A group key carries one colon-separated slot per declared dimension, in the
+ * order the series dimensions are listed with the observation dimension last.
+ * The slots the group constrains hold an index into that dimension's `values`;
+ * the rest are empty and match anything, so `":0::"` on WEO pins INDICATOR to
+ * its first code and leaves COUNTRY, FREQUENCY, and TIME_PERIOD open. Matching a
+ * series therefore means comparing the slots of the attribute's relationship
+ * against the same positions of the series' own key.
+ *
+ * Keys are bucketed by which slots they constrain, so the lookup for one
+ * attribute reads only the bucket its relationship selects. One structure can
+ * declare attributes over several different dimension subsets — `FAS` files them
+ * under COUNTRY, under INDICATOR, and under TYPE_OF_TRANSFORMATION — and each is
+ * then answered from its own bucket, never from a row filed under a subset that
+ * describes a different set of series. Bucketing also keeps the per-series cost
+ * proportional to the number of concepts read rather than to the number of
+ * groups, which reaches 552 on `FSIBSIS` against its 43,848 series.
+ *
+ * Returns undefined when the payload carries no groups, so the common case adds
+ * no per-series work at all.
+ */
+function buildDimensionGroupLookup(
+  groupAttributes: Record<string, Array<string | number | null>> | undefined,
+):
+  | ((slots: number[], seriesKeyParts: string[]) => Array<string | number | null> | undefined)
+  | undefined {
+  const entries = Object.entries(groupAttributes ?? {});
+  if (entries.length === 0) return;
+
+  const buckets = new Map<string, Map<string, Array<string | number | null>>>();
+  for (const [groupKey, values] of entries) {
+    const slots = groupKey.split(':');
+    const constrained: number[] = [];
+    for (const [index, slot] of slots.entries()) {
+      if (slot !== '') constrained.push(index);
+    }
+    const bucketId = constrained.join(',');
+    let rows = buckets.get(bucketId);
+    if (!rows) {
+      rows = new Map();
+      buckets.set(bucketId, rows);
+    }
+    rows.set(constrained.map((index) => slots[index]).join(':'), values);
+  }
+
+  return (slots, seriesKeyParts) =>
+    // A slot past the series key belongs to the observation dimension, which a
+    // series key says nothing about; projecting it as empty makes the lookup
+    // miss rather than pair a series with a group it is not in.
+    buckets.get(slots.join(','))?.get(slots.map((index) => seriesKeyParts[index] ?? '').join(':'));
 }
 
 /** An SDMX artefact reference: the agency / id / version triple a URN encodes. */
@@ -773,6 +865,7 @@ export class ImfSdmxService {
     // Series attributes (UNIT, SCALE, DECIMALS_DISPLAYED, etc.)
     const seriesAttrs = structure?.attributes?.series ?? [];
     const obsAttrs = structure?.attributes?.observation ?? [];
+    const groupAttrs = structure?.attributes?.dimensionGroup ?? [];
 
     // Find STATUS attribute index in observation attributes
     const statusObsIdx = obsAttrs.findIndex((a) => a.id === 'STATUS');
@@ -783,14 +876,35 @@ export class ImfSdmxService {
     const scaleIdx = findSeriesAttrIndex(seriesAttrs, SERIES_ATTRIBUTE_ALIASES.scale);
     const decimalsIdx = findSeriesAttrIndex(seriesAttrs, SERIES_ATTRIBUTE_ALIASES.decimals);
 
+    // Series-level dimensions for decoding the colon-separated series key ("0:0:0").
+    const seriesDims = structure?.dimensions?.series ?? [];
+
+    /**
+     * The same three concepts, located again in the dimensionGroup list, each
+     * paired with the key slots its own relationship names. The two lists are
+     * disjoint by construction — a DSD declares each attribute at one
+     * relationship — so an id resolved here is one the series list does not carry.
+     */
+    const groupUnitIdx = findSeriesAttrIndex(groupAttrs, SERIES_ATTRIBUTE_ALIASES.unit);
+    const groupScaleIdx = findSeriesAttrIndex(groupAttrs, SERIES_ATTRIBUTE_ALIASES.scale);
+    const groupDecimalsIdx = findSeriesAttrIndex(groupAttrs, SERIES_ATTRIBUTE_ALIASES.decimals);
+    const groupSlotOrder = [...seriesDims, ...obsDims].map((dim) => dim.id);
+    const groupUnitSlots = dimensionGroupSlots(groupAttrs[groupUnitIdx], groupSlotOrder);
+    const groupScaleSlots = dimensionGroupSlots(groupAttrs[groupScaleIdx], groupSlotOrder);
+    const groupDecimalsSlots = dimensionGroupSlots(groupAttrs[groupDecimalsIdx], groupSlotOrder);
+    const groupRowFor =
+      groupUnitSlots || groupScaleSlots || groupDecimalsSlots
+        ? buildDimensionGroupLookup(dataset?.dimensionGroupAttributes)
+        : undefined;
+    /** The row of the group covering this series, or an empty row when there is none. */
+    const groupRowOf = (slots: number[] | undefined, keyParts: string[]) =>
+      (slots && groupRowFor?.(slots, keyParts)) ?? NO_ATTRIBUTE_ROW;
+
     const series = dataset?.series ?? {};
     const observations: Observation[] = [];
     const seriesAttributesByKey: Record<string, SeriesAttributes> = {};
     /** The flat field describes the first series decoded only — see DataQueryResult. */
     let firstSeriesAttributes: SeriesAttributes | undefined;
-
-    // Series-level dimensions for decoding the colon-separated series key ("0:0:0").
-    const seriesDims = structure?.dimensions?.series ?? [];
 
     for (const [seriesKey, seriesData] of Object.entries(series)) {
       // Decode the series key ("0:1:0") into dimension code values ("USA.NGDP_RPCH.A").
@@ -808,14 +922,45 @@ export class ImfSdmxService {
        * every earlier one, so a `USA.NGDPD+NGDP_RPCH.A` query reported a single
        * scale for two series that do not share it.
        */
-      const attrs = seriesData.attributes;
-      const decodedAttributes: SeriesAttributes = attrs
-        ? {
-            unit: this.resolveAttrValue(unitIdx, attrs, seriesAttrs),
-            scale: this.resolveAttrValue(scaleIdx, attrs, seriesAttrs),
-            decimals: this.resolveDecimalsValue(decimalsIdx, attrs, seriesAttrs),
-          }
-        : { unit: null, scale: null, decimals: null };
+      const attrs = seriesData.attributes ?? NO_ATTRIBUTE_ROW;
+      /**
+       * The group a series falls in describes it as truly as its own attribute
+       * row does — the two lists just partition the DSD's attributes by how many
+       * of the key dimensions each one is declared against. Reading only the
+       * series row is what reported `unit: null` across most of the catalog,
+       * where `UNIT` is declared against the indicator alone.
+       *
+       * Each concept is read from the group its own relationship names, so a
+       * structure filing several attributes over different dimension subsets
+       * cannot hand one of them a row that describes a different set of series.
+       *
+       * The series row still wins any concept both lists somehow carry: a
+       * relationship over the whole key describes one series, a group describes
+       * a set of them, and the narrower statement is the one to keep.
+       */
+      const decodedAttributes: SeriesAttributes = {
+        unit:
+          this.resolveAttrValue(unitIdx, attrs, seriesAttrs) ??
+          this.resolveAttrValue(
+            groupUnitIdx,
+            groupRowOf(groupUnitSlots, seriesKeyParts),
+            groupAttrs,
+          ),
+        scale:
+          this.resolveAttrValue(scaleIdx, attrs, seriesAttrs) ??
+          this.resolveAttrValue(
+            groupScaleIdx,
+            groupRowOf(groupScaleSlots, seriesKeyParts),
+            groupAttrs,
+          ),
+        decimals:
+          this.resolveDecimalsValue(decimalsIdx, attrs, seriesAttrs) ??
+          this.resolveDecimalsValue(
+            groupDecimalsIdx,
+            groupRowOf(groupDecimalsSlots, seriesKeyParts),
+            groupAttrs,
+          ),
+      };
       seriesAttributesByKey[decodedSeriesKey] = decodedAttributes;
       // First write wins. Counting the map's keys here instead made the decode
       // quadratic in series count — a `*` key on a wide dataflow resolves to
@@ -860,18 +1005,20 @@ export class ImfSdmxService {
 
   private resolveAttrValue(
     attrIdx: number,
-    attrValues: Array<string | null>,
+    attrValues: Array<string | number | null>,
     attrDefs: Array<{ id: string; values?: Array<{ id: string; name?: string }> }>,
   ): string | null {
     if (attrIdx < 0 || attrIdx >= attrValues.length) return null;
     const raw = attrValues[attrIdx];
     if (raw == null) return null;
+    // Coded cells arrive as JSON numbers, free-text ones as strings.
+    const value = String(raw);
     const def = attrDefs[attrIdx];
     if (def?.values) {
-      const idx = parseInt(raw, 10);
-      if (!Number.isNaN(idx)) return def.values[idx]?.name ?? def.values[idx]?.id ?? raw;
+      const idx = parseInt(value, 10);
+      if (!Number.isNaN(idx)) return def.values[idx]?.name ?? def.values[idx]?.id ?? value;
     }
-    return raw;
+    return value;
   }
 
   /**
@@ -889,7 +1036,7 @@ export class ImfSdmxService {
    */
   private resolveDecimalsValue(
     attrIdx: number,
-    attrValues: Array<string | null>,
+    attrValues: Array<string | number | null>,
     attrDefs: Array<{ id: string; values?: Array<{ id: string; name?: string }> }>,
   ): number | null {
     const resolved = this.resolveAttrValue(attrIdx, attrValues, attrDefs);

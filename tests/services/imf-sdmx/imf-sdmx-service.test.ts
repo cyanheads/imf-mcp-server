@@ -10,8 +10,10 @@
  * their index), #20 (dimensions
  * whose codelist no naming convention can name), #26 (per-dimension code listing
  * capped, with the pre-cap count preserved), #28 (dimension labels), #30 (a
- * shared DSD does not hand one flow another flow's description), and #32 (unit,
- * scale, and precision decode the same whichever of the portal's ids name them).
+ * shared DSD does not hand one flow another flow's description), #32 (unit,
+ * scale, and precision decode the same whichever of the portal's ids name them),
+ * and #33 (an attribute declared against a subset of the series key resolves from
+ * the dimension group covering each series).
  *
  * Fixtures are modeled on the live api.imf.org SDMX 3.0 response shapes: dataflow
  * `structure` is a URN string; `localRepresentation.enumeration` is a Codelist URN
@@ -1712,5 +1714,449 @@ describe('ImfSdmxService.fetchData attribute id aliases (#32)', () => {
     const attrs = await decode(payload);
 
     expect(attrs).toEqual({ unit: 'PT', scale: null, decimals: null });
+  });
+});
+
+// --- #33: unit attaches to a dimension group, not to the whole series key --------
+
+/**
+ * The 17 dimensionGroup attribute ids `WEO` declares, in the order the live
+ * payload lists them. `UNIT` sits at position 15, so a decode that assumes the
+ * concept is near the front of the list reads a neighbouring attribute instead.
+ */
+const WEO_GROUP_ATTR_IDS = [
+  'FUNCTIONAL_CAT',
+  'INT_ACC_ITEM',
+  'NA_STO',
+  'GFS_STO',
+  'COICOP_1999',
+  'TRADE_FLOW',
+  'COMMODITY',
+  'SOC_CONCEPTS',
+  'SECTOR',
+  'ACCOUNTING_ENTRY',
+  'INDEX_TYPE',
+  'PRICES',
+  'STATISTICAL_MEASURES',
+  'EXRATE',
+  'TRANSFORMATION',
+  'UNIT',
+  'REPORTING_PERIOD_TYPE',
+];
+const WEO_GROUP_UNIT_POSITION = WEO_GROUP_ATTR_IDS.indexOf('UNIT');
+
+/** A dimensionGroup attribute row: every position null except UNIT, which is coded. */
+const groupRow = (unitEntry: number | null) =>
+  WEO_GROUP_ATTR_IDS.map((_, index) => (index === WEO_GROUP_UNIT_POSITION ? unitEntry : null));
+
+/**
+ * The dimensionGroup definitions, with UNIT carrying the codes the groups index
+ * into. Every one declares its relationship, as the live payload does — that is
+ * what says which slots of a group key describe the attribute.
+ */
+const weoGroupDefs = (unitCodes: string[]) =>
+  WEO_GROUP_ATTR_IDS.map((id) => ({
+    id,
+    relationship: { dimensions: ['INDICATOR'] },
+    ...(id === 'UNIT' ? { values: unitCodes.map((code) => ({ id: code })) } : {}),
+  }));
+
+/**
+ * A WEO-shaped payload whose UNIT lives only in the dimensionGroup bucket, as the
+ * live response has it: the series' own attribute row carries scale, precision,
+ * and the update date, while UNIT is declared against INDICATOR alone and its
+ * values are keyed by a partial dimension key — `":0::"` pins INDICATOR to its
+ * first code and wildcards COUNTRY, FREQUENCY, and TIME_PERIOD.
+ */
+const weoDimensionGroupFixture = (options: {
+  countries: string[];
+  indicators: string[];
+  /** Series key → its own positional attribute row (SCALE, DECIMALS_DISPLAYED, OVERLAP, COUNTRY_UPDATE_DATE). */
+  series: Record<string, Array<string | number | null>>;
+  unitCodes: string[];
+  dimensionGroupAttributes: Record<string, Array<string | number | null>>;
+}) => ({
+  data: {
+    dataSets: [
+      {
+        dimensionGroupAttributes: options.dimensionGroupAttributes,
+        series: Object.fromEntries(
+          Object.entries(options.series).map(([key, attributes]) => [
+            key,
+            { attributes, observations: { '0': ['1.5'] } },
+          ]),
+        ),
+      },
+    ],
+    structures: [
+      {
+        attributes: {
+          series: [
+            { id: 'SCALE', values: [{ id: '9' }, { id: '0' }] },
+            { id: 'DECIMALS_DISPLAYED', values: [{ id: '3' }] },
+            { id: 'OVERLAP', values: [{ id: 'OL' }] },
+            { id: 'COUNTRY_UPDATE_DATE' },
+          ],
+          dimensionGroup: weoGroupDefs(options.unitCodes),
+          observation: [],
+        },
+        dimensions: {
+          series: [
+            { id: 'COUNTRY', values: options.countries.map((id) => ({ id })) },
+            { id: 'INDICATOR', values: options.indicators.map((id) => ({ id })) },
+            { id: 'FREQUENCY', values: [{ id: 'A' }] },
+          ],
+          observation: [{ id: 'TIME_PERIOD', values: [{ value: '2023' }] }],
+        },
+      },
+    ],
+  },
+});
+
+/**
+ * `FSICDM` files its dimension-group attributes under two different subsets of
+ * the same five-dimension key: `FSI` and `ACCOUNTS` against INDICATOR alone,
+ * `UNIT` against SECTOR + INDICATOR + TRANSFORMATION. Every series therefore
+ * falls in one row of each subset, and only the relationship each attribute
+ * declares says which of the two describes it.
+ */
+const FSICDM_TWO_SUBSETS = {
+  data: {
+    dataSets: [
+      {
+        dimensionGroupAttributes: {
+          '::0:::': [0, 0, null] as Array<string | number | null>,
+          ':0:0:0::': [null, null, 0] as Array<string | number | null>,
+          ':0:0:1::': [null, null, 1] as Array<string | number | null>,
+        },
+        series: {
+          '0:0:0:0:0': { observations: { '0': ['1.5'] } },
+          '0:0:0:1:0': { observations: { '0': ['2.5'] } },
+        },
+      },
+    ],
+    structures: [
+      {
+        attributes: {
+          series: [],
+          dimensionGroup: [
+            { id: 'FSI', relationship: { dimensions: ['INDICATOR'] }, values: [{ id: 'FSKA' }] },
+            {
+              id: 'ACCOUNTS',
+              relationship: { dimensions: ['INDICATOR'] },
+              values: [{ id: 'A1' }],
+            },
+            {
+              id: 'UNIT',
+              relationship: { dimensions: ['SECTOR', 'INDICATOR', 'TRANSFORMATION'] },
+              values: [{ id: 'USD' }, { id: 'PT' }],
+            },
+          ],
+          observation: [],
+        },
+        dimensions: {
+          series: [
+            { id: 'COUNTRY', values: [{ id: 'USA' }] },
+            { id: 'SECTOR', values: [{ id: 'S1' }] },
+            { id: 'INDICATOR', values: [{ id: 'FSKA' }] },
+            { id: 'TRANSFORMATION', values: [{ id: 'LEVEL' }, { id: 'PCH' }] },
+            { id: 'FREQUENCY', values: [{ id: 'Q' }] },
+          ],
+          observation: [{ id: 'TIME_PERIOD', values: [{ value: '2023-Q1' }] }],
+        },
+      },
+    ],
+  },
+};
+
+describe('ImfSdmxService.fetchData dimension-group attributes (#33)', () => {
+  let svc: ImfSdmxService;
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+  });
+
+  const decode = async (payload: unknown, key = 'USA.NGDP_RPCH.A') => {
+    fetchWithTimeout.mockImplementation(() =>
+      Promise.resolve({
+        status: 200,
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify(payload)),
+      }),
+    );
+    const ctx = createMockContext({ tenantId: 'test' });
+    return svc.fetchData('IMF.RES', 'WEO', '9.0.0', key, undefined, undefined, ctx);
+  };
+
+  it('reports the unit WEO carries for a series instead of null', async () => {
+    // The live `USA.NGDP_RPCH.A` response: real GDP growth is a percentage and
+    // the payload says so, in the one bucket the decode never read.
+    const result = await decode(
+      weoDimensionGroupFixture({
+        countries: ['USA'],
+        indicators: ['NGDP_RPCH'],
+        series: { '0:0:0': [1, 0, 0, '9/30/2025'] },
+        unitCodes: ['PT'],
+        dimensionGroupAttributes: { ':0::': groupRow(0) },
+      }),
+    );
+
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']).toEqual({
+      unit: 'PT',
+      scale: '0',
+      decimals: 3,
+    });
+    expect(result.seriesAttributes.unit).toBe('PT');
+  });
+
+  it('gives each series the unit of the group it falls in, not the first group listed', async () => {
+    // A key spanning indicators with genuinely different units: USD for the
+    // dollar level, percent for the growth rate. One shared unit here would be
+    // wrong for one of them either way round.
+    const result = await decode(
+      weoDimensionGroupFixture({
+        countries: ['USA'],
+        indicators: ['NGDPD', 'NGDP_RPCH'],
+        series: {
+          '0:0:0': [0, 0, 0, '9/30/2025'],
+          '0:1:0': [1, 0, 0, '9/30/2025'],
+        },
+        unitCodes: ['USD', 'PT'],
+        dimensionGroupAttributes: { ':0::': groupRow(0), ':1::': groupRow(1) },
+      }),
+      'USA.NGDPD+NGDP_RPCH.*',
+    );
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']).toEqual({
+      unit: 'USD',
+      scale: '9',
+      decimals: 3,
+    });
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']).toEqual({
+      unit: 'PT',
+      scale: '0',
+      decimals: 3,
+    });
+  });
+
+  it('applies one group to every series inside it', async () => {
+    // `USA+GBR.NGDP_RPCH.A` resolves to two series in the same group — the group
+    // wildcards COUNTRY, so both read the same unit while keeping their own scale.
+    const result = await decode(
+      weoDimensionGroupFixture({
+        countries: ['GBR', 'USA'],
+        indicators: ['NGDP_RPCH'],
+        series: {
+          '0:0:0': [1, 0, 0, '9/30/2025'],
+          '1:0:0': [1, 0, 0, '9/30/2025'],
+        },
+        unitCodes: ['PT'],
+        dimensionGroupAttributes: { ':0::': groupRow(0) },
+      }),
+      'USA+GBR.NGDP_RPCH.A',
+    );
+
+    expect(result.seriesAttributesByKey['GBR.NGDP_RPCH.A']?.unit).toBe('PT');
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.unit).toBe('PT');
+  });
+
+  it('leaves a series in no listed group without a unit', async () => {
+    // A wildcard WEO query returns a group per indicator, so all but one miss
+    // every given series. A miss must report nothing rather than the first row.
+    const result = await decode(
+      weoDimensionGroupFixture({
+        countries: ['USA'],
+        indicators: ['NGDP_RPCH'],
+        series: { '0:0:0': [1, 0, 0, '9/30/2025'] },
+        unitCodes: ['USD'],
+        dimensionGroupAttributes: { ':7::': groupRow(0) },
+      }),
+    );
+
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.unit).toBeNull();
+  });
+
+  it('resolves a group whose attribute is declared against several dimensions', async () => {
+    // FSICDM pins UNIT to SECTOR + INDICATOR + TRANSFORMATION out of five series
+    // dimensions, so three slots of the group key are populated at once and two
+    // series differing only in the last of them read different units.
+    const result = await decode(FSICDM_TWO_SUBSETS, 'USA.S1.FSKA.*.Q');
+
+    expect(result.seriesAttributesByKey['USA.S1.FSKA.LEVEL.Q']?.unit).toBe('USD');
+    expect(result.seriesAttributesByKey['USA.S1.FSKA.PCH.Q']?.unit).toBe('PT');
+  });
+
+  it('reads a concept from the group its own relationship names, not from another subset', async () => {
+    // A row filed under INDICATOR alone covers both transformations at once, so
+    // a unit read out of it is a statement about the wrong set of series. The
+    // relationship UNIT declares is what says its row is the SECTOR + INDICATOR
+    // + TRANSFORMATION one, whatever else a matching row happens to carry.
+    const payload = structuredClone(FSICDM_TWO_SUBSETS);
+    payload.data.dataSets[0].dimensionGroupAttributes['::0:::'] = [0, 0, 1];
+
+    const result = await decode(payload, 'USA.S1.FSKA.*.Q');
+
+    expect(result.seriesAttributesByKey['USA.S1.FSKA.LEVEL.Q']?.unit).toBe('USD');
+    expect(result.seriesAttributesByKey['USA.S1.FSKA.PCH.Q']?.unit).toBe('PT');
+  });
+
+  it('resolves a relationship whose dimensions are listed out of key order', async () => {
+    // `QGDP_WCA` declares one of its group attributes against
+    // ["TYPE_OF_TRANSFORMATION", "INDICATOR"] — the reverse of the key order.
+    // A group key is read left to right regardless, so the relationship has to
+    // be ordered against the key before it names any slots.
+    const payload = structuredClone(FSICDM_TWO_SUBSETS);
+    payload.data.structures[0].attributes.dimensionGroup[2]!.relationship = {
+      dimensions: ['TRANSFORMATION', 'INDICATOR', 'SECTOR'],
+    };
+
+    const result = await decode(payload, 'USA.S1.FSKA.*.Q');
+
+    expect(result.seriesAttributesByKey['USA.S1.FSKA.LEVEL.Q']?.unit).toBe('USD');
+    expect(result.seriesAttributesByKey['USA.S1.FSKA.PCH.Q']?.unit).toBe('PT');
+  });
+
+  it('reports no unit for a group declared against the observation dimension', async () => {
+    // A series key says nothing about time, so a group keyed on a period cannot
+    // be shown to cover a series. Reporting nothing is the only safe answer; a
+    // near-miss that resolved anyway would pin one period's unit to every one.
+    const payload = weoDimensionGroupFixture({
+      countries: ['USA'],
+      indicators: ['NGDP_RPCH'],
+      series: { '0:0:0': [1, 0, 0, '9/30/2025'] },
+      unitCodes: ['PT'],
+      dimensionGroupAttributes: { ':0::0': groupRow(0) },
+    });
+    payload.data.structures[0].attributes.dimensionGroup =
+      payload.data.structures[0].attributes.dimensionGroup.map((def) =>
+        def.id === 'UNIT'
+          ? { ...def, relationship: { dimensions: ['INDICATOR', 'TIME_PERIOD'] } }
+          : def,
+      );
+
+    const result = await decode(payload);
+
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.unit).toBeNull();
+  });
+
+  it('reports no unit when the payload declares no relationship for it', async () => {
+    // Without a relationship nothing says which slots of a group key describe
+    // the attribute, so no row can be shown to be this series'.
+    const payload = weoDimensionGroupFixture({
+      countries: ['USA'],
+      indicators: ['NGDP_RPCH'],
+      series: { '0:0:0': [1, 0, 0, '9/30/2025'] },
+      unitCodes: ['PT'],
+      dimensionGroupAttributes: { ':0::': groupRow(0) },
+    });
+    payload.data.structures[0].attributes.dimensionGroup =
+      payload.data.structures[0].attributes.dimensionGroup.map((def) =>
+        def.id === 'UNIT' ? { id: def.id, values: def.values } : def,
+      );
+
+    const result = await decode(payload);
+
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.unit).toBeNull();
+  });
+
+  it('decodes UNIT_MEASURE in a dimension group the same as UNIT', async () => {
+    // The alias list is a property of the concept, not of the bucket it was
+    // first needed in — a group spelling the concept the SDMX-standard way has
+    // to resolve identically.
+    const payload = weoDimensionGroupFixture({
+      countries: ['USA'],
+      indicators: ['NGDP_RPCH'],
+      series: { '0:0:0': [1, 0, 0, '9/30/2025'] },
+      unitCodes: ['PT'],
+      dimensionGroupAttributes: { ':0::': groupRow(0) },
+    });
+    payload.data.structures[0].attributes.dimensionGroup =
+      payload.data.structures[0].attributes.dimensionGroup.map((def) =>
+        def.id === 'UNIT' ? { ...def, id: 'UNIT_MEASURE' } : def,
+      );
+
+    const result = await decode(payload);
+
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.unit).toBe('PT');
+  });
+
+  it('keeps the series attribute when both buckets describe one concept', async () => {
+    // No structure declares a concept at two relationships today. Pinning the
+    // narrower one keeps a structure that later does from describing a single
+    // series by a statement made about a set of them.
+    const payload = weoDimensionGroupFixture({
+      countries: ['USA'],
+      indicators: ['NGDP_RPCH'],
+      series: { '0:0:0': [1, 0, 0, '9/30/2025'] },
+      unitCodes: ['USD'],
+      dimensionGroupAttributes: { ':0::': groupRow(0) },
+    });
+    payload.data.structures[0].attributes.series = [
+      { id: 'SCALE', values: [{ id: '9' }, { id: '0' }] },
+      { id: 'DECIMALS_DISPLAYED', values: [{ id: '3' }] },
+      { id: 'OVERLAP', values: [{ id: 'OL' }] },
+      { id: 'UNIT', values: [{ id: 'PT' }] },
+    ];
+    payload.data.dataSets[0].series['0:0:0'].attributes = [1, 0, 0, 0];
+
+    const result = await decode(payload);
+
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']?.unit).toBe('PT');
+  });
+
+  it('reports the same attributes as before for a payload with no dimension groups', async () => {
+    // The bucket is absent on the structures that attach UNIT to the whole key,
+    // and on every payload predating this decode. Nothing about them may move.
+    const result = await decode(WEO_TWO_SERIES, 'USA.NGDP_RPCH+NGDPD.A');
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']).toEqual({
+      unit: null,
+      scale: '9',
+      decimals: 3,
+    });
+    expect(result.seriesAttributesByKey['USA.NGDP_RPCH.A']).toEqual({
+      unit: null,
+      scale: '0',
+      decimals: 3,
+    });
+  });
+
+  it('decodes a wide result against many groups in time proportional to its series count', async () => {
+    // A wildcard WEO query returns one group per indicator — 145 live — against
+    // tens of thousands of series. Scanning the groups per series would make the
+    // decode quadratic, which is the growth curve this bound exists to catch.
+    const seriesCount = 20_000;
+    const groupCount = 145;
+    const indicators = Array.from({ length: groupCount }, (_, i) => `IND${i}`);
+    const series: Record<string, Array<string | number | null>> = {};
+    for (let i = 0; i < seriesCount; i++) {
+      series[`${i}:${i % groupCount}:0`] = [1, 0, 0, 'x'];
+    }
+    const dimensionGroupAttributes: Record<string, Array<string | number | null>> = {};
+    for (let i = 0; i < groupCount; i++) {
+      dimensionGroupAttributes[`:${i}::`] = groupRow(i);
+    }
+    const payload = weoDimensionGroupFixture({
+      countries: Array.from({ length: seriesCount }, (_, i) => `C${i}`),
+      indicators,
+      series,
+      unitCodes: Array.from({ length: groupCount }, (_, i) => `U${i}`),
+      dimensionGroupAttributes,
+    });
+
+    const started = performance.now();
+    const result = await decode(payload, '*.*.A');
+    const elapsedMs = performance.now() - started;
+
+    expect(Object.keys(result.seriesAttributesByKey)).toHaveLength(seriesCount);
+    expect(result.seriesAttributesByKey['C7.IND7.A']?.unit).toBe('U7');
+    expect(result.seriesAttributesByKey['C150.IND5.A']?.unit).toBe('U5');
+    expect(elapsedMs).toBeLessThan(1500);
   });
 });

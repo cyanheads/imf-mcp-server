@@ -69,10 +69,11 @@ const MOCK_QUERY_RESULT = {
 };
 
 /**
- * The two WEO series #15 was reported against: a dollar aggregate scaled by 10^9
- * and a percent-change series with the `"0"` no-scale sentinel. They are the
- * fixture because their attributes genuinely differ — a fixture where both series
- * share a scale cannot tell a per-series lookup from a global one.
+ * Two series whose attributes differ on every axis a per-series lookup has to
+ * keep apart: an aggregate scaled by 10^9 with a coded unit, against one with the
+ * `"0"` no-scale sentinel and no unit at all. A fixture where both share a scale
+ * cannot tell a per-series lookup from a global one, and one where both carry a
+ * unit cannot tell the rendered `—` from a value.
  */
 const NGDPD_ATTRS = { unit: 'US Dollar', scale: '9', decimals: 3 };
 const NGDP_RPCH_ATTRS = { unit: null, scale: '0', decimals: 3 };
@@ -1409,9 +1410,39 @@ describe('imfQueryDataset', () => {
     );
     expect(byKey['USA.NGDPD.A']?.scale).toBe('9');
     expect(byKey['USA.NGDP_RPCH.A']?.scale).toBe('0');
-    // The dollar aggregate keeps its unit; the percent-change series has none.
+    // One series carries a unit, the other none — neither may be spread to both.
     expect(byKey['USA.NGDPD.A']?.unit).toBe('US Dollar');
     expect(byKey['USA.NGDP_RPCH.A']?.unit).toBeNull();
+  });
+
+  it('#33 carries a per-series unit into series_metadata and the rendered table', async () => {
+    // Every series in a dimension-group flow has a unit, and series sharing a
+    // key can still disagree on it: on WEO the dollar level is USD and the
+    // growth rate PT. Both channels have to say so per row, since a client sees
+    // only one of them.
+    mockSvc.fetchData.mockResolvedValue({
+      ...TWO_SERIES_RESULT,
+      key: 'USA.NGDP_RPCH+NGDPD.*',
+      seriesAttributes: { unit: 'USD', scale: '9', decimals: 3 },
+      seriesAttributesByKey: {
+        'USA.NGDPD.A': { unit: 'USD', scale: '9', decimals: 3 },
+        'USA.NGDP_RPCH.A': { unit: 'PT', scale: '0', decimals: 3 },
+      },
+    });
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH+NGDPD.*',
+    });
+    const structured = result.structuredContent as {
+      series_metadata: Array<{ series_key: string; unit: string | null }>;
+    };
+    const text = (result.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
+
+    expect(
+      Object.fromEntries(structured.series_metadata.map((s) => [s.series_key, s.unit])),
+    ).toEqual({ 'USA.NGDPD.A': 'USD', 'USA.NGDP_RPCH.A': 'PT' });
+    expect(text).toMatch(/\|\s*USA\.NGDPD\.A\s*\|\s*USD\s*\|/);
+    expect(text).toMatch(/\|\s*USA\.NGDP_RPCH\.A\s*\|\s*PT\s*\|/);
   });
 
   it('#15 lists one metadata entry per distinct series, not one per observation', async () => {

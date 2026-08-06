@@ -98,6 +98,22 @@ export interface DataQueryResult {
 export interface SdmxDataResponse {
   data?: {
     dataSets?: Array<{
+      /**
+       * Values for the attributes in `SdmxStructure.attributes.dimensionGroup`,
+       * keyed by a partial dimension key: one colon-separated slot per dimension
+       * the structure declares, in the order `dimensions.series` lists them with
+       * the observation dimension last. A slot the attribute's group constrains
+       * holds an index into that dimension's `values`; every other slot is empty
+       * (`":0::"` on WEO pins INDICATOR and wildcards COUNTRY, FREQUENCY, and
+       * TIME_PERIOD). Which slots a key constrains says which relationship it was
+       * filed under, so a row is read through the relationship its attribute
+       * declares rather than through whichever key happens to match.
+       *
+       * Each entry is positional against the `dimensionGroup` definition list,
+       * exactly as `SdmxSeries.attributes` is against `series` — and, as there, a
+       * coded cell arrives as a JSON number and an uncoded one as a string.
+       */
+      dimensionGroupAttributes?: Record<string, Array<string | number | null>>;
       series?: Record<string, SdmxSeries>;
     }>;
     structures?: Array<SdmxStructure>;
@@ -105,13 +121,21 @@ export interface SdmxDataResponse {
 }
 
 export interface SdmxSeries {
-  attributes?: Array<string | null>;
+  /** Positional against `SdmxStructure.attributes.series`; coded cells arrive as JSON numbers. */
+  attributes?: Array<string | number | null>;
   observations?: Record<string, Array<string | null>>;
 }
 
 export interface SdmxStructure {
   attributes?: {
     series?: Array<SdmxAttributeDef>;
+    /**
+     * Attributes whose DSD relationship names a proper subset of the series-key
+     * dimensions. Their values live in `dataSets[].dimensionGroupAttributes`
+     * rather than on each series, so one entry covers every series sharing the
+     * group. `UNIT` sits here on most of the catalog.
+     */
+    dimensionGroup?: Array<SdmxAttributeDef>;
     observation?: Array<SdmxAttributeDef>;
   };
   dimensions?: {
@@ -130,6 +154,13 @@ export interface SdmxDimensionDef {
 
 export interface SdmxAttributeDef {
   id: string;
+  /**
+   * The dimensions the attribute is declared against. Absent on a series or
+   * observation attribute; on a `dimensionGroup` one it names the proper subset
+   * of the series key its values describe, which is what selects the group row
+   * that applies to a given series.
+   */
+  relationship?: { dimensions?: string[] };
   values?: Array<{ id: string; name?: string }>;
 }
 

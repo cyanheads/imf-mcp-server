@@ -201,12 +201,14 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     'Query an IMF SDMX dataflow by dimension key over a time range. ' +
     'Returns observations with time_period, value, and status, plus the unit, scale, and ' +
     'decimals of each series — a key resolving to several series carries one entry per series ' +
-    'in series_metadata, since scale differs between them. ' +
+    'in series_metadata, since unit and scale differ between them. ' +
     'Requires imf_get_database first to obtain the correct key_format and valid dimension codes. ' +
     'Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE). ' +
     'Key format: dot-separated codes in DSD keyPosition order (e.g. USA.NGDP_RPCH.A for WEO). ' +
     'Every position must carry a code: use + to combine codes (e.g. USA+GBR.NGDP_RPCH.A) ' +
     'and * to match every code at a position (e.g. *.NGDP_RPCH.A for all countries). ' +
+    'A key that uses + but no * can come back with unit null on every series; putting * in ' +
+    'one position (e.g. USA.NGDP_RPCH+NGDPD.* instead of ...A) returns the units. ' +
     'Codelists from imf_get_database enumerate the code universe, not actual coverage — ' +
     'valid codes can still return no_data if the combination has no series. ' +
     'start_period and end_period must be valid period strings (YYYY, YYYY-SN, YYYY-QN, ' +
@@ -316,7 +318,13 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       ),
     series_attributes: z
       .object({
-        unit: z.string().nullable().describe('Unit of measure, e.g. Percent, USD.'),
+        unit: z
+          .string()
+          .nullable()
+          .describe(
+            'Unit of measure as the upstream code, e.g. PT (percent), USD, XDC (domestic currency), NUM (count). ' +
+              'Null when the response carries no unit for the series — many dataflows publish none.',
+          ),
         scale: z
           .string()
           .nullable()
@@ -338,7 +346,13 @@ export const imfQueryDataset = tool('imf_query_dataset', {
             series_key: z
               .string()
               .describe('Series these attributes belong to, matching observations[].series_key.'),
-            unit: z.string().nullable().describe('Unit of measure for this series, e.g. Percent.'),
+            unit: z
+              .string()
+              .nullable()
+              .describe(
+                'Unit of measure for this series as the upstream code, e.g. PT (percent), USD, ' +
+                  'XDC (domestic currency). Null when the response carries none for it.',
+              ),
             scale: z
               .string()
               .nullable()
@@ -356,8 +370,9 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .describe(
         'Per-series attributes, one entry per distinct series_key in the result. Present only ' +
           'when the query resolved to more than one series; a single-series query carries its ' +
-          'values in series_attributes instead. Scale differs across series in one query — WEO ' +
-          'NGDPD is scale 9 while NGDP_RPCH is unscaled — so interpret each series against its own entry.',
+          'values in series_attributes instead. Unit and scale differ across series in one query — ' +
+          'WEO NGDPD is USD at scale 9 while NGDP_RPCH is PT unscaled — so interpret each series ' +
+          'against its own entry.',
       ),
     observation_count: z.number().describe('Total observations in the result.'),
     truncated: z
