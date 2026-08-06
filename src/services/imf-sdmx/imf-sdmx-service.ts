@@ -3,9 +3,10 @@
  * and observations from api.imf.org. Implements caching via ctx.state and retry.
  * A flow's own name, version, agency, and description survive a shared DSD;
  * series attributes are decoded per series and keyed by series key, so a
- * multi-series key does not collapse to one record; the SDMX 2.1 availability
- * constraint is parsed for no-data enrichment, listing a dimension's codes up to
- * AVAILABILITY_CODE_CAP alongside the pre-cap total.
+ * multi-series key does not collapse to one record, and unit / scale / decimals
+ * are located across every id the portal spells them with rather than one each;
+ * the SDMX 2.1 availability constraint is parsed for no-data enrichment, listing
+ * a dimension's codes up to AVAILABILITY_CODE_CAP alongside the pre-cap total.
  * @module services/imf-sdmx/imf-sdmx-service
  */
 
@@ -54,6 +55,49 @@ const DATAFLOW_LIST_UNAVAILABLE_MESSAGE =
   'IMF dataflow catalog is unavailable — the upstream SDMX structure endpoint did not return a usable response.';
 const DATAFLOW_LIST_RECOVERY_HINT =
   'Retry in a few moments. The IMF SDMX 3.0 portal is intermittently unavailable; if it keeps failing the upstream service is down.';
+
+/**
+ * The series-attribute ids that carry unit, scale, and precision, per decoded
+ * attribute and in precedence order.
+ *
+ * The portal does not name these attributes uniformly. A sweep of every
+ * dataflow's DSD attribute list (222 dataflows over 214 distinct structures)
+ * found exactly seven series-attached spellings across the three concepts: the
+ * IMF-authored structures use `UNIT` / `SCALE` / `DECIMALS_DISPLAYED`, while
+ * three externally-authored or one-off structures name the same facts with the
+ * SDMX-standard ids or a variant — `NA_MAIN` (ESTAT) uses `UNIT_MULT` and
+ * `DECIMALS`, `SDG` (IAEG-SDGs) uses `UNIT_MEASURE`, and `PCPS` uses the
+ * singular `DECIMAL_DISPLAYED`. Matching one id per attribute reported `null`
+ * for every series on those flows even though the payload carried the values.
+ *
+ * `PRECISION` and the observation-attached `UNIT_MULT` are deliberately absent:
+ * both attach to the observation, not the series, so they never appear in the
+ * series attribute list this index is taken against.
+ *
+ * Order is the tie-break, IMF-specific spelling first. No dataflow in the
+ * catalog declares two spellings of one concept, so the tie-break does not fire
+ * today; it exists so one that later does resolves the same way on every
+ * request rather than by whichever id the payload happens to list first.
+ */
+const SERIES_ATTRIBUTE_ALIASES = {
+  unit: ['UNIT', 'UNIT_MEASURE'],
+  scale: ['SCALE', 'UNIT_MULT'],
+  decimals: ['DECIMALS_DISPLAYED', 'DECIMALS', 'DECIMAL_DISPLAYED'],
+} as const satisfies Record<keyof SeriesAttributes, readonly string[]>;
+
+/**
+ * Position of the first alias present in a payload's series attribute
+ * definitions, or -1 when the payload declares none of them. The position is
+ * what indexes a series' own positional `attributes` array, so it must come
+ * from the payload's own ordering rather than from the alias list.
+ */
+function findSeriesAttrIndex(defs: Array<{ id: string }>, aliases: readonly string[]): number {
+  for (const alias of aliases) {
+    const idx = defs.findIndex((def) => def.id === alias);
+    if (idx >= 0) return idx;
+  }
+  return -1;
+}
 
 /** An SDMX artefact reference: the agency / id / version triple a URN encodes. */
 interface ArtefactRef {
@@ -726,17 +770,18 @@ export class ImfSdmxService {
     const timeDim = obsDims[0];
     const timeValues = timeDim?.values ?? [];
 
-    // Series attributes (UNIT, SCALE, DECIMALS, etc.)
+    // Series attributes (UNIT, SCALE, DECIMALS_DISPLAYED, etc.)
     const seriesAttrs = structure?.attributes?.series ?? [];
     const obsAttrs = structure?.attributes?.observation ?? [];
 
     // Find STATUS attribute index in observation attributes
     const statusObsIdx = obsAttrs.findIndex((a) => a.id === 'STATUS');
 
-    // Find attribute indices in series attributes
-    const unitIdx = seriesAttrs.findIndex((a) => a.id === 'UNIT');
-    const scaleIdx = seriesAttrs.findIndex((a) => a.id === 'SCALE');
-    const decimalsIdx = seriesAttrs.findIndex((a) => a.id === 'DECIMALS_DISPLAYED');
+    // Find attribute indices in series attributes, across every id the portal
+    // spells each attribute with (see SERIES_ATTRIBUTE_ALIASES).
+    const unitIdx = findSeriesAttrIndex(seriesAttrs, SERIES_ATTRIBUTE_ALIASES.unit);
+    const scaleIdx = findSeriesAttrIndex(seriesAttrs, SERIES_ATTRIBUTE_ALIASES.scale);
+    const decimalsIdx = findSeriesAttrIndex(seriesAttrs, SERIES_ATTRIBUTE_ALIASES.decimals);
 
     const series = dataset?.series ?? {};
     const observations: Observation[] = [];
@@ -830,12 +875,17 @@ export class ImfSdmxService {
   }
 
   /**
-   * DECIMALS_DISPLAYED is a coded attribute like the rest: the series entry holds
-   * an index into the attribute definition's `values`, not the digit count. Read
+   * The precision attribute is coded like the rest: the series entry holds an
+   * index into the attribute definition's `values`, not the digit count. Read
    * straight, WEO's `[0, 0, 0, …]` against `values: [{ id: "3" }]` reports 0
    * decimals for a series that displays 3. Resolving through the definition first
    * — and falling back to the literal when the attribute ships no `values` — is
    * what makes the number mean what it says.
+   *
+   * Both paths are reached in the catalog and both are alias-independent, since
+   * the index is resolved before this runs: `DECIMALS_DISPLAYED` and NA_MAIN's
+   * `DECIMALS` ship `values` and resolve through them, while PCPS's
+   * `DECIMAL_DISPLAYED` ships none and falls back to its literal.
    */
   private resolveDecimalsValue(
     attrIdx: number,

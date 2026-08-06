@@ -9,8 +9,9 @@
  * are keyed per series, and coded attributes are resolved rather than read as
  * their index), #20 (dimensions
  * whose codelist no naming convention can name), #26 (per-dimension code listing
- * capped, with the pre-cap count preserved), #28 (dimension labels), and #30 (a
- * shared DSD does not hand one flow another flow's description).
+ * capped, with the pre-cap count preserved), #28 (dimension labels), #30 (a
+ * shared DSD does not hand one flow another flow's description), and #32 (unit,
+ * scale, and precision decode the same whichever of the portal's ids name them).
  *
  * Fixtures are modeled on the live api.imf.org SDMX 3.0 response shapes: dataflow
  * `structure` is a URN string; `localRepresentation.enumeration` is a Codelist URN
@@ -1494,5 +1495,222 @@ describe('ImfSdmxService.fetchData series attributes (#15)', () => {
     const result = await query();
 
     expect(result.seriesAttributesByKey['USA.NGDPD.A']?.decimals).toBe(4);
+  });
+});
+
+// --- #32: the portal spells unit / scale / precision several ways ----------------
+
+/**
+ * A one-series payload whose series attribute definitions are supplied by the
+ * caller, so a fixture differs from another only in what the attributes are
+ * NAMED. Series dimensions and observations are fixed — the series always
+ * decodes to `USA.NGDPD.A` — which is what makes two spellings directly
+ * comparable as decoded output rather than as matched ids.
+ */
+const attributeFixture = (
+  defs: Array<{ id: string; values?: Array<{ id: string }> }>,
+  entries: Array<string | number | null>,
+) => ({
+  data: {
+    dataSets: [{ series: { '0:0:0': { attributes: entries, observations: { '0': ['1.5'] } } } }],
+    structures: [
+      {
+        attributes: { series: defs, observation: [] },
+        dimensions: {
+          series: [
+            { id: 'COUNTRY', values: [{ id: 'USA' }] },
+            { id: 'INDICATOR', values: [{ id: 'NGDPD' }] },
+            { id: 'FREQUENCY', values: [{ id: 'A' }] },
+          ],
+          observation: [{ id: 'TIME_PERIOD', values: [{ value: '2020' }] }],
+        },
+      },
+    ],
+  },
+});
+
+/**
+ * The series attribute definitions `NA_MAIN` actually ships, in the order the
+ * live payload lists them, with the entries a real series carries. Only three
+ * positions are populated and the two that matter sit at 6 and 10 — reproducing
+ * the shape is the point, since an index taken against a shorter list would
+ * read the wrong slot even with the right id matched.
+ */
+const NA_MAIN_ATTR_DEFS = [
+  { id: 'REF_PERIOD_DETAIL' },
+  { id: 'REPYEARSTART' },
+  { id: 'REPYEAREND' },
+  { id: 'TIME_FORMAT', values: [{ id: 'P1Y' }] },
+  { id: 'TIME_PER_COLLECT' },
+  { id: 'REF_YEAR_PRICE' },
+  { id: 'DECIMALS', values: [{ id: '2' }] },
+  { id: 'TABLE_IDENTIFIER' },
+  { id: 'TITLE' },
+  { id: 'TITLE_COMPL' },
+  { id: 'UNIT_MULT', values: [{ id: '0' }] },
+  { id: 'LAST_UPDATE' },
+  { id: 'COMPILING_ORG' },
+  { id: 'COMMENT_TS' },
+  { id: 'DATA_COMP' },
+  { id: 'CURRENCY' },
+  { id: 'DISS_ORG' },
+];
+const NA_MAIN_ATTR_ENTRIES = [
+  null,
+  null,
+  null,
+  0,
+  null,
+  null,
+  0,
+  null,
+  null,
+  null,
+  0,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+];
+
+describe('ImfSdmxService.fetchData attribute id aliases (#32)', () => {
+  let svc: ImfSdmxService;
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+  });
+
+  const decode = async (payload: unknown) => {
+    fetchWithTimeout.mockImplementation(() =>
+      Promise.resolve({
+        status: 200,
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify(payload)),
+      }),
+    );
+    const ctx = createMockContext({ tenantId: 'test' });
+    const result = await svc.fetchData(
+      'IMF.RES',
+      'WEO',
+      '9.0.0',
+      'USA.NGDPD.A',
+      undefined,
+      undefined,
+      ctx,
+    );
+    return result.seriesAttributesByKey['USA.NGDPD.A'];
+  };
+
+  /**
+   * Each pair is the same fact under two ids. Asserting the two decode to the
+   * same record — rather than asserting an alias list contains a string — is
+   * what fails if a spelling is matched but the value behind it is not resolved.
+   */
+  const equivalentSpellings: Array<{
+    attribute: string;
+    imf: { id: string; values?: Array<{ id: string }> };
+    other: { id: string; values?: Array<{ id: string }> };
+    entry: string | number | null;
+  }> = [
+    {
+      attribute: 'unit',
+      imf: { id: 'UNIT', values: [{ id: 'PER_100000_POP' }] },
+      other: { id: 'UNIT_MEASURE', values: [{ id: 'PER_100000_POP' }] },
+      entry: 0,
+    },
+    {
+      attribute: 'scale',
+      imf: { id: 'SCALE', values: [{ id: '9' }] },
+      other: { id: 'UNIT_MULT', values: [{ id: '9' }] },
+      entry: 0,
+    },
+    {
+      attribute: 'decimals',
+      imf: { id: 'DECIMALS_DISPLAYED', values: [{ id: '2' }] },
+      other: { id: 'DECIMALS', values: [{ id: '2' }] },
+      entry: 0,
+    },
+    {
+      attribute: 'decimals',
+      imf: { id: 'DECIMALS_DISPLAYED', values: [{ id: '2' }] },
+      other: { id: 'DECIMAL_DISPLAYED', values: [{ id: '2' }] },
+      entry: 0,
+    },
+  ];
+
+  for (const { attribute, imf, other, entry } of equivalentSpellings) {
+    it(`decodes ${attribute} the same from ${other.id} as from ${imf.id}`, async () => {
+      const viaImf = await decode(attributeFixture([imf], [entry]));
+      const viaOther = await decode(attributeFixture([other], [entry]));
+
+      expect(viaOther).toEqual(viaImf);
+      expect(viaOther?.[attribute as 'unit' | 'scale' | 'decimals']).not.toBeNull();
+    });
+  }
+
+  it('reports NA_MAIN’s own precision and scale instead of nulls', async () => {
+    // The values are unrecoverable from the response when this returns nulls, so
+    // a caller cannot tell whether 1312245540100 is already in units.
+    const attrs = await decode(attributeFixture(NA_MAIN_ATTR_DEFS, NA_MAIN_ATTR_ENTRIES));
+
+    expect(attrs).toEqual({ unit: null, scale: '0', decimals: 2 });
+  });
+
+  it('reads an aliased attribute that ships no values as the literal it carries', async () => {
+    // PCPS spells precision `DECIMAL_DISPLAYED` and ships no `values` for it, so
+    // the alias and the literal fallback have to compose.
+    const attrs = await decode(attributeFixture([{ id: 'DECIMAL_DISPLAYED' }], ['4']));
+
+    expect(attrs?.decimals).toBe(4);
+  });
+
+  it('reports null for a dataflow declaring no spelling of an attribute', async () => {
+    const attrs = await decode(
+      attributeFixture([{ id: 'OVERLAP', values: [{ id: 'OL' }] }, { id: 'IFS_FLAG' }], [0, null]),
+    );
+
+    expect(attrs).toEqual({ unit: null, scale: null, decimals: null });
+  });
+
+  it('prefers the IMF spelling when a payload declares two for one attribute', async () => {
+    // No dataflow declares both today; pinning the order keeps one that later
+    // does from resolving differently between requests.
+    const attrs = await decode(
+      attributeFixture(
+        [
+          { id: 'UNIT_MULT', values: [{ id: '3' }] },
+          { id: 'SCALE', values: [{ id: '9' }] },
+          { id: 'DECIMALS', values: [{ id: '1' }] },
+          { id: 'DECIMALS_DISPLAYED', values: [{ id: '2' }] },
+          { id: 'UNIT_MEASURE', values: [{ id: 'PT' }] },
+          { id: 'UNIT', values: [{ id: 'Percent' }] },
+        ],
+        [0, 0, 0, 0, 0, 0],
+      ),
+    );
+
+    expect(attrs).toEqual({ unit: 'Percent', scale: '9', decimals: 2 });
+  });
+
+  it('does not read an observation-attached attribute as the series scale', async () => {
+    // SDG attaches UNIT_MULT to the observation and UNIT_MEASURE to the series.
+    // Only the series list indexes a series' positional attributes array, so
+    // reaching into the other one would mean indexing an unrelated array.
+    const payload = attributeFixture([{ id: 'UNIT_MEASURE', values: [{ id: 'PT' }] }], [0]);
+    payload.data.structures[0]!.attributes.observation = [
+      { id: 'UNIT_MULT', values: [{ id: '6' }] },
+    ];
+
+    const attrs = await decode(payload);
+
+    expect(attrs).toEqual({ unit: 'PT', scale: null, decimals: null });
   });
 });
