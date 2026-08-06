@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.5](changelog/0.2.x/0.2.5.md) — 2026-08-06 · 🛡️ Security
+
+Security fix for a dataflow-list URL leak in error responses; imf_dataframe_query surfaces DataCanvas truncation, translates missing-table recovery, and accepts WITH … SELECT; adopt @cyanheads/mcp-ts-core ^0.11.1 (TypeScript 7, raised optional-peer floors)
+
 ## [0.2.4](changelog/0.2.x/0.2.4.md) — 2026-07-11
 
 imf_query_dataset rejects malformed and reversed start_period/end_period before the upstream call; docs/design.md error-code label corrections for key_dimension_mismatch and invalid_sql
