@@ -1,8 +1,9 @@
 /**
  * @fileoverview Tool: imf_query_dataset — query a dataflow by dimension key over a time range.
  * Periods are compared as the date spans they name, so a bound coarser than the
- * observation frequency covers every sub-period inside it. Large result sets
- * spill to DataCanvas for SQL analysis.
+ * observation frequency covers every sub-period inside it. A key resolving to
+ * several series carries each one's own unit/scale/decimals, inline and on the
+ * canvas. Large result sets spill to DataCanvas for SQL analysis.
  * @module mcp-server/tools/definitions/imf-query-dataset.tool
  */
 
@@ -11,12 +12,51 @@ import { spillover } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
-import type { Observation } from '@/services/imf-sdmx/types.js';
+import type {
+  AvailabilityResult,
+  Observation,
+  SeriesAttributes,
+} from '@/services/imf-sdmx/types.js';
 
 const PREVIEW_CHARS = 100_000;
 
 /** IMF SDMX 3.0 data portal base URL — used to construct per-dataflow attribution links. */
 const IMF_DATA_PORTAL = 'https://data.imf.org/';
+
+/**
+ * How a scale of `"0"` reads in formatted text. The IMF emits `"0"` as the
+ * no-op sentinel for a series with no scale multiplier, and a bare `0` beside a
+ * value reads as a quantity — as an observation of zero, or as a multiplier of
+ * zero. Naming it keeps the attribute out of the reader's way while still
+ * carrying it, so the formatted channel says what the structured one does.
+ */
+const NO_SCALE_MULTIPLIER = 'no scale multiplier';
+
+/**
+ * Most per-series rows the formatted channel renders. A `*` key resolves to
+ * hundreds of series (WEO's `*.NGDPD+NGDP_RPCH.A` is 420), and a table that long
+ * costs more than the observations it annotates. `structuredContent` keeps every
+ * entry, and each canvas row carries its own unit/scale/decimals, so the cap
+ * bounds the rendering rather than the data — it is disclosed, never silent.
+ */
+const SERIES_METADATA_PREVIEW_ROWS = 20;
+
+/** Render a scale attribute for a reader: null stays absent, `"0"` is named, anything else is the upstream value. */
+function scaleLabel(scale: string | null): string | null {
+  if (scale == null) return null;
+  return scale === '0' ? NO_SCALE_MULTIPLIER : scale;
+}
+
+/** One `DIM: codes` clause per dimension, stating how many of how many when the listing is capped. */
+function describeCoverage(availableCodes: AvailabilityResult['available_codes']): string {
+  return Object.entries(availableCodes)
+    .map(([dim, { codes, count }]) =>
+      count > codes.length
+        ? `${dim}: ${codes.length} of ${count} codes with data shown (${codes.join(', ')})`
+        : `${dim}: ${codes.join(', ')}`,
+    )
+    .join('; ');
+}
 
 /** The inclusive span of dates a period label names. */
 interface PeriodSpan {
@@ -159,7 +199,9 @@ function observedRange(observations: Observation[]): { first: string; last: stri
 export const imfQueryDataset = tool('imf_query_dataset', {
   description:
     'Query an IMF SDMX dataflow by dimension key over a time range. ' +
-    'Returns observations with time_period, value, unit, scale, and status attributes. ' +
+    'Returns observations with time_period, value, and status, plus the unit, scale, and ' +
+    'decimals of each series — a key resolving to several series carries one entry per series ' +
+    'in series_metadata, since scale differs between them. ' +
     'Requires imf_get_database first to obtain the correct key_format and valid dimension codes. ' +
     'Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE). ' +
     'Key format: dot-separated codes in DSD keyPosition order (e.g. USA.NGDP_RPCH.A for WEO). ' +
@@ -275,10 +317,48 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     series_attributes: z
       .object({
         unit: z.string().nullable().describe('Unit of measure, e.g. Percent, USD.'),
-        scale: z.string().nullable().describe('Scale multiplier, e.g. Billions.'),
+        scale: z
+          .string()
+          .nullable()
+          .describe(
+            'Scale multiplier as the upstream code, e.g. 9 for billions. "0" means no multiplier — the values are unscaled.',
+          ),
         decimals: z.number().nullable().describe('Number of decimal places shown.'),
       })
-      .describe('Series-level attributes (unit, scale, decimals).'),
+      .describe(
+        'Attributes of the first series in the result — the same series as series_metadata[0]. ' +
+          'A key with + or * resolves to several series whose scale and unit differ, and this ' +
+          'field describes only the first of them: read series_metadata for the rest, and never ' +
+          'apply these values to another series_key.',
+      ),
+    series_metadata: z
+      .array(
+        z
+          .object({
+            series_key: z
+              .string()
+              .describe('Series these attributes belong to, matching observations[].series_key.'),
+            unit: z.string().nullable().describe('Unit of measure for this series, e.g. Percent.'),
+            scale: z
+              .string()
+              .nullable()
+              .describe(
+                'Scale multiplier for this series as the upstream code, e.g. 9 for billions. "0" means no multiplier.',
+              ),
+            decimals: z
+              .number()
+              .nullable()
+              .describe('Number of decimal places shown for this series.'),
+          })
+          .describe('Unit, scale, and decimals for one series in the result.'),
+      )
+      .optional()
+      .describe(
+        'Per-series attributes, one entry per distinct series_key in the result. Present only ' +
+          'when the query resolved to more than one series; a single-series query carries its ' +
+          'values in series_attributes instead. Scale differs across series in one query — WEO ' +
+          'NGDPD is scale 9 while NGDP_RPCH is unscaled — so interpret each series against its own entry.',
+      ),
     observation_count: z.number().describe('Total observations in the result.'),
     truncated: z
       .boolean()
@@ -316,9 +396,9 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     {
       reason: 'no_data',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Key is structurally valid but the dataflow holds no series for this code combination',
+      when: 'Key is structurally valid but the dataflow holds no series for this code combination, or the dataflow publishes no series at all',
       recovery:
-        'Check the availability context in the error — if series_count is 0 the code has no coverage; if series_count > 0 the combination is wrong and available_codes names the codes that do have data, stating how many of a dimension it is showing when the list is capped.',
+        'Read the availability context in the error. An empty dataflow means no key will return data — call imf_list_databases and pick another dataflow. Otherwise, series_count 0 means the code itself has no coverage and dataflow_availability names codes that do, while series_count above 0 means the combination is wrong and available_codes names the codes that have data, stating how many of a dimension it shows when the list is capped.',
     },
     {
       reason: 'no_data_in_range',
@@ -571,40 +651,71 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         .fetchAvailabilityConstraint(input.dataflow_id, firstCode, ctx, ctx.signal)
         .catch(() => null);
 
+      /**
+       * A key-scoped constraint answers "does this code have series" and nothing
+       * more: an uncovered code in a populated dataflow and a dataflow that
+       * publishes nothing at all both come back as `series_count: 0` with an
+       * empty cube region, byte-identical apart from the ids. Only the
+       * dataflow-wide constraint separates them — so ask for it, and only on the
+       * path that already has no data to return.
+       */
+      const dataflowAvailability =
+        availability?.series_count === 0
+          ? await svc
+              .fetchAvailabilityConstraint(input.dataflow_id, '', ctx, ctx.signal)
+              .catch(() => null)
+          : null;
+
       let noDataMsg: string;
       let recoveryHint: string | undefined;
 
-      if (availability) {
-        if (availability.series_count === 0) {
-          noDataMsg =
-            `'${firstCode}' has 0 series in '${input.dataflow_id}' — ` +
-            `this code has no coverage in this dataflow. ` +
-            `Coverage is narrower than the codelist; check availability rather than the codelist to pick codes.`;
-          recoveryHint =
-            `'${firstCode}' is not covered in '${input.dataflow_id}'. ` +
-            `Try a different code — the codelist may include codes with no actual data.`;
-        } else {
-          // A capped dimension states how many of how many it is showing —
-          // an unannotated slice reads as the full set (see AvailabilityDimension).
-          const dimLines = Object.entries(availability.available_codes)
-            .map(([dim, { codes, count }]) =>
-              count > codes.length
-                ? `${dim}: ${codes.length} of ${count} codes with data shown (${codes.join(', ')})`
-                : `${dim}: ${codes.join(', ')}`,
-            )
-            .join('; ');
-          const timeLine =
-            availability.time_period_start || availability.time_period_end
-              ? ` Available time range: ${availability.time_period_start ?? '?'} – ${availability.time_period_end ?? '?'}.`
-              : '';
-          noDataMsg =
-            `No data for key '${input.key}' in '${input.dataflow_id}' ` +
-            `(${availability.series_count} series exist for '${firstCode}', but this combination has none). ` +
-            `Available codes per dimension: ${dimLines}.${timeLine}`;
-          recoveryHint =
-            `The combination is wrong — '${firstCode}' has ${availability.series_count} series but not for this key. ` +
-            `Available codes: ${dimLines}.${timeLine}`;
-        }
+      if (
+        availability &&
+        availability.series_count === 0 &&
+        dataflowAvailability?.series_count === 0
+      ) {
+        // The dataflow itself is empty. Every key returns this, so pointing the
+        // caller at a different code is a loop with no exit.
+        noDataMsg =
+          `Dataflow '${input.dataflow_id}' publishes no series at all — it is empty, so every key ` +
+          `returns no data, including this one. Recently added vintage dataflows are commonly empty ` +
+          `until the IMF populates them.`;
+        recoveryHint =
+          `'${input.dataflow_id}' holds no data — changing the key will not help. ` +
+          `Call imf_list_databases to pick a different dataflow.`;
+      } else if (availability && availability.series_count === 0) {
+        // The code is uncovered inside a dataflow that does publish series. When
+        // the dataflow-wide constraint came back, it names codes that do have
+        // data — the correction the old "try a different code" hint never gave.
+        const coverage = dataflowAvailability
+          ? describeCoverage(dataflowAvailability.available_codes)
+          : '';
+        const coverageLine = coverage ? ` Codes with data in this dataflow: ${coverage}.` : '';
+        const totalLine = dataflowAvailability
+          ? ` The dataflow itself publishes ${dataflowAvailability.series_count} series.`
+          : '';
+        noDataMsg =
+          `'${firstCode}' has 0 series in '${input.dataflow_id}' — ` +
+          `this code has no coverage in this dataflow.${totalLine} ` +
+          `Coverage is narrower than the codelist; check availability rather than the codelist to pick codes.${coverageLine}`;
+        recoveryHint =
+          `'${firstCode}' is not covered in '${input.dataflow_id}'. ` +
+          `Try a different code — the codelist may include codes with no actual data.${coverageLine}`;
+      } else if (availability) {
+        // A capped dimension states how many of how many it is showing —
+        // an unannotated slice reads as the full set (see AvailabilityDimension).
+        const dimLines = describeCoverage(availability.available_codes);
+        const timeLine =
+          availability.time_period_start || availability.time_period_end
+            ? ` Available time range: ${availability.time_period_start ?? '?'} – ${availability.time_period_end ?? '?'}.`
+            : '';
+        noDataMsg =
+          `No data for key '${input.key}' in '${input.dataflow_id}' ` +
+          `(${availability.series_count} series exist for '${firstCode}', but this combination has none). ` +
+          `Available codes per dimension: ${dimLines}.${timeLine}`;
+        recoveryHint =
+          `The combination is wrong — '${firstCode}' has ${availability.series_count} series but not for this key. ` +
+          `Available codes: ${dimLines}.${timeLine}`;
       } else {
         noDataMsg = `No data returned for key '${input.key}' in dataflow '${input.dataflow_id}'`;
       }
@@ -613,6 +724,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         key: input.key,
         dataflowId: input.dataflow_id,
         ...(availability ? { availability } : {}),
+        ...(dataflowAvailability ? { dataflow_availability: dataflowAvailability } : {}),
         ...ctx.recoveryFor('no_data'),
         ...(recoveryHint ? { recovery: { hint: recoveryHint } } : {}),
       });
@@ -638,26 +750,68 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       }
     }
 
+    /**
+     * Attributes belong to a series, not to a query. Everything downstream — the
+     * inline payload, the canvas rows, the rendered text — reads them through
+     * this lookup so a row can only ever receive its own series' unit and scale.
+     * The flat fallback covers a series the upstream payload described no
+     * attributes for.
+     */
+    const attributesFor = (seriesKey: string): SeriesAttributes =>
+      queryResult.seriesAttributesByKey[seriesKey] ?? queryResult.seriesAttributes;
+
+    const seriesKeys = [...new Set(filteredObservations.map((obs) => obs.series_key))];
+    // One series needs no per-series list — series_attributes already describes it.
+    const seriesMetadata =
+      seriesKeys.length > 1
+        ? seriesKeys.map((seriesKey) => {
+            const attrs = attributesFor(seriesKey);
+            return {
+              series_key: seriesKey,
+              unit: attrs.unit,
+              scale: attrs.scale,
+              decimals: attrs.decimals,
+            };
+          })
+        : undefined;
+
+    /**
+     * The flat field is pinned to the first series of the result rather than the
+     * first the decoder happened to reach, so `series_attributes` and
+     * `series_metadata[0]` always describe the same series. Observations are
+     * time-sorted, so the two orders are otherwise unrelated — and a flat record
+     * that silently belongs to a different series than the list's head is the
+     * same class of confusion the per-series list exists to end.
+     */
+    const primarySeriesKey = seriesKeys[0];
+    const seriesAttributes = primarySeriesKey
+      ? attributesFor(primarySeriesKey)
+      : queryResult.seriesAttributes;
+
     ctx.log.info('Data query completed', {
       dataflowId: input.dataflow_id,
       key: input.key,
       observations: filteredObservations.length,
+      series: seriesKeys.length,
     });
 
     // Canvas spill path
     const canvas = getCanvas();
     if (canvas) {
       const instance = await canvas.acquire(input.canvas_id, ctx);
-      const rows = filteredObservations.map((obs) => ({
-        dataflow_id: input.dataflow_id,
-        series_key: obs.series_key,
-        time_period: obs.time_period,
-        value: obs.value,
-        status: obs.status,
-        unit: queryResult.seriesAttributes.unit,
-        scale: queryResult.seriesAttributes.scale,
-        decimals: queryResult.seriesAttributes.decimals,
-      }));
+      const rows = filteredObservations.map((obs) => {
+        const attrs = attributesFor(obs.series_key);
+        return {
+          dataflow_id: input.dataflow_id,
+          series_key: obs.series_key,
+          time_period: obs.time_period,
+          value: obs.value,
+          status: obs.status,
+          unit: attrs.unit,
+          scale: attrs.scale,
+          decimals: attrs.decimals,
+        };
+      });
 
       const result = await spillover({
         canvas: instance,
@@ -678,7 +832,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
             value: r.value,
             status: r.status,
           })),
-          series_attributes: queryResult.seriesAttributes,
+          series_attributes: seriesAttributes,
+          ...(seriesMetadata ? { series_metadata: seriesMetadata } : {}),
           observation_count: result.handle.rowCount,
           truncated: true,
           canvas_id: instance.canvasId,
@@ -695,7 +850,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       ...(input.start_period ? { start_period: input.start_period } : {}),
       ...(input.end_period ? { end_period: input.end_period } : {}),
       observations: filteredObservations,
-      series_attributes: queryResult.seriesAttributes,
+      series_attributes: seriesAttributes,
+      ...(seriesMetadata ? { series_metadata: seriesMetadata } : {}),
       observation_count: filteredObservations.length,
       truncated: false,
       source: `Source: International Monetary Fund, ${dataflow.name}, ${IMF_DATA_PORTAL}`,
@@ -711,15 +867,41 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       lines.push(`**Period:** ${range}`);
     }
 
+    /**
+     * Series attributes reach this channel too. A client that forwards only
+     * `content[]` used to see no scale, unit, or precision at all, because the
+     * whole line was gated on a meaningful scale — which also dropped `decimals`
+     * whenever scale was the `"0"` sentinel. The sentinel is still never printed
+     * as a bare `0`; it is named instead, so nothing is suppressed to avoid it.
+     */
     const { unit, scale, decimals } = result.series_attributes;
-    // Suppress scale "0" — it's a no-op multiplier the upstream API emits when
-    // scale is absent; printing "0" is misleading.
-    const meaningfulScale = scale && scale !== '0' ? scale : null;
-    if (unit || meaningfulScale) {
-      const meta = [unit, meaningfulScale, decimals != null ? `${decimals} decimals` : null]
-        .filter(Boolean)
-        .join(' | ');
-      lines.push(`**Series:** ${meta}`);
+    const primaryMeta = [unit, scaleLabel(scale), decimals != null ? `${decimals} decimals` : null]
+      .filter(Boolean)
+      .join(' | ');
+
+    if (result.series_metadata) {
+      const shown = result.series_metadata.slice(0, SERIES_METADATA_PREVIEW_ROWS);
+      const heading =
+        shown.length < result.series_metadata.length
+          ? `\n**Series attributes** — ${shown.length} of ${result.series_metadata.length} series shown; every row on the canvas carries its own unit, scale, and decimals\n`
+          : '\n**Series attributes** — one row per series\n';
+      lines.push(heading);
+      lines.push('| Series Key | Unit | Scale | Decimals |');
+      lines.push('|:-----------|:-----|:------|---------:|');
+      for (const series of shown) {
+        lines.push(
+          `| ${series.series_key} | ${series.unit ?? '—'} | ${scaleLabel(series.scale) ?? '—'} | ${series.decimals ?? '—'} |`,
+        );
+      }
+      // Naming the series the flat field describes keeps a reader from applying
+      // it to the whole table, which is the confusion the table exists to end.
+      if (primaryMeta) {
+        lines.push(
+          `\n\`series_attributes\` describes the first row (${result.series_metadata[0]?.series_key ?? ''}): ${primaryMeta}\n`,
+        );
+      }
+    } else if (primaryMeta) {
+      lines.push(`**Series:** ${primaryMeta}`);
     }
 
     lines.push(

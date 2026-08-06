@@ -1,9 +1,13 @@
 /**
  * @fileoverview Tests for the imf_query_dataset tool — inline, canvas spillover,
- * period-range filtering, and error paths. The period cases assert the periods a
+ * period-range filtering, series attributes across both output channels, and
+ * error paths. The period cases assert the periods a
  * caller gets back rather than the shape of any internal comparison, since the
  * defect they guard (#21) was a correct-looking comparison applied to the wrong
- * representation.
+ * representation. The attribute cases (#3, #15, #18) work the same way: they read
+ * the rendered Series cells and the per-series entries a caller receives, because
+ * a line that is simply missing satisfies "the sentinel is not printed" without
+ * carrying anything across.
  * @module tests/tools/imf-query-dataset.tool.test
  */
 
@@ -49,9 +53,9 @@ const MOCK_STRUCTURE = {
 };
 
 const MOCK_OBSERVATIONS = [
-  { time_period: '2020', value: 3.5, status: null },
-  { time_period: '2021', value: 5.1, status: 'E' },
-  { time_period: '2022', value: 2.8, status: null },
+  { series_key: 'USA.NGDP_RPCH.A', time_period: '2020', value: 3.5, status: null },
+  { series_key: 'USA.NGDP_RPCH.A', time_period: '2021', value: 5.1, status: 'E' },
+  { series_key: 'USA.NGDP_RPCH.A', time_period: '2022', value: 2.8, status: null },
 ];
 
 const MOCK_SERIES_ATTRS = { unit: 'Percent', scale: null, decimals: 3 };
@@ -61,6 +65,33 @@ const MOCK_QUERY_RESULT = {
   key: 'USA.NGDP_RPCH.A',
   observations: MOCK_OBSERVATIONS,
   seriesAttributes: MOCK_SERIES_ATTRS,
+  seriesAttributesByKey: { 'USA.NGDP_RPCH.A': MOCK_SERIES_ATTRS },
+};
+
+/**
+ * The two WEO series #15 was reported against: a dollar aggregate scaled by 10^9
+ * and a percent-change series with the `"0"` no-scale sentinel. They are the
+ * fixture because their attributes genuinely differ — a fixture where both series
+ * share a scale cannot tell a per-series lookup from a global one.
+ */
+const NGDPD_ATTRS = { unit: 'US Dollar', scale: '9', decimals: 3 };
+const NGDP_RPCH_ATTRS = { unit: null, scale: '0', decimals: 3 };
+
+const TWO_SERIES_RESULT = {
+  dataflowId: 'WEO',
+  key: 'USA.NGDP_RPCH+NGDPD.A',
+  observations: [
+    { series_key: 'USA.NGDPD.A', time_period: '2020', value: 21_375_275_000_000, status: null },
+    { series_key: 'USA.NGDP_RPCH.A', time_period: '2020', value: -2.081277, status: null },
+    { series_key: 'USA.NGDPD.A', time_period: '2021', value: 23_725_650_000_000, status: null },
+    { series_key: 'USA.NGDP_RPCH.A', time_period: '2021', value: 6.151865, status: null },
+  ],
+  // Decoded last, so a last-write-wins global would report scale "0" for both.
+  seriesAttributes: NGDPD_ATTRS,
+  seriesAttributesByKey: {
+    'USA.NGDPD.A': NGDPD_ATTRS,
+    'USA.NGDP_RPCH.A': NGDP_RPCH_ATTRS,
+  },
 };
 
 /**
@@ -112,7 +143,12 @@ describe('imfQueryDataset', () => {
     expect(result.key).toBe('USA.NGDP_RPCH.A');
     expect(result.truncated).toBe(false);
     expect(result.observations).toHaveLength(3);
-    expect(result.observations[0]).toEqual({ time_period: '2020', value: 3.5, status: null });
+    expect(result.observations[0]).toEqual({
+      series_key: 'USA.NGDP_RPCH.A',
+      time_period: '2020',
+      value: 3.5,
+      status: null,
+    });
     expect(result.series_attributes.unit).toBe('Percent');
     expect(result.observation_count).toBe(3);
     expect(result.canvas_id).toBeUndefined();
@@ -280,8 +316,23 @@ describe('imfQueryDataset', () => {
     expect(text).toContain('https://data.imf.org/');
   });
 
-  it('suppresses scale "0" in format output (upstream no-op sentinel)', () => {
-    // Upstream emits scale "0" when scale is absent — it must not be printed.
+  /**
+   * Attribute cells a reader sees on the Series line, split out of the rendered
+   * text. Asserting on the cells rather than on substrings is what separates "the
+   * sentinel is not printed as a bare 0" (#3's actual goal) from "the line is
+   * missing" — the second passes for free by dropping the attributes entirely,
+   * which is the defect #18 reported.
+   */
+  const seriesLineCells = (text: string): string[] => {
+    const line = text.split('\n').find((l) => l.startsWith('**Series:**'));
+    if (!line) return [];
+    return line
+      .replace('**Series:**', '')
+      .split('|')
+      .map((cell) => cell.trim());
+  };
+
+  it('#3 never renders the "0" scale sentinel as a bare value', () => {
     const output = {
       dataflow_id: 'WEO',
       key: 'USA.NGDP_RPCH.A',
@@ -291,13 +342,31 @@ describe('imfQueryDataset', () => {
       truncated: false,
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
-    const blocks = imfQueryDataset.format!(output);
-    const text = (blocks[0] as { text: string }).text;
-    // "0" scale and null unit — Series line should be omitted entirely
-    expect(text).not.toContain('**Series:**');
+    const cells = seriesLineCells((imfQueryDataset.format!(output)[0] as { text: string }).text);
+
+    // A reader must never meet a lone "0" standing in for the absent scale.
+    expect(cells).not.toContain('0');
+    // It is named instead of dropped, so the attribute still crosses the channel.
+    expect(cells).toContain('no scale multiplier');
   });
 
-  it('shows Series line when unit is present even with scale "0"', () => {
+  it('#18 carries decimals into content[] even when scale is the "0" sentinel', () => {
+    const output = {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      observations: MOCK_OBSERVATIONS,
+      series_attributes: { unit: null, scale: '0', decimals: 0 },
+      observation_count: 3,
+      truncated: false,
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    };
+    const cells = seriesLineCells((imfQueryDataset.format!(output)[0] as { text: string }).text);
+
+    // Gating the whole line on a meaningful scale is what dropped decimals.
+    expect(cells).toContain('0 decimals');
+  });
+
+  it('#3 shows unit and decimals with scale "0" named, not printed raw', () => {
     const output = {
       dataflow_id: 'WEO',
       key: 'USA.NGDP_RPCH.A',
@@ -307,14 +376,41 @@ describe('imfQueryDataset', () => {
       truncated: false,
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
-    const blocks = imfQueryDataset.format!(output);
-    const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('**Series:**');
-    expect(text).toContain('Percent');
-    // "0" scale must not appear in the output
-    expect(text).not.toMatch(/\| 0 \||\| 0$/m);
-    // But decimals should still render
-    expect(text).toContain('2 decimals');
+    const cells = seriesLineCells((imfQueryDataset.format!(output)[0] as { text: string }).text);
+
+    expect(cells).toContain('Percent');
+    expect(cells).toContain('2 decimals');
+    expect(cells).not.toContain('0');
+  });
+
+  it('renders a real scale code as-is', () => {
+    const output = {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDPD.A',
+      observations: MOCK_OBSERVATIONS,
+      series_attributes: { unit: 'US Dollar', scale: '9', decimals: 3 },
+      observation_count: 3,
+      truncated: false,
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    };
+    const cells = seriesLineCells((imfQueryDataset.format!(output)[0] as { text: string }).text);
+
+    expect(cells).toEqual(expect.arrayContaining(['US Dollar', '9', '3 decimals']));
+  });
+
+  it('omits the Series line only when the series carries no attributes at all', () => {
+    const output = {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      observations: MOCK_OBSERVATIONS,
+      series_attributes: { unit: null, scale: null, decimals: null },
+      observation_count: 3,
+      truncated: false,
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    };
+    const text = (imfQueryDataset.format!(output)[0] as { text: string }).text;
+
+    expect(text).not.toContain('**Series:**');
   });
 
   it('formats canvas spill path with canvas_id and table_name', () => {
@@ -563,14 +659,42 @@ describe('imfQueryDataset', () => {
   // #5: no_data availability enrichment
   // -------------------------------------------------------------------------
 
+  /**
+   * The availability endpoint answers two different questions depending on
+   * whether a code is pinned, and the handler asks both. Mocking by scope is what
+   * keeps a test honest about which answer it is exercising — a single mock
+   * returning one object for both calls describes a response the API never gives.
+   */
+  const availability = (
+    seriesCount: number,
+    availableCodes: Record<string, { codes: string[]; count: number }> = {},
+    time: { start: string | null; end: string | null } = { start: null, end: null },
+  ) => ({
+    series_count: seriesCount,
+    available_codes: availableCodes,
+    time_period_start: time.start,
+    time_period_end: time.end,
+  });
+
+  type Availability = ReturnType<typeof availability>;
+
+  /** Serve one availability response for the key-scoped probe and another for the dataflow-wide one. */
+  const availabilityByScope = (
+    keyed: Availability | null,
+    dataflowWide: Availability | null = null,
+  ) => {
+    mockSvc.fetchAvailabilityConstraint.mockImplementation((_flow: string, code: string) =>
+      Promise.resolve(code === '' ? dataflowWide : keyed),
+    );
+  };
+
   it('enriches no_data error with "not covered" message when series_count is 0', async () => {
     mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations: [] });
-    mockSvc.fetchAvailabilityConstraint.mockResolvedValue({
-      series_count: 0,
-      available_codes: {},
-      time_period_start: null,
-      time_period_end: null,
-    });
+    // EER holds 732 series; TUR is simply not one of the countries covered.
+    availabilityByScope(
+      availability(0),
+      availability(732, { COUNTRY: { count: 2, codes: ['USA', 'GBR'] } }),
+    );
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'EER', key: 'TUR.REER_IX.M' });
 
@@ -1260,6 +1384,311 @@ describe('imfQueryDataset', () => {
     const entry = imfQueryDataset.errors?.find((e) => e.reason === 'dataflow_list_unavailable');
     expect(entry?.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
     expect(entry?.retryable).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // #15: a query resolving to several series keeps each one's own attributes
+  // -------------------------------------------------------------------------
+
+  /** Run the two-series WEO query and hand back the tool result. */
+  const twoSeriesResult = async () => {
+    mockSvc.fetchData.mockResolvedValue(TWO_SERIES_RESULT);
+    const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+    const input = imfQueryDataset.input.parse({
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH+NGDPD.A',
+    });
+    return imfQueryDataset.handler(input, ctx);
+  };
+
+  it('#15 gives each series in a + query its own scale', async () => {
+    const result = await twoSeriesResult();
+
+    const byKey = Object.fromEntries(
+      (result.series_metadata ?? []).map((series) => [series.series_key, series]),
+    );
+    expect(byKey['USA.NGDPD.A']?.scale).toBe('9');
+    expect(byKey['USA.NGDP_RPCH.A']?.scale).toBe('0');
+    // The dollar aggregate keeps its unit; the percent-change series has none.
+    expect(byKey['USA.NGDPD.A']?.unit).toBe('US Dollar');
+    expect(byKey['USA.NGDP_RPCH.A']?.unit).toBeNull();
+  });
+
+  it('#15 lists one metadata entry per distinct series, not one per observation', async () => {
+    const result = await twoSeriesResult();
+
+    expect(result.observations).toHaveLength(4);
+    expect(result.series_metadata).toHaveLength(2);
+  });
+
+  it('#15 leaves the single-series shape alone — no per-series list to read', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+    const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.NGDP_RPCH.A' });
+    const result = await imfQueryDataset.handler(input, ctx);
+
+    expect(result.series_metadata).toBeUndefined();
+    expect(result.series_attributes).toEqual(MOCK_SERIES_ATTRS);
+  });
+
+  it('#15 stages each canvas row with its own series attributes, not the last series decoded', async () => {
+    const mockInstance = { canvasId: 'canvas-multi', describe: vi.fn(), query: vi.fn() };
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+      acquire: vi.fn().mockResolvedValue(mockInstance),
+    });
+    let staged: Array<Record<string, unknown>> = [];
+    (spillover as ReturnType<typeof vi.fn>).mockImplementation(
+      ({ source }: { source: Array<Record<string, unknown>> }) => {
+        staged = source;
+        return Promise.resolve({
+          spilled: true,
+          handle: { tableName: 'spilled_multi', rowCount: source.length, columns: [] },
+          previewRows: source.slice(0, 2),
+          truncated: false,
+        });
+      },
+    );
+
+    await twoSeriesResult();
+
+    // Every staged row must carry the scale of the series named in that row.
+    for (const row of staged) {
+      expect(row.scale).toBe(row.series_key === 'USA.NGDPD.A' ? '9' : '0');
+    }
+    expect(staged.filter((row) => row.series_key === 'USA.NGDPD.A')).toHaveLength(2);
+  });
+
+  it('#15 carries per-series metadata through the spill response too', async () => {
+    const mockInstance = { canvasId: 'canvas-multi', describe: vi.fn(), query: vi.fn() };
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+      acquire: vi.fn().mockResolvedValue(mockInstance),
+    });
+    (spillover as ReturnType<typeof vi.fn>).mockImplementation(
+      ({ source }: { source: Array<Record<string, unknown>> }) =>
+        Promise.resolve({
+          spilled: true,
+          handle: { tableName: 'spilled_multi', rowCount: source.length, columns: [] },
+          previewRows: source.slice(0, 1),
+          truncated: false,
+        }),
+    );
+
+    const result = await twoSeriesResult();
+
+    expect(result.truncated).toBe(true);
+    // The preview shows one series; the staged table holds both, so the metadata
+    // has to describe the staged set rather than what happened to fit inline.
+    expect(result.observations).toHaveLength(1);
+    expect(result.series_metadata?.map((series) => series.series_key)).toEqual([
+      'USA.NGDPD.A',
+      'USA.NGDP_RPCH.A',
+    ]);
+  });
+
+  it('#15 renders each series’ own scale in content[], with the sentinel named', async () => {
+    mockSvc.fetchData.mockResolvedValue(TWO_SERIES_RESULT);
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH+NGDPD.A',
+    });
+    const text = (result.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
+
+    expect(text).toMatch(/\|\s*USA\.NGDPD\.A\s*\|\s*US Dollar\s*\|\s*9\s*\|/);
+    expect(text).toMatch(/\|\s*USA\.NGDP_RPCH\.A\s*\|\s*—\s*\|\s*no scale multiplier\s*\|/);
+  });
+
+  it('#15 caps the rendered series table and says so, keeping every entry in structuredContent', async () => {
+    // A `*` key resolves to hundreds of series; the table is bounded, the data is not.
+    const many = Array.from({ length: 40 }, (_, i) => `C${String(i).padStart(3, '0')}.NGDPD.A`);
+    mockSvc.fetchData.mockResolvedValue({
+      ...TWO_SERIES_RESULT,
+      observations: many.map((series_key) => ({
+        series_key,
+        time_period: '2020',
+        value: 1,
+        status: null,
+      })),
+      seriesAttributesByKey: Object.fromEntries(many.map((key) => [key, NGDPD_ATTRS])),
+    });
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: '*.NGDPD.A',
+    });
+    const structured = result.structuredContent as { series_metadata: unknown[] };
+    const text = (result.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
+
+    expect(structured.series_metadata).toHaveLength(40);
+    expect(text).toContain('20 of 40 series shown');
+    // Attribute rows carry unit/scale/decimals; observation rows carry values,
+    // so counting the attribute shape is what measures the rendered table.
+    const attributeRows = text.match(/\|\s*C\d{3}\.NGDPD\.A\s*\|\s*US Dollar\s*\|/g) ?? [];
+    expect(attributeRows).toHaveLength(20);
+    expect(text).toContain('canvas');
+  });
+
+  // -------------------------------------------------------------------------
+  // #18: structuredContent and content[] carry the same series metadata
+  // -------------------------------------------------------------------------
+
+  it('#18 surfaces the same series attributes in both channels for a single series', async () => {
+    const attrs = { unit: null, scale: '0', decimals: 0 };
+    mockSvc.fetchData.mockResolvedValue({
+      ...MOCK_QUERY_RESULT,
+      seriesAttributes: attrs,
+      seriesAttributesByKey: { 'USA.NGDP_RPCH.A': attrs },
+    });
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      start_period: '2020',
+      end_period: '2024',
+    });
+    const structured = result.structuredContent as {
+      series_attributes: { unit: string | null; scale: string | null; decimals: number | null };
+    };
+    const text = (result.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
+
+    // structuredContent keeps the raw upstream sentinel …
+    expect(structured.series_attributes).toEqual(attrs);
+    // … and content[] states the same facts without printing a bare 0.
+    const cells = seriesLineCells(text);
+    expect(cells).toContain('no scale multiplier');
+    expect(cells).toContain('0 decimals');
+    expect(cells).not.toContain('0');
+  });
+
+  it('#18 surfaces per-series attributes in both channels for a multi-series query', async () => {
+    mockSvc.fetchData.mockResolvedValue(TWO_SERIES_RESULT);
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH+NGDPD.A',
+    });
+    const structured = result.structuredContent as {
+      series_metadata: Array<{ series_key: string; scale: string | null }>;
+    };
+    const text = (result.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
+
+    for (const series of structured.series_metadata) {
+      expect(text).toContain(series.series_key);
+    }
+    // Scale 9 reaches the text channel; the "0" sentinel reaches it named.
+    expect(text).toContain('9');
+    expect(text).toContain('no scale multiplier');
+  });
+
+  // -------------------------------------------------------------------------
+  // #31: an empty dataflow is not an uncovered code
+  // -------------------------------------------------------------------------
+
+  /** Drive the no_data path with a chosen pair of availability answers. */
+  const noDataFor = async (
+    keyed: Availability | null,
+    dataflowWide: Availability | null,
+    input: { dataflow_id: string; key: string },
+  ) => {
+    mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations: [] });
+    availabilityByScope(keyed, dataflowWide);
+    // The DSDs differ in width across these dataflows (CPI has five dimensions,
+    // EER three), and a key that fails the arity check never reaches no_data.
+    const segments = input.key.split('.');
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dataflowId: input.dataflow_id,
+      keyFormat: segments.map((_, i) => `DIM_${i + 1}`).join('.'),
+      dimensions: segments.map((_, i) => ({
+        id: `DIM_${i + 1}`,
+        name: `Dimension ${i + 1}`,
+        position: i,
+        codelist: [],
+      })),
+    });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+    return (await imfQueryDataset
+      .handler(imfQueryDataset.input.parse(input), ctx)
+      .catch((e) => e)) as {
+      message: string;
+      data: { reason: string; recovery: { hint: string } };
+    };
+  };
+
+  it('#31 says the dataflow itself is empty when no code anywhere has data', async () => {
+    const err = await noDataFor(availability(0), availability(0), {
+      dataflow_id: 'CPI_2026_MAY_VINTAGE',
+      key: 'USA.CPI._T.IX.M',
+    });
+
+    expect(err.data.reason).toBe('no_data');
+    expect(err.message).toContain('publishes no series at all');
+    // The caller's own code is not what is being blamed.
+    expect(err.message).not.toContain("'USA' has 0 series");
+  });
+
+  it('#31 points recovery at a different dataflow, never at another code', async () => {
+    const err = await noDataFor(availability(0), availability(0), {
+      dataflow_id: 'CPI_2026_MAY_VINTAGE',
+      key: 'USA.CPI._T.IX.M',
+    });
+
+    expect(err.data.recovery.hint).toContain('imf_list_databases');
+    // "Try a different code" is the loop with no exit — every code fails here.
+    expect(err.data.recovery.hint).not.toMatch(/different code/i);
+  });
+
+  it('#31 gives every code the same empty-dataflow answer', async () => {
+    const first = await noDataFor(availability(0), availability(0), {
+      dataflow_id: 'CPI_2026_MAY_VINTAGE',
+      key: 'USA.CPI._T.IX.M',
+    });
+    const second = await noDataFor(availability(0), availability(0), {
+      dataflow_id: 'CPI_2026_MAY_VINTAGE',
+      key: 'GBR.CPI._T.IX.M',
+    });
+
+    expect(second.message).toBe(first.message);
+    expect(second.data.recovery.hint).toBe(first.data.recovery.hint);
+  });
+
+  it('#31 still blames the code when the dataflow does publish series', async () => {
+    const err = await noDataFor(
+      availability(0),
+      availability(732, { COUNTRY: { count: 165, codes: ['USA', 'GBR', 'DEU'] } }),
+      { dataflow_id: 'EER', key: 'TUR.REER_IX_RY2010_ACW_RCPI.M' },
+    );
+
+    expect(err.message).toContain("'TUR' has 0 series in 'EER'");
+    expect(err.data.recovery.hint).toMatch(/different code/i);
+  });
+
+  it('#31 names codes that do have data so the retry has somewhere to go', async () => {
+    const err = await noDataFor(
+      availability(0),
+      availability(732, { COUNTRY: { count: 165, codes: ['USA', 'GBR', 'DEU'] } }),
+      { dataflow_id: 'EER', key: 'TUR.REER_IX_RY2010_ACW_RCPI.M' },
+    );
+
+    expect(err.message).toContain('COUNTRY: 3 of 165 codes with data shown (USA, GBR, DEU)');
+    expect(err.data.recovery.hint).toContain('USA');
+  });
+
+  it('#31 asks the dataflow-wide constraint only when the code probe came back empty', async () => {
+    await noDataFor(
+      availability(9, { INDICATOR: { count: 2, codes: ['A', 'B'] } }),
+      availability(9),
+      { dataflow_id: 'MFS_IR', key: 'TUR.MFS135.M' },
+    );
+
+    // series_count > 0 already identifies the failure as a wrong combination.
+    const scopes = mockSvc.fetchAvailabilityConstraint.mock.calls.map((call) => call[1]);
+    expect(scopes).toEqual(['TUR']);
+  });
+
+  it('#31 degrades to the code-scoped diagnosis when the dataflow-wide probe fails', async () => {
+    const err = await noDataFor(availability(0), null, {
+      dataflow_id: 'EER',
+      key: 'TUR.REER_IX_RY2010_ACW_RCPI.M',
+    });
+
+    expect(err.message).toContain("'TUR' has 0 series in 'EER'");
+    expect(err.message).not.toContain('publishes no series at all');
   });
 
   it('#24 keeps the dataflow_list_unavailable reason instead of relabeling it structure_unavailable', async () => {
