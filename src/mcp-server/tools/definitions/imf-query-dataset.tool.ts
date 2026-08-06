@@ -1,6 +1,8 @@
 /**
  * @fileoverview Tool: imf_query_dataset — query a dataflow by dimension key over a time range.
- * Large result sets spill to DataCanvas for SQL analysis.
+ * Periods are compared as the date spans they name, so a bound coarser than the
+ * observation frequency covers every sub-period inside it. Large result sets
+ * spill to DataCanvas for SQL analysis.
  * @module mcp-server/tools/definitions/imf-query-dataset.tool
  */
 
@@ -9,50 +11,149 @@ import { spillover } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
+import type { Observation } from '@/services/imf-sdmx/types.js';
 
 const PREVIEW_CHARS = 100_000;
 
 /** IMF SDMX 3.0 data portal base URL — used to construct per-dataflow attribution links. */
 const IMF_DATA_PORTAL = 'https://data.imf.org/';
 
+/** The inclusive span of dates a period label names. */
+interface PeriodSpan {
+  /** Last date of the span, as a date key. */
+  hi: number;
+  /** First date of the span, as a date key. */
+  lo: number;
+}
+
 /**
- * Normalize a period string to a canonical comparable form.
- * Supports:
- *   Annual:      "YYYY"        → "YYYY"
- *   Quarterly:   "YYYY-QN"     → "YYYY-QN"
- *   Monthly:     "YYYY-MM"     → "YYYY-MM" (input format)
- *   Monthly:     "YYYY-MNN"    → "YYYY-MM" (upstream format, e.g. "1956-M01" → "1956-01")
- * Returns null for unrecognized formats; callers decide whether null is fatal
- * (input validation) or a pass-through (per-observation filtering).
+ * A calendar date as the comparable integer `YYYYMMDD`. Ordering is the only
+ * operation period comparison needs, so the closing edge of a month, quarter,
+ * half-year, or year can be day 31 without consulting the calendar: no real
+ * date within that month sorts above it, and none in the next month sorts below.
  */
-function normalizePeriod(period: string): string | null {
-  // Annual: "2023"
-  if (/^\d{4}$/.test(period)) return period;
-  // Quarterly: "2023-Q1"
-  if (/^\d{4}-Q\d$/.test(period)) return period;
-  // Monthly YYYY-MM (input format)
-  if (/^\d{4}-\d{2}$/.test(period)) return period;
-  // Monthly YYYY-MNN (upstream format, e.g. "1956-M01", "2023-M12")
-  const mMatch = /^(\d{4})-M(\d{1,2})$/.exec(period);
-  if (mMatch) {
-    const [, year, month] = mMatch;
-    return `${year}-${month?.padStart(2, '0')}`;
+function dateKey(year: number, month: number, day: number): number {
+  return year * 10_000 + month * 100 + day;
+}
+
+/** Day number closing any month-or-coarser span, and the largest a date may name. */
+const LAST_DAY = 31;
+
+/**
+ * Resolve a period label to the span of dates it names.
+ *
+ * A period is an interval, not a point: `2023` names January–December 2023 and
+ * `2023-Q1` names January–March. Comparing labels as strings instead conflates
+ * the two ends of that interval, which is what made `end_period: "2023"` reject
+ * `2023-M01` while `start_period: "2023"` admitted it.
+ *
+ * Recognized labels — every shape api.imf.org emits, since a label the parser
+ * does not know is a label the range filter cannot apply:
+ *   Annual:       `YYYY`         → January–December of that year
+ *   Semi-annual:  `YYYY-SN`      → the half-year's six months (PIP)
+ *   Quarterly:    `YYYY-QN`      → the quarter's three months
+ *   Monthly:      `YYYY-MM`      → that month (input format)
+ *   Monthly:      `YYYY-MNN`     → that month (upstream format, e.g. `1956-M01`)
+ *   Daily:        `YYYY-MM-DD`   → that day (IRFCL, CCI)
+ *
+ * Returns null for anything else; callers decide whether null is fatal (input
+ * validation) or a pass-through (per-observation filtering).
+ */
+function periodSpan(period: string): PeriodSpan | null {
+  const annual = /^(\d{4})$/.exec(period);
+  if (annual) {
+    const year = Number(annual[1]);
+    return { lo: dateKey(year, 1, 1), hi: dateKey(year, 12, LAST_DAY) };
   }
+
+  const semiAnnual = /^(\d{4})-S([12])$/.exec(period);
+  if (semiAnnual) {
+    const year = Number(semiAnnual[1]);
+    const half = Number(semiAnnual[2]);
+    return { lo: dateKey(year, half * 6 - 5, 1), hi: dateKey(year, half * 6, LAST_DAY) };
+  }
+
+  const quarterly = /^(\d{4})-Q([1-4])$/.exec(period);
+  if (quarterly) {
+    const year = Number(quarterly[1]);
+    const quarter = Number(quarterly[2]);
+    return { lo: dateKey(year, quarter * 3 - 2, 1), hi: dateKey(year, quarter * 3, LAST_DAY) };
+  }
+
+  const daily = /^(\d{4})-(\d{2})-(\d{2})$/.exec(period);
+  if (daily) {
+    const month = Number(daily[2]);
+    const day = Number(daily[3]);
+    if (month < 1 || month > 12 || day < 1 || day > LAST_DAY) return null;
+    const key = dateKey(Number(daily[1]), month, day);
+    return { lo: key, hi: key };
+  }
+
+  // Monthly, in the input format (YYYY-MM) or the upstream one (YYYY-MNN).
+  const monthly = /^(\d{4})-(\d{2})$/.exec(period) ?? /^(\d{4})-M(\d{1,2})$/.exec(period);
+  if (monthly) {
+    const month = Number(monthly[2]);
+    if (month < 1 || month > 12) return null;
+    const year = Number(monthly[1]);
+    return { lo: dateKey(year, month, 1), hi: dateKey(year, month, LAST_DAY) };
+  }
+
   return null;
 }
 
-/** Return true if observation period falls within [start, end] (both inclusive, either optional). */
+/**
+ * Return true if an observation's own period overlaps the requested window.
+ *
+ * Overlap rather than containment: each bound expands to its inclusive edge
+ * (start to its first date, end to its last), and an observation is kept when
+ * any part of the period it names falls inside. That is what makes a bound
+ * coarser than the data inclusive — `end_period: "2023"` keeps `2023-M12` and
+ * `2023-Q4` — and it treats a bound finer than the data the same way instead of
+ * silently dropping the observation that straddles it.
+ */
 function periodInRange(
   timePeriod: string,
-  startNorm: string | null | undefined,
-  endNorm: string | null | undefined,
+  start: PeriodSpan | null | undefined,
+  end: PeriodSpan | null | undefined,
 ): boolean {
-  if (!startNorm && !endNorm) return true;
-  const norm = normalizePeriod(timePeriod);
-  if (!norm) return true; // unrecognized format — don't filter
-  if (startNorm && norm < startNorm) return false;
-  if (endNorm && norm > endNorm) return false;
+  if (!start && !end) return true;
+  const span = periodSpan(timePeriod);
+  if (!span) return true; // unrecognized format — don't filter
+  if (start && span.hi < start.lo) return false;
+  if (end && span.lo > end.hi) return false;
   return true;
+}
+
+/**
+ * Earliest and latest period labels present in an observation set, ordered by
+ * the dates they name rather than by string. Reported when a period filter
+ * empties an otherwise non-empty response, so the caller can see the window the
+ * data actually occupies.
+ */
+function observedRange(observations: Observation[]): { first: string; last: string } {
+  let first: string | undefined;
+  let last: string | undefined;
+  let earliest = Number.POSITIVE_INFINITY;
+  let latest = Number.NEGATIVE_INFINITY;
+
+  for (const obs of observations) {
+    const span = periodSpan(obs.time_period);
+    if (!span) continue;
+    if (span.lo < earliest) {
+      earliest = span.lo;
+      first = obs.time_period;
+    }
+    if (span.hi > latest) {
+      latest = span.hi;
+      last = obs.time_period;
+    }
+  }
+
+  // No label parsed — fall back to the service's time-ascending ordering.
+  return {
+    first: first ?? observations[0]?.time_period ?? '',
+    last: last ?? observations[observations.length - 1]?.time_period ?? '',
+  };
 }
 
 export const imfQueryDataset = tool('imf_query_dataset', {
@@ -62,11 +163,14 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     'Requires imf_get_database first to obtain the correct key_format and valid dimension codes. ' +
     'Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE). ' +
     'Key format: dot-separated codes in DSD keyPosition order (e.g. USA.NGDP_RPCH.A for WEO). ' +
-    'Use + to specify multiple codes per position (e.g. USA+GBR.NGDP_RPCH.A). ' +
+    'Every position must carry a code: use + to combine codes (e.g. USA+GBR.NGDP_RPCH.A) ' +
+    'and * to match every code at a position (e.g. *.NGDP_RPCH.A for all countries). ' +
     'Codelists from imf_get_database enumerate the code universe, not actual coverage — ' +
     'valid codes can still return no_data if the combination has no series. ' +
-    'start_period and end_period must be valid period strings (YYYY, YYYY-QN, or YYYY-MM) ' +
-    'with start_period no later than end_period; malformed or reversed ranges are rejected. ' +
+    'start_period and end_period must be valid period strings (YYYY, YYYY-SN, YYYY-QN, ' +
+    'YYYY-MM, or YYYY-MM-DD) with start_period no later than end_period; malformed or ' +
+    'reversed ranges are rejected. ' +
+    'A bound covers the whole period it names, so end_period 2023 includes 2023-M12 and 2023-Q4. ' +
     'Large analytical result sets (multi-country, long time range) spill to DataCanvas; ' +
     'imf_dataframe_query provides SQL analysis of spilled results.',
   annotations: {
@@ -93,23 +197,30 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .describe(
         'Dot-separated dimension codes in DSD keyPosition order. ' +
           'Call imf_get_database to get key_format and valid codes first. ' +
-          'Use + to specify multiple codes (e.g. USA+GBR.NGDP_RPCH.A). ' +
+          'Use + to combine codes at one position (e.g. USA+GBR.NGDP_RPCH.A). ' +
+          'Use * to match every code at a position — *.NGDP_RPCH.A returns the ' +
+          'indicator for all countries, and CAN.*.A every indicator for Canada. ' +
+          'Every position needs a code or a *; an empty segment (USA..A) is rejected. ' +
           'Country codes are ISO 3-letter: USA not US, GBR not GB, DEU not DE.',
       ),
     start_period: z
       .string()
       .optional()
       .describe(
-        'Start of time range (inclusive). Format matches the dataflow frequency: ' +
-          'YYYY (annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly). ' +
+        'Start of time range (inclusive). Accepts any of YYYY (annual), ' +
+          'YYYY-SN (semi-annual, e.g. 2023-S1), YYYY-QN (quarterly, e.g. 2023-Q1), ' +
+          'YYYY-MM (monthly), or YYYY-MM-DD (daily), whatever the ' +
+          "dataflow's frequency. The bound covers the whole period it names, so " +
+          'start_period 2023 admits 2023-M01 and 2023-Q1. ' +
           'Observations before this period are excluded from the result.',
       ),
     end_period: z
       .string()
       .optional()
       .describe(
-        'End of time range (inclusive). Same format as start_period, and must be ' +
-          'greater than or equal to start_period. ' +
+        'End of time range (inclusive). Same formats as start_period, and must not ' +
+          'be earlier than it. The bound covers the whole period it names, so ' +
+          'end_period 2023 admits 2023-M12 and 2023-Q4. ' +
           'Observations after this period are excluded from the result.',
       ),
     canvas_id: z
@@ -145,8 +256,10 @@ export const imfQueryDataset = tool('imf_query_dataset', {
               .string()
               .describe(
                 'Time label as emitted by the upstream API. Annual: YYYY (e.g. 2023). ' +
-                  'Quarterly: YYYY-QN (e.g. 2023-Q1). Monthly: YYYY-MNN (e.g. 2023-M01, not YYYY-MM). ' +
-                  'start_period/end_period accept both YYYY-MM and YYYY-MNN for monthly comparisons.',
+                  'Semi-annual: YYYY-SN (e.g. 2023-S1). Quarterly: YYYY-QN (e.g. 2023-Q1). ' +
+                  'Monthly: YYYY-MNN (e.g. 2023-M01, not YYYY-MM). Daily: YYYY-MM-DD (e.g. 2023-01-05). ' +
+                  'Every one of these is also accepted as a start_period/end_period bound, ' +
+                  'so a label from this field can be passed straight back in.',
               ),
             value: z.number().nullable().describe('Observation value, null when missing.'),
             status: z
@@ -203,9 +316,16 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     {
       reason: 'no_data',
       code: JsonRpcErrorCode.NotFound,
-      when: 'Key is structurally valid but returns an empty dataset — either the code combination has no series in this dataflow, or the time range is outside available coverage',
+      when: 'Key is structurally valid but the dataflow holds no series for this code combination',
       recovery:
-        'Check the availability context in the error — if series_count is 0 the code has no coverage; if series_count > 0 the combination is wrong and available_codes lists what does have data.',
+        'Check the availability context in the error — if series_count is 0 the code has no coverage; if series_count > 0 the combination is wrong and available_codes names the codes that do have data, stating how many of a dimension it is showing when the list is capped.',
+    },
+    {
+      reason: 'no_data_in_range',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'The key returned observations but start_period/end_period excluded every one of them',
+      recovery:
+        'The key is valid — widen start_period/end_period to overlap the period range reported in the error, or omit both to get the full series.',
     },
     {
       reason: 'key_dimension_mismatch',
@@ -215,10 +335,18 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         'Call imf_get_database to get the correct key_format for this dataflow, then reconstruct the key.',
     },
     {
+      reason: 'empty_key_segment',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A dot-separated position in key is empty or blank, which matches no series upstream',
+      recovery:
+        'Put * at that position to match every code there, or a code from imf_get_database to pin it.',
+    },
+    {
       reason: 'invalid_period_format',
       code: JsonRpcErrorCode.ValidationError,
       when: 'start_period or end_period is not one of the recognized period formats',
-      recovery: 'Use YYYY (annual), YYYY-QN (quarterly, e.g. 2023-Q1), or YYYY-MM (monthly).',
+      recovery:
+        'Use YYYY (annual), YYYY-SN (semi-annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly), or YYYY-MM-DD (daily).',
     },
     {
       reason: 'invalid_period_range',
@@ -242,21 +370,32 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     },
   ],
 
+  enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Populated when a period bound was set but some observations carry a time_period label ' +
+          'the range filter does not recognize — those rows are returned unfiltered, so the ' +
+          'requested range did not apply to them.',
+      ),
+  },
+
   async handler(input, ctx) {
     /**
      * Reject malformed or reversed period bounds before any upstream call.
-     * normalizePeriod() returns null for unrecognized input; the per-observation
+     * periodSpan() returns null for unrecognized input; the per-observation
      * filter treats null as "don't filter", but as INPUT a null bound must be
      * fatal. Period filtering is client-side (IMF ignores startPeriod/endPeriod),
      * so rejecting known-bad input early is free and skips a wasted round-trip.
      */
-    const startNorm = input.start_period ? normalizePeriod(input.start_period) : null;
-    const endNorm = input.end_period ? normalizePeriod(input.end_period) : null;
+    const startSpan = input.start_period ? periodSpan(input.start_period) : null;
+    const endSpan = input.end_period ? periodSpan(input.end_period) : null;
 
-    if (input.start_period && startNorm === null) {
+    if (input.start_period && startSpan === null) {
       throw ctx.fail(
         'invalid_period_format',
-        `start_period '${input.start_period}' is not a recognized period format (expected YYYY, YYYY-QN, or YYYY-MM)`,
+        `start_period '${input.start_period}' is not a recognized period format (expected YYYY, YYYY-SN, YYYY-QN, YYYY-MM, or YYYY-MM-DD)`,
         {
           field: 'start_period',
           value: input.start_period,
@@ -264,10 +403,10 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         },
       );
     }
-    if (input.end_period && endNorm === null) {
+    if (input.end_period && endSpan === null) {
       throw ctx.fail(
         'invalid_period_format',
-        `end_period '${input.end_period}' is not a recognized period format (expected YYYY, YYYY-QN, or YYYY-MM)`,
+        `end_period '${input.end_period}' is not a recognized period format (expected YYYY, YYYY-SN, YYYY-QN, YYYY-MM, or YYYY-MM-DD)`,
         {
           field: 'end_period',
           value: input.end_period,
@@ -275,7 +414,9 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         },
       );
     }
-    if (startNorm && endNorm && startNorm > endNorm) {
+    // Reversed only when the whole start period sits after the whole end period,
+    // so a mixed-granularity forward range (2023-Q2 → 2023) is not misread as one.
+    if (startSpan && endSpan && startSpan.lo > endSpan.hi) {
       throw ctx.fail(
         'invalid_period_range',
         `start_period '${input.start_period}' is after end_period '${input.end_period}' — start_period must be <= end_period`,
@@ -331,6 +472,32 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       );
     }
 
+    /**
+     * Reject blank positions before the data fetch. An empty segment is not a
+     * wildcard upstream — it matches zero series and returns HTTP 200, which
+     * would surface as a `no_data` blaming the codes. Rejecting names the `*`
+     * that does wildcard the position, and keeps a template-substitution slip
+     * from silently widening a one-series query to the whole dimension.
+     */
+    const blankPositions = keySegments.flatMap((segment, index) =>
+      segment.trim() === '' ? [index] : [],
+    );
+    if (blankPositions.length > 0) {
+      const named = blankPositions
+        .map((index) => `${index + 1} (${structure.dimensions[index]?.id ?? 'unknown'})`)
+        .join(', ');
+      throw ctx.fail(
+        'empty_key_segment',
+        `Key '${input.key}' leaves position ${named} empty. An empty position matches no series — use * to match every code there. Key format: ${structure.keyFormat}`,
+        {
+          key: input.key,
+          emptyPositions: blankPositions.map((index) => index + 1),
+          keyFormat: structure.keyFormat,
+          ...ctx.recoveryFor('empty_key_segment'),
+        },
+      );
+    }
+
     // Fetch data
     let queryResult: Awaited<ReturnType<typeof svc.fetchData>>;
     try {
@@ -359,17 +526,46 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       (obs) => obs.value !== null || obs.status !== null,
     );
 
-    // Apply period filter server-side (startNorm / endNorm validated at handler top).
+    // Apply period filter server-side (startSpan / endSpan validated at handler top).
     const filteredObservations =
-      startNorm || endNorm
-        ? nonPaddingObservations.filter((obs) => periodInRange(obs.time_period, startNorm, endNorm))
+      startSpan || endSpan
+        ? nonPaddingObservations.filter((obs) => periodInRange(obs.time_period, startSpan, endSpan))
         : nonPaddingObservations;
 
-    // Detect empty result (after null-padding removal and period filtering)
+    /**
+     * The requested range emptied a response that did carry data. That is a
+     * range problem, not a coverage one, so it gets its own reason and skips the
+     * availability probe — listing the codes that do have data would name the
+     * very codes the caller used and point the recovery at the wrong input.
+     */
+    if (filteredObservations.length === 0 && nonPaddingObservations.length > 0) {
+      const { first, last } = observedRange(nonPaddingObservations);
+      const requested = [input.start_period, input.end_period].filter(Boolean).join(' – ');
+      const message =
+        `Key '${input.key}' in '${input.dataflow_id}' has data, but none within the requested range (${requested}). ` +
+        `${nonPaddingObservations.length} observation(s) were returned, spanning ${first} – ${last}.`;
+
+      throw ctx.fail('no_data_in_range', message, {
+        key: input.key,
+        dataflowId: input.dataflow_id,
+        requested_range: {
+          ...(input.start_period ? { start_period: input.start_period } : {}),
+          ...(input.end_period ? { end_period: input.end_period } : {}),
+        },
+        available_range: { first, last },
+        excluded_observation_count: nonPaddingObservations.length,
+        // The contract's static hint cannot name the window, so it is replaced
+        // rather than spread — the observed range is the whole point here.
+        recovery: {
+          hint: `The key is valid — data spans ${first} – ${last}. Set start_period/end_period to overlap that window, or omit both for the full series.`,
+        },
+      });
+    }
+
+    // Upstream returned nothing for this key — a coverage question, so enrich
+    // with availability to separate "code not covered" from "wrong combination".
     if (filteredObservations.length === 0) {
-      // Enrich the error with availability info so the caller can distinguish
-      // "code not covered" from "valid code, wrong combination".
-      // Uses the first dimension code from the key (e.g. "TUR" from "TUR.MFS135..M").
+      // Uses the first dimension code from the key (e.g. "TUR" from "TUR.MFS135.M").
       const firstCode = input.key.split('.')[0] ?? '';
       const availability = await svc
         .fetchAvailabilityConstraint(input.dataflow_id, firstCode, ctx, ctx.signal)
@@ -388,8 +584,14 @@ export const imfQueryDataset = tool('imf_query_dataset', {
             `'${firstCode}' is not covered in '${input.dataflow_id}'. ` +
             `Try a different code — the codelist may include codes with no actual data.`;
         } else {
+          // A capped dimension states how many of how many it is showing —
+          // an unannotated slice reads as the full set (see AvailabilityDimension).
           const dimLines = Object.entries(availability.available_codes)
-            .map(([dim, codes]) => `${dim}: ${codes.join(', ')}`)
+            .map(([dim, { codes, count }]) =>
+              count > codes.length
+                ? `${dim}: ${codes.length} of ${count} codes with data shown (${codes.join(', ')})`
+                : `${dim}: ${codes.join(', ')}`,
+            )
             .join('; ');
           const timeLine =
             availability.time_period_start || availability.time_period_end
@@ -414,6 +616,26 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         ...ctx.recoveryFor('no_data'),
         ...(recoveryHint ? { recovery: { hint: recoveryHint } } : {}),
       });
+    }
+
+    /**
+     * A label periodSpan() cannot read is returned rather than dropped — dropping
+     * data over an unknown label shape is worse than ignoring the bound for it.
+     * But leaving that silent is how a coarse bound quietly dropped a whole year
+     * before, so say it: the response would otherwise echo a range it did not
+     * apply to these rows.
+     */
+    if (startSpan || endSpan) {
+      const unrecognized = filteredObservations.filter(
+        (obs) => periodSpan(obs.time_period) === null,
+      );
+      if (unrecognized.length > 0) {
+        const samples = [...new Set(unrecognized.map((obs) => obs.time_period))].slice(0, 3);
+        ctx.enrich.notice(
+          `${unrecognized.length} observation(s) carry a period label this tool cannot parse (${samples.join(', ')}), ` +
+            `so start_period/end_period were not applied to them and they are returned unfiltered.`,
+        );
+      }
     }
 
     ctx.log.info('Data query completed', {
