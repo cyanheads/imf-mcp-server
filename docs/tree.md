@@ -1,11 +1,9 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-08-06 17:08:48
+Generated on: 2026-08-25 07:13:35
 
 ```text
 imf-mcp-server/
-├── .cache/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -16,6 +14,8 @@ imf-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/
@@ -156,6 +156,8 @@ imf-mcp-server/
 │   │       └── types.ts
 │   └── index.ts
 ├── tests/
+│   ├── helpers/
+│   │   └── errors.ts
 │   ├── prompts/
 │   ├── resources/
 │   │   └── imf-database.resource.test.ts

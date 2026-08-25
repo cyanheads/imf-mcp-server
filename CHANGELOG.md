@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.12](changelog/0.2.x/0.2.12.md) — 2026-08-25 · ⚠️ Breaking
+
+Adopts mcp-ts-core 0.12.3 and the MCP SDK v2 wire — HTTP serves protocol revision 2026-07-28 alongside the 2025 era, tool arguments reject undeclared keys, and the advertised output schemas declare the error envelope
+
 ## [0.2.11](changelog/0.2.x/0.2.11.md) — 2026-08-06
 
 imf_query_dataset recovers the unit a + key with no * suppresses upstream, via one bounded attributes-only probe request
