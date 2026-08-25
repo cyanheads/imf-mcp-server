@@ -14,6 +14,7 @@
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { captureMcpError, recoveryHint } from '../helpers/errors.js';
 
 vi.mock('@/services/imf-sdmx/imf-sdmx-service.js', () => ({
   getImfSdmxService: vi.fn(),
@@ -258,7 +259,7 @@ describe('imfQueryDataset', () => {
     expect(result.observation_count).toBe(1000);
     // Preview rows surfaced inline
     expect(result.observations).toHaveLength(1);
-    expect(result.observations[0].time_period).toBe('2020');
+    expect(result.observations[0]!.time_period).toBe('2020');
     expect(result.source).toBe(
       'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     );
@@ -453,8 +454,8 @@ describe('imfQueryDataset', () => {
 
     // Only the real observation should be returned
     expect(result.observations).toHaveLength(1);
-    expect(result.observations[0].time_period).toBe('1955-M01');
-    expect(result.observations[0].value).toBe(42.3);
+    expect(result.observations[0]!.time_period).toBe('1955-M01');
+    expect(result.observations[0]!.value).toBe(42.3);
     expect(result.observation_count).toBe(1);
   });
 
@@ -699,8 +700,8 @@ describe('imfQueryDataset', () => {
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'EER', key: 'TUR.REER_IX.M' });
 
-    const err = await imfQueryDataset.handler(input, ctx).catch((e) => e);
-    expect(err.data.reason).toBe('no_data');
+    const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+    expect(err.data?.reason).toBe('no_data');
     // Message should communicate zero-series coverage for TUR
     expect(err.message).toContain('0 series');
     expect(err.message).toContain('TUR');
@@ -723,14 +724,14 @@ describe('imfQueryDataset', () => {
       key: 'TUR.MFS135_XDC_RT_PT_A_PT.M',
     });
 
-    const err = await imfQueryDataset.handler(input, ctx).catch((e) => e);
-    expect(err.data.reason).toBe('no_data');
+    const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+    expect(err.data?.reason).toBe('no_data');
     // Should mention that series exist but combination is wrong
     expect(err.message).toContain('9 series');
     expect(err.message).toContain('DISR_RT_PT_A_PT');
     // Should mention time range
     expect(err.message).toContain('1964');
-    expect(err.data.availability.series_count).toBe(9);
+    expect(err.data?.availability).toMatchObject({ series_count: 9 });
   });
 
   it('degrades to generic no_data message when availability fetch fails', async () => {
@@ -739,10 +740,10 @@ describe('imfQueryDataset', () => {
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'ZZZ.NGDP_RPCH.A' });
 
-    const err = await imfQueryDataset.handler(input, ctx).catch((e) => e);
-    expect(err.data.reason).toBe('no_data');
+    const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+    expect(err.data?.reason).toBe('no_data');
     // Generic message — no availability context
-    expect(err.data.availability).toBeUndefined();
+    expect(err.data?.availability).toBeUndefined();
     expect(err.message).toContain('No data returned');
   });
 
@@ -1148,15 +1149,15 @@ describe('imfQueryDataset', () => {
       end_period: '1801',
     });
 
-    const err = await imfQueryDataset.handler(input, ctx).catch((e) => e);
+    const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
     expect(err.code).toBe(JsonRpcErrorCode.NotFound);
-    expect(err.data.reason).toBe('no_data_in_range');
+    expect(err.data?.reason).toBe('no_data_in_range');
     // The message names the requested range, the range the data occupies, and how much was excluded.
     expect(err.message).toContain('1800 – 1801');
     expect(err.message).toContain('1950-M01 – 2026-M06');
     expect(err.message).toContain('3 observation(s)');
-    expect(err.data.available_range).toEqual({ first: '1950-M01', last: '2026-M06' });
-    expect(err.data.excluded_observation_count).toBe(3);
+    expect(err.data?.available_range).toEqual({ first: '1950-M01', last: '2026-M06' });
+    expect(err.data?.excluded_observation_count).toBe(3);
   });
 
   it('#22 points recovery at the period bounds, not at the key', async () => {
@@ -1172,13 +1173,13 @@ describe('imfQueryDataset', () => {
       end_period: '1801',
     });
 
-    const err = await imfQueryDataset.handler(input, ctx).catch((e) => e);
-    expect(err.data.recovery.hint).toContain('start_period');
-    expect(err.data.recovery.hint).toContain('end_period');
-    expect(err.data.recovery.hint).toContain('valid');
+    const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+    expect(recoveryHint(err)).toContain('start_period');
+    expect(recoveryHint(err)).toContain('end_period');
+    expect(recoveryHint(err)).toContain('valid');
     // No availability enrichment — it would list the caller's own codes as the
     // ones that do have data and send them to change the key.
-    expect(err.data.availability).toBeUndefined();
+    expect(err.data?.availability).toBeUndefined();
   });
 
   it('#22 does not spend an availability lookup on a range failure', async () => {
@@ -1194,7 +1195,11 @@ describe('imfQueryDataset', () => {
       end_period: '1801',
     });
 
-    await imfQueryDataset.handler(input, ctx).catch(() => undefined);
+    try {
+      await imfQueryDataset.handler(input, ctx);
+    } catch {
+      // The throw is expected; this test asserts the availability lookup was skipped.
+    }
     expect(mockSvc.fetchAvailabilityConstraint).not.toHaveBeenCalled();
   });
 
@@ -1214,9 +1219,9 @@ describe('imfQueryDataset', () => {
       end_period: '2024',
     });
 
-    const err = await imfQueryDataset.handler(input, ctx).catch((e) => e);
-    expect(err.data.reason).toBe('no_data');
-    expect(err.data.availability.series_count).toBe(150);
+    const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+    expect(err.data?.reason).toBe('no_data');
+    expect(err.data?.availability).toMatchObject({ series_count: 150 });
   });
 
   it('#22 reports no_data, not no_data_in_range, when every row was null padding', async () => {
@@ -1236,8 +1241,8 @@ describe('imfQueryDataset', () => {
       start_period: '2020',
     });
 
-    const err = await imfQueryDataset.handler(input, ctx).catch((e) => e);
-    expect(err.data.reason).toBe('no_data');
+    const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+    expect(err.data?.reason).toBe('no_data');
   });
 
   it('#22 declares no_data_in_range in the error contract', () => {
@@ -1254,13 +1259,13 @@ describe('imfQueryDataset', () => {
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: '.NGDP_RPCH.A' });
 
-    const err = await imfQueryDataset.handler(input, ctx).catch((e) => e);
+    const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
     expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
-    expect(err.data.reason).toBe('empty_key_segment');
+    expect(err.data?.reason).toBe('empty_key_segment');
     expect(err.message).toContain('*');
     // Names the position and the dimension sitting there.
     expect(err.message).toContain('position 1 (COUNTRY)');
-    expect(err.data.emptyPositions).toEqual([1]);
+    expect(err.data?.emptyPositions).toEqual([1]);
     // Never sent upstream to come back as a misdiagnosed no_data.
     expect(mockSvc.fetchData).not.toHaveBeenCalled();
     expect(mockSvc.fetchAvailabilityConstraint).not.toHaveBeenCalled();
@@ -1270,10 +1275,10 @@ describe('imfQueryDataset', () => {
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: '..A' });
 
-    const err = await imfQueryDataset.handler(input, ctx).catch((e) => e);
-    expect(err.data.reason).toBe('empty_key_segment');
-    expect(err.data.emptyPositions).toEqual([1, 2]);
-    expect(err.data.keyFormat).toBe('COUNTRY.INDICATOR.FREQUENCY');
+    const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+    expect(err.data?.reason).toBe('empty_key_segment');
+    expect(err.data?.emptyPositions).toEqual([1, 2]);
+    expect(err.data?.keyFormat).toBe('COUNTRY.INDICATOR.FREQUENCY');
   });
 
   it('#23 treats a whitespace-only segment as empty', async () => {
@@ -1338,10 +1343,7 @@ describe('imfQueryDataset', () => {
     });
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.ZZZ.A' });
-    return (await imfQueryDataset.handler(input, ctx).catch((e) => e)) as {
-      message: string;
-      data: { recovery: { hint: string } };
-    };
+    return captureMcpError(() => imfQueryDataset.handler(input, ctx));
   };
 
   it('#26 states how many of how many a capped dimension shows, and still names the codes', async () => {
@@ -1373,8 +1375,8 @@ describe('imfQueryDataset', () => {
       FREQUENCY: { count: 1, codes: ['A'] },
     });
 
-    expect(err.data.recovery.hint).toContain('COUNTRY: 2 of 210 codes with data shown');
-    expect(err.data.recovery.hint).toContain('FREQUENCY: A');
+    expect(recoveryHint(err)).toContain('COUNTRY: 2 of 210 codes with data shown');
+    expect(recoveryHint(err)).toContain('FREQUENCY: A');
   });
 
   // -------------------------------------------------------------------------
@@ -1633,12 +1635,7 @@ describe('imfQueryDataset', () => {
       })),
     });
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
-    return (await imfQueryDataset
-      .handler(imfQueryDataset.input.parse(input), ctx)
-      .catch((e) => e)) as {
-      message: string;
-      data: { reason: string; recovery: { hint: string } };
-    };
+    return captureMcpError(() => imfQueryDataset.handler(imfQueryDataset.input.parse(input), ctx));
   };
 
   it('#31 says the dataflow itself is empty when no code anywhere has data', async () => {
@@ -1647,7 +1644,7 @@ describe('imfQueryDataset', () => {
       key: 'USA.CPI._T.IX.M',
     });
 
-    expect(err.data.reason).toBe('no_data');
+    expect(err.data?.reason).toBe('no_data');
     expect(err.message).toContain('publishes no series at all');
     // The caller's own code is not what is being blamed.
     expect(err.message).not.toContain("'USA' has 0 series");
@@ -1659,9 +1656,9 @@ describe('imfQueryDataset', () => {
       key: 'USA.CPI._T.IX.M',
     });
 
-    expect(err.data.recovery.hint).toContain('imf_list_databases');
+    expect(recoveryHint(err)).toContain('imf_list_databases');
     // "Try a different code" is the loop with no exit — every code fails here.
-    expect(err.data.recovery.hint).not.toMatch(/different code/i);
+    expect(recoveryHint(err)).not.toMatch(/different code/i);
   });
 
   it('#31 gives every code the same empty-dataflow answer', async () => {
@@ -1675,7 +1672,7 @@ describe('imfQueryDataset', () => {
     });
 
     expect(second.message).toBe(first.message);
-    expect(second.data.recovery.hint).toBe(first.data.recovery.hint);
+    expect(recoveryHint(second)).toBe(recoveryHint(first));
   });
 
   it('#31 still blames the code when the dataflow does publish series', async () => {
@@ -1686,7 +1683,7 @@ describe('imfQueryDataset', () => {
     );
 
     expect(err.message).toContain("'TUR' has 0 series in 'EER'");
-    expect(err.data.recovery.hint).toMatch(/different code/i);
+    expect(recoveryHint(err)).toMatch(/different code/i);
   });
 
   it('#31 names codes that do have data so the retry has somewhere to go', async () => {
@@ -1697,7 +1694,7 @@ describe('imfQueryDataset', () => {
     );
 
     expect(err.message).toContain('COUNTRY: 3 of 165 codes with data shown (USA, GBR, DEU)');
-    expect(err.data.recovery.hint).toContain('USA');
+    expect(recoveryHint(err)).toContain('USA');
   });
 
   it('#31 asks the dataflow-wide constraint only when the code probe came back empty', async () => {
@@ -1727,12 +1724,7 @@ describe('imfQueryDataset', () => {
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.NGDP_RPCH.A' });
 
-    const err = (await imfQueryDataset.handler(input, ctx).then(
-      () => {
-        throw new Error('expected rejection');
-      },
-      (e: unknown) => e,
-    )) as McpError;
+    const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
 
     expect(err.data?.reason).toBe('dataflow_list_unavailable');
     expect(JSON.stringify({ message: err.message, data: err.data })).not.toContain('/structure/');

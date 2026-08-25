@@ -6,6 +6,7 @@
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { captureMcpError } from '../helpers/errors.js';
 
 vi.mock('@/services/imf-sdmx/imf-sdmx-service.js', () => ({
   getImfSdmxService: vi.fn(),
@@ -69,6 +70,17 @@ const dataflowListUnavailable = () =>
     },
   );
 
+/**
+ * `params` is optional on ResourceDefinition; this resource declares one, so
+ * narrow it once here instead of asserting at every call site.
+ */
+const resourceParams = imfDatabaseResource.params;
+if (!resourceParams) throw new Error('imfDatabaseResource must declare a params schema');
+
+/** Same story for `output` — declared on the definition, optional on the type. */
+const resourceOutput = imfDatabaseResource.output;
+if (!resourceOutput) throw new Error('imfDatabaseResource must declare an output schema');
+
 describe('imfDatabaseResource', () => {
   let mockSvc: {
     findDataflow: ReturnType<typeof vi.fn>;
@@ -85,7 +97,7 @@ describe('imfDatabaseResource', () => {
 
   it('returns dataflow metadata for a known dataflow_id', async () => {
     const ctx = createMockContext({ tenantId: 'test' });
-    const params = imfDatabaseResource.params.parse({ dataflow_id: 'WEO' });
+    const params = resourceParams.parse({ dataflow_id: 'WEO' });
     const result = await imfDatabaseResource.handler(params, ctx);
 
     expect(result).toMatchObject({
@@ -95,17 +107,48 @@ describe('imfDatabaseResource', () => {
       name: 'World Economic Outlook',
       key_format: 'COUNTRY.INDICATOR.FREQUENCY',
     });
-    const typed = result as typeof MOCK_STRUCTURE & {
-      dimensions: (typeof MOCK_STRUCTURE)['dimensions'];
-    };
-    expect(typed.dimensions).toHaveLength(3);
-    expect(typed.dimensions[0].codelist).toHaveLength(2);
+    expect(result.dimensions).toHaveLength(3);
+    expect(result.dimensions[0]?.codelist).toHaveLength(2);
+  });
+
+  it('parses against the declared output schema, optional fields included', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    const params = resourceParams.parse({ dataflow_id: 'WEO' });
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dsdId: 'DSD_WEO_PUB',
+      dsdVersion: '4.0.0',
+    });
+
+    const result = await imfDatabaseResource.handler(params, ctx);
+    const parsed = resourceOutput.parse(result);
+
+    expect(parsed).toMatchObject({
+      dsd_version: '4.0.0',
+      structure_ref: 'DSD_WEO_PUB',
+      description: 'Biannual WEO projections',
+    });
+  });
+
+  it('parses against the output schema when every optional field is absent', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    const params = resourceParams.parse({ dataflow_id: 'WEO' });
+    const { description: _description, ...minimal } = MOCK_STRUCTURE;
+    mockSvc.fetchDataflowStructure.mockResolvedValue(minimal);
+
+    const result = await imfDatabaseResource.handler(params, ctx);
+    const parsed = resourceOutput.parse(result);
+
+    expect(parsed.description).toBeUndefined();
+    expect(parsed.dsd_version).toBeUndefined();
+    expect(parsed.structure_ref).toBeUndefined();
+    expect(parsed.dimensions).toHaveLength(3);
   });
 
   it('includes description when present', async () => {
     const ctx = createMockContext({ tenantId: 'test' });
-    const params = imfDatabaseResource.params.parse({ dataflow_id: 'WEO' });
-    const result = (await imfDatabaseResource.handler(params, ctx)) as Record<string, unknown>;
+    const params = resourceParams.parse({ dataflow_id: 'WEO' });
+    const result = await imfDatabaseResource.handler(params, ctx);
 
     expect(result.description).toBe('Biannual WEO projections');
   });
@@ -113,7 +156,7 @@ describe('imfDatabaseResource', () => {
   it('throws NotFound when dataflow_id does not exist', async () => {
     mockSvc.findDataflow.mockResolvedValue(undefined);
     const ctx = createMockContext({ tenantId: 'test' });
-    const params = imfDatabaseResource.params.parse({ dataflow_id: 'UNKNOWN' });
+    const params = resourceParams.parse({ dataflow_id: 'UNKNOWN' });
 
     await expect(imfDatabaseResource.handler(params, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
@@ -123,7 +166,7 @@ describe('imfDatabaseResource', () => {
   it('throws NotFound when structure fetch returns not-found error', async () => {
     mockSvc.fetchDataflowStructure.mockRejectedValue(new Error('not found'));
     const ctx = createMockContext({ tenantId: 'test' });
-    const params = imfDatabaseResource.params.parse({ dataflow_id: 'WEO' });
+    const params = resourceParams.parse({ dataflow_id: 'WEO' });
 
     await expect(imfDatabaseResource.handler(params, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
@@ -133,7 +176,7 @@ describe('imfDatabaseResource', () => {
   it('throws ServiceUnavailable when structure fetch fails with non-notfound error', async () => {
     mockSvc.fetchDataflowStructure.mockRejectedValue(new Error('connection reset'));
     const ctx = createMockContext({ tenantId: 'test' });
-    const params = imfDatabaseResource.params.parse({ dataflow_id: 'WEO' });
+    const params = resourceParams.parse({ dataflow_id: 'WEO' });
 
     await expect(imfDatabaseResource.handler(params, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
@@ -155,12 +198,10 @@ describe('imfDatabaseResource', () => {
     });
 
     const ctx = createMockContext({ tenantId: 'test' });
-    const params = imfDatabaseResource.params.parse({ dataflow_id: 'WEO' });
-    const result = (await imfDatabaseResource.handler(params, ctx)) as {
-      dimensions: Array<{ codelist: unknown[] }>;
-    };
+    const params = resourceParams.parse({ dataflow_id: 'WEO' });
+    const result = await imfDatabaseResource.handler(params, ctx);
 
-    expect(result.dimensions[0].codelist).toHaveLength(80);
+    expect(result.dimensions[0]?.codelist).toHaveLength(80);
   });
 
   it('#28 surfaces the concept label for each dimension rather than repeating the id', async () => {
@@ -180,10 +221,8 @@ describe('imfDatabaseResource', () => {
     });
 
     const ctx = createMockContext({ tenantId: 'test' });
-    const params = imfDatabaseResource.params.parse({ dataflow_id: 'CTOT' });
-    const result = (await imfDatabaseResource.handler(params, ctx)) as {
-      dimensions: Array<{ id: string; name: string }>;
-    };
+    const params = resourceParams.parse({ dataflow_id: 'CTOT' });
+    const result = await imfDatabaseResource.handler(params, ctx);
 
     // The resource shares normalizeDsd() with the tool, so the label reaches it too.
     expect(result.dimensions[0]).toMatchObject({ id: 'WGT_TYPE', name: 'Weight Type' });
@@ -197,14 +236,9 @@ describe('imfDatabaseResource', () => {
   it('#24 surfaces a controlled dataflow_list_unavailable with no upstream detail', async () => {
     mockSvc.findDataflow.mockRejectedValue(dataflowListUnavailable());
     const ctx = createMockContext({ tenantId: 'test' });
-    const params = imfDatabaseResource.params.parse({ dataflow_id: 'WEO' });
+    const params = resourceParams.parse({ dataflow_id: 'WEO' });
 
-    const err = (await imfDatabaseResource.handler(params, ctx).then(
-      () => {
-        throw new Error('expected rejection');
-      },
-      (e: unknown) => e,
-    )) as McpError;
+    const err = await captureMcpError(() => imfDatabaseResource.handler(params, ctx));
 
     expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
     expect(err.data?.reason).toBe('dataflow_list_unavailable');

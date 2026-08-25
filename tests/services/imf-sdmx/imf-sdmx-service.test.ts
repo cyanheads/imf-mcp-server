@@ -46,6 +46,7 @@ vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
 });
 
 import { ImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
+import type { SdmxAttributeDef } from '@/services/imf-sdmx/types.js';
 
 // --- Fixtures (real api.imf.org SDMX 3.0 shapes) --------------------------------
 
@@ -1442,7 +1443,7 @@ describe('ImfSdmxService.fetchData series attributes (#15)', () => {
                   {
                     ...WEO_TWO_SERIES.data.structures[0],
                     dimensions: {
-                      ...WEO_TWO_SERIES.data.structures[0].dimensions,
+                      ...WEO_TWO_SERIES.data.structures[0]!.dimensions,
                       series: [
                         {
                           id: 'COUNTRY',
@@ -1521,7 +1522,7 @@ const attributeFixture = (
     dataSets: [{ series: { '0:0:0': { attributes: entries, observations: { '0': ['1.5'] } } } }],
     structures: [
       {
-        attributes: { series: defs, observation: [] },
+        attributes: { series: defs, observation: [] as SdmxAttributeDef[] },
         dimensions: {
           series: [
             { id: 'COUNTRY', values: [{ id: 'USA' }] },
@@ -1758,12 +1759,15 @@ const groupRow = (unitEntry: number | null) =>
  * into. Every one declares its relationship, as the live payload does — that is
  * what says which slots of a group key describe the attribute.
  */
-const weoGroupDefs = (unitCodes: string[]) =>
+const weoGroupDefs = (unitCodes: string[]): SdmxAttributeDef[] =>
   WEO_GROUP_ATTR_IDS.map((id) => ({
     id,
     relationship: { dimensions: ['INDICATOR'] },
     ...(id === 'UNIT' ? { values: unitCodes.map((code) => ({ id: code })) } : {}),
   }));
+
+/** The same attribute definition with its `relationship` dropped. */
+const withoutRelationship = ({ relationship: _relationship, ...rest }: SdmxAttributeDef) => rest;
 
 /**
  * A WEO-shaped payload whose UNIT lives only in the dimensionGroup bucket, as the
@@ -1802,7 +1806,7 @@ const weoDimensionGroupFixture = (options: {
             { id: 'COUNTRY_UPDATE_DATE' },
           ],
           dimensionGroup: weoGroupDefs(options.unitCodes),
-          observation: [],
+          observation: [] as SdmxAttributeDef[],
         },
         dimensions: {
           series: [
@@ -1842,7 +1846,7 @@ const FSICDM_TWO_SUBSETS = {
     structures: [
       {
         attributes: {
-          series: [],
+          series: [] as SdmxAttributeDef[],
           dimensionGroup: [
             { id: 'FSI', relationship: { dimensions: ['INDICATOR'] }, values: [{ id: 'FSKA' }] },
             {
@@ -1855,8 +1859,8 @@ const FSICDM_TWO_SUBSETS = {
               relationship: { dimensions: ['SECTOR', 'INDICATOR', 'TRANSFORMATION'] },
               values: [{ id: 'USD' }, { id: 'PT' }],
             },
-          ],
-          observation: [],
+          ] as SdmxAttributeDef[],
+          observation: [] as SdmxAttributeDef[],
         },
         dimensions: {
           series: [
@@ -2002,7 +2006,7 @@ describe('ImfSdmxService.fetchData dimension-group attributes (#33)', () => {
     // relationship UNIT declares is what says its row is the SECTOR + INDICATOR
     // + TRANSFORMATION one, whatever else a matching row happens to carry.
     const payload = structuredClone(FSICDM_TWO_SUBSETS);
-    payload.data.dataSets[0].dimensionGroupAttributes['::0:::'] = [0, 0, 1];
+    payload.data.dataSets[0]!.dimensionGroupAttributes['::0:::'] = [0, 0, 1];
 
     const result = await decode(payload, 'USA.S1.FSKA.*.Q');
 
@@ -2016,7 +2020,7 @@ describe('ImfSdmxService.fetchData dimension-group attributes (#33)', () => {
     // A group key is read left to right regardless, so the relationship has to
     // be ordered against the key before it names any slots.
     const payload = structuredClone(FSICDM_TWO_SUBSETS);
-    payload.data.structures[0].attributes.dimensionGroup[2]!.relationship = {
+    payload.data.structures[0]!.attributes.dimensionGroup[2]!.relationship = {
       dimensions: ['TRANSFORMATION', 'INDICATOR', 'SECTOR'],
     };
 
@@ -2037,8 +2041,8 @@ describe('ImfSdmxService.fetchData dimension-group attributes (#33)', () => {
       unitCodes: ['PT'],
       dimensionGroupAttributes: { ':0::0': groupRow(0) },
     });
-    payload.data.structures[0].attributes.dimensionGroup =
-      payload.data.structures[0].attributes.dimensionGroup.map((def) =>
+    payload.data.structures[0]!.attributes.dimensionGroup =
+      payload.data.structures[0]!.attributes.dimensionGroup.map((def) =>
         def.id === 'UNIT'
           ? { ...def, relationship: { dimensions: ['INDICATOR', 'TIME_PERIOD'] } }
           : def,
@@ -2059,9 +2063,9 @@ describe('ImfSdmxService.fetchData dimension-group attributes (#33)', () => {
       unitCodes: ['PT'],
       dimensionGroupAttributes: { ':0::': groupRow(0) },
     });
-    payload.data.structures[0].attributes.dimensionGroup =
-      payload.data.structures[0].attributes.dimensionGroup.map((def) =>
-        def.id === 'UNIT' ? { id: def.id, values: def.values } : def,
+    payload.data.structures[0]!.attributes.dimensionGroup =
+      payload.data.structures[0]!.attributes.dimensionGroup.map((def) =>
+        def.id === 'UNIT' ? withoutRelationship(def) : def,
       );
 
     const result = await decode(payload);
@@ -2080,8 +2084,8 @@ describe('ImfSdmxService.fetchData dimension-group attributes (#33)', () => {
       unitCodes: ['PT'],
       dimensionGroupAttributes: { ':0::': groupRow(0) },
     });
-    payload.data.structures[0].attributes.dimensionGroup =
-      payload.data.structures[0].attributes.dimensionGroup.map((def) =>
+    payload.data.structures[0]!.attributes.dimensionGroup =
+      payload.data.structures[0]!.attributes.dimensionGroup.map((def) =>
         def.id === 'UNIT' ? { ...def, id: 'UNIT_MEASURE' } : def,
       );
 
@@ -2101,13 +2105,13 @@ describe('ImfSdmxService.fetchData dimension-group attributes (#33)', () => {
       unitCodes: ['USD'],
       dimensionGroupAttributes: { ':0::': groupRow(0) },
     });
-    payload.data.structures[0].attributes.series = [
+    payload.data.structures[0]!.attributes.series = [
       { id: 'SCALE', values: [{ id: '9' }, { id: '0' }] },
       { id: 'DECIMALS_DISPLAYED', values: [{ id: '3' }] },
       { id: 'OVERLAP', values: [{ id: 'OL' }] },
       { id: 'UNIT', values: [{ id: 'PT' }] },
     ];
-    payload.data.dataSets[0].series['0:0:0'].attributes = [1, 0, 0, 0];
+    payload.data.dataSets[0]!.series['0:0:0']!.attributes = [1, 0, 0, 0];
 
     const result = await decode(payload);
 
@@ -2497,7 +2501,7 @@ describe('ImfSdmxService.fetchData suppressed dimension groups (#34)', () => {
     // response of any shape could be read for it — and the request would be spent
     // on a value that could not be placed.
     const noRelationship = weo34Suppressed();
-    noRelationship.data.structures[0].attributes.dimensionGroup = [
+    noRelationship.data.structures[0]!.attributes.dimensionGroup = [
       { id: 'UNIT', values: [] as Array<{ id: string }> },
     ];
     serve(noRelationship, weo34Probe());
@@ -2571,7 +2575,7 @@ describe('ImfSdmxService.fetchData suppressed dimension groups (#34)', () => {
 
   it('does not probe a key that matched no series', async () => {
     const empty = weo34Suppressed();
-    empty.data.dataSets[0].series = {};
+    empty.data.dataSets[0]!.series = {};
     serve(empty, weo34Probe());
 
     const result = await query('USA.NGDP_RPCH+NGDPD.A');
@@ -2586,8 +2590,8 @@ describe('ImfSdmxService.fetchData suppressed dimension groups (#34)', () => {
     // slot UNIT names. Reading whichever row matched would pin one unit to
     // series it says nothing about.
     const probe = weo34Probe();
-    probe.data.dataSets[0].dimensionGroupAttributes = {
-      ...probe.data.dataSets[0].dimensionGroupAttributes,
+    probe.data.dataSets[0]!.dimensionGroupAttributes = {
+      ...probe.data.dataSets[0]!.dimensionGroupAttributes,
       '0:::': groupRow(1),
     };
     serve(weo34Suppressed(), probe);
@@ -2602,13 +2606,13 @@ describe('ImfSdmxService.fetchData suppressed dimension groups (#34)', () => {
     // The probe recovers the group statement only. A concept the series' own row
     // answers is the narrower statement and stays the one reported.
     const main = weo34Suppressed();
-    main.data.structures[0].attributes.series = [
+    main.data.structures[0]!.attributes.series = [
       { id: 'SCALE', values: [{ id: '9' }, { id: '0' }] },
       { id: 'DECIMALS_DISPLAYED', values: [{ id: '3' }] },
       { id: 'OVERLAP', values: [{ id: 'OL' }] },
       { id: 'UNIT', values: [{ id: 'XDC' }] },
     ];
-    main.data.dataSets[0].series['0:0:0'].attributes = [0, 0, 0, 0];
+    main.data.dataSets[0]!.series['0:0:0']!.attributes = [0, 0, 0, 0];
     serve(main, weo34Probe());
 
     const result = await query('USA.NGDP_RPCH+NGDPD.A');

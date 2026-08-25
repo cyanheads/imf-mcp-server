@@ -20,7 +20,6 @@ import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import type { RequestContext } from '@cyanheads/mcp-ts-core/utils';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type {
   AvailabilityDimension,
@@ -459,21 +458,16 @@ export class ImfSdmxService {
         async () => {
           const url = `${this.baseUrl}/structure/dataflow`;
           ctx.log.debug('Fetching dataflow list', { url });
-          const response = await fetchWithTimeout(
-            url,
-            this.timeoutMs,
-            ctx as unknown as RequestContext,
-            {
-              headers: { Accept: 'application/json' },
-              signal: ctx.signal,
-            },
-          );
+          const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
+            headers: { Accept: 'application/json' },
+            signal: ctx.signal,
+          });
           const text = await response.text();
           return this.parseJson<SdmxStructureResponse>(text, 'dataflow list');
         },
         {
           operation: 'ImfSdmxService.fetchDataflows',
-          context: ctx as unknown as RequestContext,
+          context: ctx,
           maxRetries: 3,
           baseDelayMs: 1000,
           signal: ctx.signal,
@@ -535,15 +529,10 @@ export class ImfSdmxService {
       async () => {
         const url = `${this.baseUrl}/structure/datastructure/${encodeURIComponent(agencyId)}/${encodeURIComponent(dsdId)}/${encodeURIComponent(version)}?references=all`;
         ctx.log.debug('Fetching data structure', { url });
-        const response = await fetchWithTimeout(
-          url,
-          this.timeoutMs,
-          ctx as unknown as RequestContext,
-          {
-            headers: { Accept: 'application/json' },
-            signal: ctx.signal,
-          },
-        );
+        const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
+          headers: { Accept: 'application/json' },
+          signal: ctx.signal,
+        });
         // HTTP 204 (or an empty body) means the DSD id does not exist — a
         // definitive miss, not a transient error. Opt out of retry (retryable:
         // false) so callers fall through to the fallback immediately rather than
@@ -559,7 +548,7 @@ export class ImfSdmxService {
       },
       {
         operation: 'ImfSdmxService.fetchDataStructure',
-        context: ctx as unknown as RequestContext,
+        context: ctx,
         maxRetries: 3,
         baseDelayMs: 1000,
         signal: ctx.signal,
@@ -659,21 +648,16 @@ export class ImfSdmxService {
       async () => {
         const url = `${this.baseUrl}/structure/dataflow/${encodeURIComponent(agencyId)}/${encodeURIComponent(dataflowId)}/${encodeURIComponent(version)}?references=all`;
         ctx.log.debug('Fetching dataflow structure (fallback)', { url });
-        const response = await fetchWithTimeout(
-          url,
-          this.timeoutMs,
-          ctx as unknown as RequestContext,
-          {
-            headers: { Accept: 'application/json' },
-            signal: ctx.signal,
-          },
-        );
+        const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
+          headers: { Accept: 'application/json' },
+          signal: ctx.signal,
+        });
         const text = await response.text();
         return this.parseJson<SdmxStructureResponse>(text, 'dataflow structure (fallback)');
       },
       {
         operation: 'ImfSdmxService.fetchDataflowStructureFallback',
-        context: ctx as unknown as RequestContext,
+        context: ctx,
         maxRetries: 3,
         baseDelayMs: 1000,
         signal: ctx.signal,
@@ -697,9 +681,9 @@ export class ImfSdmxService {
     dataflowId: string,
     version: string,
     key: string,
-    startPeriod?: string,
-    endPeriod?: string,
-    ctx?: Context,
+    startPeriod: string | undefined,
+    endPeriod: string | undefined,
+    ctx: Context,
     signal?: AbortSignal,
   ): Promise<DataQueryResult> {
     const queryParams = new URLSearchParams();
@@ -708,30 +692,24 @@ export class ImfSdmxService {
     const qsStr = queryParams.toString();
     const qs = qsStr ? `?${qsStr}` : '';
 
-    // Build a minimal RequestContextLike for fetchWithTimeout when no ctx provided
-    const now = new Date().toISOString();
-    const fetchCtx: RequestContext = ctx
-      ? (ctx as unknown as RequestContext)
-      : ({ requestId: 'internal', timestamp: now } as RequestContext);
-
-    const effectiveSignal = signal ?? ctx?.signal;
+    const effectiveSignal = signal ?? ctx.signal;
     const raw = await withRetry(
       async () => {
         const url = `${this.baseUrl}/data/dataflow/${encodeURIComponent(agencyId)}/${encodeURIComponent(dataflowId)}/${encodeURIComponent(version)}/${encodeURIComponent(key)}${qs}`;
-        if (ctx) ctx.log.debug('Fetching data', { url });
-        const response = await fetchWithTimeout(url, this.timeoutMs, fetchCtx, {
+        ctx.log.debug('Fetching data', { url });
+        const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
           headers: { Accept: 'application/json' },
-          ...(effectiveSignal ? { signal: effectiveSignal } : {}),
+          signal: effectiveSignal,
         });
         const text = await response.text();
         return this.parseJson<SdmxDataResponse>(text, 'data query');
       },
       {
         operation: 'ImfSdmxService.fetchData',
-        context: ctx as unknown as RequestContext,
+        context: ctx,
         maxRetries: 3,
         baseDelayMs: 1000,
-        ...(effectiveSignal ? { signal: effectiveSignal } : {}),
+        signal: effectiveSignal,
       },
     );
 
@@ -781,13 +759,9 @@ export class ImfSdmxService {
     dataflowId: string,
     version: string,
     key: string,
-    ctx?: Context,
+    ctx: Context,
     signal?: AbortSignal,
   ): Promise<DimensionGroupOverlay | undefined> {
-    // The DSD sizes the codelists the widen position is chosen by, and it is
-    // read through ctx.state's cache; without a context there is nothing to
-    // choose on.
-    if (!ctx) return;
     if (key.includes('*')) return;
 
     const dataStructure = raw.data?.structures?.[0];
@@ -812,7 +786,7 @@ export class ImfSdmxService {
       const response = await fetchWithTimeout(
         url,
         Math.min(this.timeoutMs, GROUP_PROBE_TIMEOUT_MS),
-        ctx as unknown as RequestContext,
+        ctx,
         {
           headers: { Accept: 'application/json' },
           ...(signal ? { signal } : {}),
@@ -917,7 +891,7 @@ export class ImfSdmxService {
   async fetchAvailabilityConstraint(
     dataflowId: string,
     firstDimensionCode: string,
-    ctx?: Context,
+    ctx: Context,
     signal?: AbortSignal,
   ): Promise<AvailabilityResult | null> {
     // Derive the SDMX 2.1 base URL from the configured 3.0 URL.
@@ -926,19 +900,16 @@ export class ImfSdmxService {
     const key = firstDimensionCode ? `${encodeURIComponent(firstDimensionCode)}..` : '';
     const url = `${base21}/availableconstraint/${encodeURIComponent(dataflowId)}/${key}`;
 
-    const fetchCtx: RequestContext = ctx
-      ? (ctx as unknown as RequestContext)
-      : ({ requestId: 'avail', timestamp: new Date().toISOString() } as RequestContext);
-    const effectiveSignal = signal ?? ctx?.signal;
+    const effectiveSignal = signal ?? ctx.signal;
 
     try {
       const response = await fetchWithTimeout(
         url,
         Math.min(this.timeoutMs, 10_000), // cap availability lookup at 10s
-        fetchCtx,
+        ctx,
         {
           headers: { Accept: 'application/xml, text/xml' },
-          ...(effectiveSignal ? { signal: effectiveSignal } : {}),
+          signal: effectiveSignal,
         },
       );
 

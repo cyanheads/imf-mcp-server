@@ -11,6 +11,7 @@
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { captureMcpError } from '../helpers/errors.js';
 
 vi.mock('@/services/imf-sdmx/imf-sdmx-service.js', () => ({
   getImfSdmxService: vi.fn(),
@@ -62,7 +63,7 @@ describe('imfListDatabases', () => {
   });
 
   it('returns all non-vintage dataflows by default', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({});
     const result = await imfListDatabases.handler(input, ctx);
 
@@ -71,7 +72,7 @@ describe('imfListDatabases', () => {
   });
 
   it('includes vintage dataflows when include_vintages=true', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({ include_vintages: true });
     const result = await imfListDatabases.handler(input, ctx);
 
@@ -80,25 +81,25 @@ describe('imfListDatabases', () => {
   });
 
   it('filters by name substring (case-insensitive)', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({ filter: 'balance' });
     const result = await imfListDatabases.handler(input, ctx);
 
     expect(result.total_count).toBe(1);
-    expect(result.dataflows[0].id).toBe('BOP');
+    expect(result.dataflows[0]!.id).toBe('BOP');
   });
 
   it('filters by description substring', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({ filter: 'price indices' });
     const result = await imfListDatabases.handler(input, ctx);
 
     expect(result.total_count).toBe(1);
-    expect(result.dataflows[0].id).toBe('CPI');
+    expect(result.dataflows[0]!.id).toBe('CPI');
   });
 
   it('returns empty list when filter matches nothing', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({ filter: 'xyznonexistent' });
     const result = await imfListDatabases.handler(input, ctx);
 
@@ -107,7 +108,7 @@ describe('imfListDatabases', () => {
   });
 
   it('enriches notice when filter matches nothing', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({ filter: 'xyznonexistent' });
     await imfListDatabases.handler(input, ctx);
 
@@ -118,7 +119,7 @@ describe('imfListDatabases', () => {
   });
 
   it('does not enrich notice when filter matches results', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({ filter: 'balance' });
     await imfListDatabases.handler(input, ctx);
 
@@ -126,7 +127,7 @@ describe('imfListDatabases', () => {
   });
 
   it('does not enrich notice when no filter is provided', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({});
     await imfListDatabases.handler(input, ctx);
 
@@ -207,13 +208,13 @@ describe('imfListDatabases', () => {
     ];
     mockSvc.fetchDataflows.mockResolvedValue(dataflows);
 
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     // "asia pacific" matches only via description on APDREO (and not WEO)
     const input = imfListDatabases.input.parse({ filter: 'asia pacific' });
     const result = await imfListDatabases.handler(input, ctx);
 
     expect(result.total_count).toBe(1);
-    expect(result.dataflows[0].id).toBe('APDREO');
+    expect(result.dataflows[0]!.id).toBe('APDREO');
   });
 
   // -------------------------------------------------------------------------
@@ -235,7 +236,7 @@ describe('imfListDatabases', () => {
     args: Record<string, unknown> = {},
   ) => {
     mockSvc.fetchDataflows.mockResolvedValue(dataflows);
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const result = await imfListDatabases.handler(imfListDatabases.input.parse(args), ctx);
     return { result, notice: getEnrichment(ctx).notice as string | undefined };
   };
@@ -284,7 +285,7 @@ describe('imfListDatabases', () => {
 
   it('#29 names the next offset when matches remain', async () => {
     mockSvc.fetchDataflows.mockResolvedValue(catalogOf(103));
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     await imfListDatabases.handler(imfListDatabases.input.parse({}), ctx);
     const enrichment = getEnrichment(ctx);
 
@@ -347,7 +348,7 @@ describe('imfListDatabases', () => {
     mockSvc.fetchDataflows.mockResolvedValue([
       { id: 'CPI', agencyId: 'IMF.STA', version: '2.0.0', name: 'CPI', description: short },
     ]);
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const result = await imfListDatabases.handler(imfListDatabases.input.parse({}), ctx);
 
     expect(result.dataflows[0]?.description).toBe(short);
@@ -360,7 +361,7 @@ describe('imfListDatabases', () => {
     mockSvc.fetchDataflows.mockResolvedValue([
       { id: 'ARR', agencyId: 'IMF.STA', version: '1.0.0', name: 'Arrears', description },
     ]);
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const result = await imfListDatabases.handler(
       imfListDatabases.input.parse({ filter: 'sovereign arrears' }),
       ctx,
@@ -402,12 +403,7 @@ describe('imfListDatabases', () => {
     const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({});
 
-    const err = (await imfListDatabases.handler(input, ctx).then(
-      () => {
-        throw new Error('expected rejection');
-      },
-      (e: unknown) => e,
-    )) as McpError;
+    const err = await captureMcpError(() => imfListDatabases.handler(input, ctx));
 
     expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
     expect(err.data?.reason).toBe('dataflow_list_unavailable');

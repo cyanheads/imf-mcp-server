@@ -6,6 +6,7 @@
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { captureMcpError } from '../helpers/errors.js';
 
 vi.mock('@/services/canvas/canvas-accessor.js', () => ({
   getCanvas: vi.fn(),
@@ -257,12 +258,7 @@ describe('imfDataframeQuery', () => {
       sql: 'SELECT * FROM spilled_gone',
     });
 
-    const err = (await imfDataframeQuery.handler(input, ctx).then(
-      () => {
-        throw new Error('expected rejection');
-      },
-      (e: unknown) => e,
-    )) as McpError;
+    const err = await captureMcpError(() => imfDataframeQuery.handler(input, ctx));
 
     // Distinct from canvas_not_found — the canvas exists, the table does not.
     expect(err.code).toBe(JsonRpcErrorCode.NotFound);
@@ -345,12 +341,7 @@ describe('imfDataframeQuery', () => {
       sql: 'SELECT nope FROM spilled_abc123',
     });
 
-    const err = (await imfDataframeQuery.handler(input, ctx).then(
-      () => {
-        throw new Error('expected rejection');
-      },
-      (e: unknown) => e,
-    )) as McpError;
+    const err = await captureMcpError(() => imfDataframeQuery.handler(input, ctx));
 
     expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(err.data?.reason).toBe('invalid_sql');
@@ -381,7 +372,7 @@ describe('imfDataframeQuery', () => {
       canvas_id: 'canvas-abc',
       sql: 'DROP TABLE t',
     });
-    const err = (await imfDataframeQuery.handler(input, ctx).catch((e: unknown) => e)) as McpError;
+    const err = await captureMcpError(() => imfDataframeQuery.handler(input, ctx));
     expect(err.message).toMatch(/WITH/);
   });
 

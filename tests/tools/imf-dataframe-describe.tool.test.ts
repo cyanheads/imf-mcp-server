@@ -69,10 +69,10 @@ describe('imfDataframeDescribe', () => {
 
     expect(result.canvas_id).toBe('canvas-abc');
     expect(result.table_count).toBe(1);
-    expect(result.tables[0].name).toBe('spilled_abc123');
-    expect(result.tables[0].row_count).toBe(1000);
-    expect(result.tables[0].columns).toHaveLength(3);
-    expect(result.tables[0].columns[0]).toEqual({ name: 'time_period', type: 'VARCHAR' });
+    expect(result.tables[0]!.name).toBe('spilled_abc123');
+    expect(result.tables[0]!.row_count).toBe(1000);
+    expect(result.tables[0]!.columns).toHaveLength(3);
+    expect(result.tables[0]!.columns[0]).toEqual({ name: 'time_period', type: 'VARCHAR' });
   });
 
   it('formats table schema as markdown', () => {
@@ -109,7 +109,11 @@ describe('imfDataframeDescribe', () => {
     const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeDescribe.errors });
     const input = imfDataframeDescribe.input.parse({ canvas_id: 'canvas-abc' });
 
-    await imfDataframeDescribe.handler(input, ctx).catch(() => {});
+    try {
+      await imfDataframeDescribe.handler(input, ctx);
+    } catch {
+      // The throw is expected; this test asserts on the declared recovery text.
+    }
     // Recovery should mention re-running imf_query_dataset, not CANVAS_PROVIDER_TYPE
     const recovery =
       imfDataframeDescribe.errors?.find((e) => e.reason === 'canvas_not_found')?.recovery ?? '';

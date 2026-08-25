@@ -6,6 +6,7 @@
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { captureMcpError } from '../helpers/errors.js';
 
 vi.mock('@/services/imf-sdmx/imf-sdmx-service.js', () => ({
   getImfSdmxService: vi.fn(),
@@ -91,8 +92,8 @@ describe('imfGetDatabase', () => {
     expect(result.agency_id).toBe('IMF.RES');
     expect(result.key_format).toBe('COUNTRY.INDICATOR.FREQUENCY');
     expect(result.dimensions).toHaveLength(3);
-    expect(result.dimensions[0].id).toBe('COUNTRY');
-    expect(result.dimensions[0].codelist[0]).toEqual({ id: 'USA', name: 'United States' });
+    expect(result.dimensions[0]!.id).toBe('COUNTRY');
+    expect(result.dimensions[0]!.codelist[0]).toEqual({ id: 'USA', name: 'United States' });
     expect(result.source).toBe(
       'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     );
@@ -195,7 +196,7 @@ describe('imfGetDatabase', () => {
     const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO' });
     const result = await imfGetDatabase.handler(input, ctx);
 
-    const countryDim = result.dimensions[0];
+    const countryDim = result.dimensions[0]!;
     expect(countryDim.codelist).toHaveLength(50);
     expect(countryDim.codelist_truncated).toBe(true);
   });
@@ -205,7 +206,7 @@ describe('imfGetDatabase', () => {
     const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO' });
     const result = await imfGetDatabase.handler(input, ctx);
 
-    expect(result.dimensions[0].codelist_truncated).toBe(false);
+    expect(result.dimensions[0]!.codelist_truncated).toBe(false);
   });
 
   it('formats output with key_format prominently', () => {
@@ -284,9 +285,9 @@ describe('imfGetDatabase', () => {
     const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: 'ind_001' });
     const result = await imfGetDatabase.handler(input, ctx);
 
-    const countryDim = result.dimensions[0];
+    const countryDim = result.dimensions[0]!;
     expect(countryDim.codelist).toHaveLength(1);
-    expect(countryDim.codelist[0].id).toBe('IND_001');
+    expect(countryDim.codelist[0]!.id).toBe('IND_001');
     // filter mode — not truncated
     expect(countryDim.codelist_truncated).toBe(false);
   });
@@ -309,9 +310,9 @@ describe('imfGetDatabase', () => {
     const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: 'inflation' });
     const result = await imfGetDatabase.handler(input, ctx);
 
-    const dim = result.dimensions[0];
+    const dim = result.dimensions[0]!;
     expect(dim.codelist).toHaveLength(1);
-    expect(dim.codelist[0].id).toBe('PCPIPCH');
+    expect(dim.codelist[0]!.id).toBe('PCPIPCH');
   });
 
   it('codelist_filter returns all matches — not capped at 50', async () => {
@@ -332,8 +333,8 @@ describe('imfGetDatabase', () => {
     const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: 'match' });
     const result = await imfGetDatabase.handler(input, ctx);
 
-    expect(result.dimensions[0].codelist).toHaveLength(80);
-    expect(result.dimensions[0].codelist_truncated).toBe(false);
+    expect(result.dimensions[0]!.codelist).toHaveLength(80);
+    expect(result.dimensions[0]!.codelist_truncated).toBe(false);
   });
 
   it('without codelist_filter: behavior unchanged (first 50, truncated flag)', async () => {
@@ -353,8 +354,8 @@ describe('imfGetDatabase', () => {
     const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO' });
     const result = await imfGetDatabase.handler(input, ctx);
 
-    expect(result.dimensions[0].codelist).toHaveLength(50);
-    expect(result.dimensions[0].codelist_truncated).toBe(true);
+    expect(result.dimensions[0]!.codelist).toHaveLength(50);
+    expect(result.dimensions[0]!.codelist_truncated).toBe(true);
   });
 
   // -------------------------------------------------------------------------
@@ -562,12 +563,7 @@ describe('imfGetDatabase', () => {
     const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
     const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO' });
 
-    const err = (await imfGetDatabase.handler(input, ctx).then(
-      () => {
-        throw new Error('expected rejection');
-      },
-      (e: unknown) => e,
-    )) as McpError;
+    const err = await captureMcpError(() => imfGetDatabase.handler(input, ctx));
 
     expect(err.data?.reason).toBe('dataflow_list_unavailable');
     expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('Retry') });
