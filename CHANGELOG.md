@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-08-30 · ⚠️ Breaking
+
+imf://database/{dataflow_id} now returns bounded codelist previews with continuation into imf_get_database, which pages one selected dimension and emits 2026 metadata cache hints
+
 ## [0.2.12](changelog/0.2.x/0.2.12.md) — 2026-08-25
 
 Adopts mcp-ts-core 0.12.3 and the MCP SDK v2 wire — HTTP serves protocol revision 2026-07-28 alongside the 2025 era, tool arguments reject undeclared keys, and the advertised output schemas declare the error envelope

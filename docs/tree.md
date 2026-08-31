@@ -1,6 +1,6 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-08-25 07:13:35
+Generated on: 2026-08-31 02:39:19
 
 ```text
 imf-mcp-server/
@@ -24,6 +24,7 @@ imf-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -131,6 +132,7 @@ imf-mcp-server/
 │       └── SKILL.md
 ├── src/
 │   ├── config/
+│   │   ├── cache-hints.ts
 │   │   └── server-config.ts
 │   ├── mcp-server/
 │   │   ├── prompts/
@@ -140,14 +142,15 @@ imf-mcp-server/
 │   │   │   └── definitions/
 │   │   │       ├── imf-database.resource.ts
 │   │   │       └── index.ts
-│   │   └── tools/
-│   │       └── definitions/
-│   │           ├── imf-dataframe-describe.tool.ts
-│   │           ├── imf-dataframe-query.tool.ts
-│   │           ├── imf-get-database.tool.ts
-│   │           ├── imf-list-databases.tool.ts
-│   │           ├── imf-query-dataset.tool.ts
-│   │           └── index.ts
+│   │   ├── tools/
+│   │   │   └── definitions/
+│   │   │       ├── imf-dataframe-describe.tool.ts
+│   │   │       ├── imf-dataframe-query.tool.ts
+│   │   │       ├── imf-get-database.tool.ts
+│   │   │       ├── imf-list-databases.tool.ts
+│   │   │       ├── imf-query-dataset.tool.ts
+│   │   │       └── index.ts
+│   │   └── codelist-page.ts
 │   ├── services/
 │   │   ├── canvas/
 │   │   │   └── canvas-accessor.ts
@@ -164,12 +167,13 @@ imf-mcp-server/
 │   ├── services/
 │   │   └── imf-sdmx/
 │   │       └── imf-sdmx-service.test.ts
-│   └── tools/
-│       ├── imf-dataframe-describe.tool.test.ts
-│       ├── imf-dataframe-query.tool.test.ts
-│       ├── imf-get-database.tool.test.ts
-│       ├── imf-list-databases.tool.test.ts
-│       └── imf-query-dataset.tool.test.ts
+│   ├── tools/
+│   │   ├── imf-dataframe-describe.tool.test.ts
+│   │   ├── imf-dataframe-query.tool.test.ts
+│   │   ├── imf-get-database.tool.test.ts
+│   │   ├── imf-list-databases.tool.test.ts
+│   │   └── imf-query-dataset.tool.test.ts
+│   └── cache-hints.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

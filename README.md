@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.12-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -55,10 +55,10 @@ Entry point for every IMF query workflow — browse and filter the dataflow cata
 
 Resolve human-readable terms to SDMX dimension codes before querying.
 
-- Returns every dimension ID, its position, its label from the DSD concept scheme (`WGT_TYPE` → `Weight Type`), and a codelist preview (e.g. `"United States"` → `USA`, `"real GDP growth"` → `NGDP_RPCH`)
+- Returns every dimension ID, its position, its label from the DSD concept scheme (`WGT_TYPE` → `Weight Type`), and a codelist preview (e.g. `"United States"` → `USA`, `"Constant prices"` → `NGDP_RPCH`)
 - Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE)
 - `key_format` field shows the exact dot-separated dimension order required by `imf_query_dataset`
-- Codelists truncated at 50 entries inline; use `codelist_filter` to search large codelists by substring (returns all matches, uncapped), or the `imf://database/{dataflow_id}` resource for the full list
+- Every codelist preview is bounded at 50 entries, including substring-filtered previews. Set `dimension_id` to page one codelist with `limit`/`offset`; `codelist_filter` still applies its case-insensitive substring match before paging
 - A filter that matches nothing is reported distinctly from a codelist that could not be resolved — the two need opposite next steps
 
 ---
@@ -67,7 +67,7 @@ Resolve human-readable terms to SDMX dimension codes before querying.
 
 Query an IMF SDMX dataflow by dimension key over a time range.
 
-- Dot-separated key in DSD keyPosition order (e.g. `USA.NGDP_RPCH.A` for WEO annual real GDP growth)
+- Dot-separated key in DSD keyPosition order (e.g. `USA.NGDP_RPCH.A` for WEO annual GDP at constant prices, percent change)
 - `+` combines codes at one position (e.g. `USA+GBR+DEU.NGDP_RPCH.A`); `*` matches every code at a position (`*.NGDP_RPCH.A` for all countries, `CAN.*.A` for every indicator). Every position needs a code or a `*` — a blank segment matches nothing upstream and is rejected
 - `start_period` / `end_period` accept `YYYY`, `YYYY-SN`, `YYYY-QN`, `YYYY-MM`, or `YYYY-MM-DD` whatever the series frequency, and cover the whole period they name — `end_period: 2023` includes `2023-M12` and `2023-Q4`
 - Returns observations with `time_period`, `value`, `status`, and series attributes (`unit`, `scale`, `decimals`). Period labels come back as upstream emits them — `2023`, `2023-S1`, `2023-Q1`, `2023-M01`, `2023-01-05` — and any of them can be passed straight back in as a bound
@@ -96,9 +96,9 @@ One SELECT statement per call; a leading `WITH … SELECT` common table expressi
 
 | Type | URI | Description |
 |:-----|:----|:------------|
-| Resource | `imf://database/{dataflow_id}` | Full metadata for a single IMF SDMX dataflow — all dimensions with complete codelists, `key_format`, name, and description. Stable URI-addressable reference for known dataflow IDs (WEO, BOP, CPI, etc.). |
+| Resource | `imf://database/{dataflow_id}` | Bounded discovery metadata for a single IMF SDMX dataflow — all dimensions with up to 50 codelist entries each, counts, `key_format`, name, description, and continuation metadata. |
 
-All resource data is also reachable via `imf_get_database`. The resource URI provides the untruncated codelist for large dimensions that `imf_get_database` caps at 50 entries. The `codelist_filter` parameter on `imf_get_database` is a lighter alternative for targeted code lookup — it returns all substring matches without the cap.
+The resource stays bounded and points machine-readably to `imf_get_database` for continuation. To retrieve a large codelist, call `imf_get_database` with its `dimension_id`, then follow `next_offset` with `limit`/`offset`; add `codelist_filter` to page only entries whose ID or name contains a substring.
 
 ## Data source
 

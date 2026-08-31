@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** imf-mcp-server
-**Version:** 0.2.12
+**Version:** 0.3.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.12.3`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
@@ -88,23 +88,43 @@ export const imfQueryDataset = tool('imf_query_dataset', {
 
 ```ts
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
 export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
   name: 'imf-database',
   title: 'IMF Dataflow Metadata',
-  description: 'Metadata for a single IMF SDMX dataflow — dimensions with full codelists, key_format, name, and description.',
+  description: 'Bounded discovery metadata for one IMF SDMX dataflow, with continuation through imf_get_database.',
   mimeType: 'application/json',
   params: z.object({
     dataflow_id: z.string().describe('Dataflow identifier, e.g. WEO, BOP, CPI.'),
   }),
+  errors: [
+    { reason: 'dataflow_not_found', code: JsonRpcErrorCode.NotFound,
+      when: 'dataflow_id does not match any known dataflow',
+      recovery: 'Call imf_list_databases to browse available dataflow IDs.' },
+    { reason: 'structure_unavailable', code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The selected dataflow structure is unavailable',
+      recovery: 'Retry after a short wait.' },
+    { reason: 'dataflow_list_unavailable', code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The dataflow catalog could not be fetched', retryable: true,
+      recovery: 'Retry in a few moments.' },
+  ],
   async handler(params, ctx) {
     const svc = getImfSdmxService();
     const dataflow = await svc.findDataflow(params.dataflow_id, undefined, undefined, ctx);
-    if (!dataflow) throw notFound(`Dataflow '${params.dataflow_id}' not found`);
+    if (!dataflow) throw ctx.fail('dataflow_not_found', `Dataflow '${params.dataflow_id}' not found`, ctx.recoveryFor('dataflow_not_found'));
     const structure = await svc.fetchDataflowStructure(params.dataflow_id, dataflow.agencyId, dataflow.version, ctx);
-    return { dataflow_id: structure.dataflowId, key_format: structure.keyFormat, dimensions: structure.dimensions };
+    return {
+      dataflow_id: structure.dataflowId,
+      key_format: structure.keyFormat,
+      dimensions: structure.dimensions.map((dimension) => ({
+        ...dimension,
+        codelist: dimension.codelist.slice(0, 50),
+        codelist_truncated: dimension.codelist.length > 50,
+      })),
+      continuation: { tool: 'imf_get_database', dimension_selector: 'dimension_id', page_limit: 'limit', page_offset: 'offset' },
+    };
   },
 });
 ```
@@ -236,7 +256,7 @@ src/
       imf-dataframe-describe.tool.ts   # List canvas tables and schema
       imf-dataframe-query.tool.ts      # SQL SELECT on staged canvas tables
     resources/definitions/
-      imf-database.resource.ts         # imf://database/{dataflow_id} — full codelist resource
+      imf-database.resource.ts         # imf://database/{dataflow_id} — bounded DSD discovery resource
 ```
 
 ---
