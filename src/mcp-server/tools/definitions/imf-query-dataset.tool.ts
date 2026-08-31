@@ -8,8 +8,8 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { spillover } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { idGenerator } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 import type {
@@ -18,7 +18,11 @@ import type {
   SeriesAttributes,
 } from '@/services/imf-sdmx/types.js';
 
-const PREVIEW_CHARS = 100_000;
+/** Maximum serialized size of a staged tool result, across both MCP result channels. */
+const RESPONSE_BUDGET_CHARS = 100_000;
+
+/** Framework-style random suffix for explicitly registered IMF canvas tables. */
+const TABLE_NAME_CHARS = '0123456789abcdef';
 
 /** IMF SDMX 3.0 data portal base URL — used to construct per-dataflow attribution links. */
 const IMF_DATA_PORTAL = 'https://data.imf.org/';
@@ -122,10 +126,18 @@ function periodSpan(period: string): PeriodSpan | null {
 
   const daily = /^(\d{4})-(\d{2})-(\d{2})$/.exec(period);
   if (daily) {
+    const year = Number(daily[1]);
     const month = Number(daily[2]);
     const day = Number(daily[3]);
-    if (month < 1 || month > 12 || day < 1 || day > LAST_DAY) return null;
-    const key = dateKey(Number(daily[1]), month, day);
+    const calendarDate = new Date(Date.UTC(year, month - 1, day));
+    if (
+      calendarDate.getUTCFullYear() !== year ||
+      calendarDate.getUTCMonth() !== month - 1 ||
+      calendarDate.getUTCDate() !== day
+    ) {
+      return null;
+    }
+    const key = dateKey(year, month, day);
     return { lo: key, hi: key };
   }
 
@@ -196,6 +208,111 @@ function observedRange(observations: Observation[]): { first: string; last: stri
   };
 }
 
+interface SeriesMetadata {
+  decimals: number | null;
+  scale: string | null;
+  series_key: string;
+  unit: string | null;
+}
+
+/** Domain result fields consumed by the formatter and response-budget measurement. */
+interface QueryDatasetResult {
+  canvas_id?: string;
+  dataflow_id: string;
+  end_period?: string;
+  key: string;
+  observation_count: number;
+  observations: Observation[];
+  retrieval_guidance?: string;
+  series_attributes: SeriesAttributes;
+  series_metadata?: SeriesMetadata[];
+  source: string;
+  staged: boolean;
+  start_period?: string;
+  table_name?: string;
+  truncated: boolean;
+}
+
+/** Render the domain result identically for normal delivery and budget measurement. */
+function formatQueryDataset(result: QueryDatasetResult) {
+  const lines: string[] = [];
+  lines.push(`## IMF Data: ${result.dataflow_id} — \`${result.key}\``);
+
+  if (result.start_period || result.end_period) {
+    const range = [result.start_period, result.end_period].filter(Boolean).join(' – ');
+    lines.push(`**Period:** ${range}`);
+  }
+
+  const { unit, scale, decimals } = result.series_attributes;
+  const primaryMeta = [unit, scaleLabel(scale), decimals != null ? `${decimals} decimals` : null]
+    .filter(Boolean)
+    .join(' | ');
+
+  if (result.series_metadata) {
+    const shown = result.series_metadata.slice(0, SERIES_METADATA_PREVIEW_ROWS);
+    const heading =
+      shown.length < result.series_metadata.length
+        ? `\n**Series attributes** — ${shown.length} of ${result.series_metadata.length} series shown; every entry remains in structuredContent${result.staged ? ', and every canvas row carries its own unit, scale, and decimals' : ''}\n`
+        : '\n**Series attributes** — one row per series\n';
+    lines.push(heading);
+    lines.push('| Series Key | Unit | Scale | Decimals |');
+    lines.push('|:-----------|:-----|:------|---------:|');
+    for (const series of shown) {
+      lines.push(
+        `| ${series.series_key} | ${series.unit ?? '—'} | ${scaleLabel(series.scale) ?? '—'} | ${series.decimals ?? '—'} |`,
+      );
+    }
+    if (primaryMeta) {
+      lines.push(
+        `\n\`series_attributes\` describes the first row (${result.series_metadata[0]?.series_key ?? ''}): ${primaryMeta}\n`,
+      );
+    }
+  } else if (primaryMeta) {
+    lines.push(`**Series:** ${primaryMeta}`);
+  }
+
+  lines.push(
+    `**Observations:** ${result.observation_count} | **Staged:** ${result.staged} | **Truncated:** ${result.truncated}`,
+  );
+
+  if (result.staged) {
+    lines.push(
+      `\n> Full dataset staged on canvas${result.truncated ? '; inline observations are a preview' : '; every observation also fits inline'}.` +
+        `\n> **Canvas ID:** \`${result.canvas_id}\`` +
+        `\n> **Table:** \`${result.table_name}\``,
+    );
+  }
+
+  if (result.observations.length > 0) {
+    lines.push('\n| Series Key | Time Period | Value | Status |');
+    lines.push('|:-----------|:------------|------:|:-------|');
+    for (const obs of result.observations) {
+      const val = obs.value != null ? obs.value.toString() : '—';
+      const status = obs.status ?? '—';
+      lines.push(`| ${obs.series_key} | ${obs.time_period} | ${val} | ${status} |`);
+    }
+  }
+
+  lines.push(`\n_${result.source}_`);
+  if (result.retrieval_guidance) lines.push(`\n> ${result.retrieval_guidance}`);
+
+  return [{ type: 'text' as const, text: lines.join('\n') }];
+}
+
+/**
+ * Measure the exact success envelope emitted by mcp-ts-core 0.12.3: validated
+ * domain output in structuredContent, formatter blocks in content[], and the
+ * optional notice enrichment as both a merged field and a trailer block.
+ * A contract boundary test locks this to runToolContract's production shape.
+ */
+function serializedResultChars(result: QueryDatasetResult, notice?: string): number {
+  const content = formatQueryDataset(result);
+  return JSON.stringify({
+    structuredContent: { ...result, ...(notice ? { notice } : {}) },
+    content: notice ? [...content, { type: 'text' as const, text: `\n\n> ${notice}` }] : content,
+  }).length;
+}
+
 export const imfQueryDataset = tool('imf_query_dataset', {
   description:
     'Query an IMF SDMX dataflow by dimension key over a time range. ' +
@@ -210,11 +327,12 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     'Codelists from imf_get_database enumerate the code universe, not actual coverage — ' +
     'valid codes can still return no_data if the combination has no series. ' +
     'start_period and end_period must be valid period strings (YYYY, YYYY-SN, YYYY-QN, ' +
-    'YYYY-MM, or YYYY-MM-DD) with start_period no later than end_period; malformed or ' +
+    'YYYY-MM, or a calendar-valid YYYY-MM-DD) with start_period no later than end_period; malformed or ' +
     'reversed ranges are rejected. ' +
     'A bound covers the whole period it names, so end_period 2023 includes 2023-M12 and 2023-Q4. ' +
     'Large analytical result sets (multi-country, long time range) spill to DataCanvas; ' +
-    'imf_dataframe_query provides SQL analysis of spilled results.',
+    'call imf_dataframe_describe first to inspect staged tables and columns, then ' +
+    'imf_dataframe_query for SQL analysis.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -251,7 +369,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .describe(
         'Start of time range (inclusive). Accepts any of YYYY (annual), ' +
           'YYYY-SN (semi-annual, e.g. 2023-S1), YYYY-QN (quarterly, e.g. 2023-Q1), ' +
-          'YYYY-MM (monthly), or YYYY-MM-DD (daily), whatever the ' +
+          'YYYY-MM (monthly), or a calendar-valid YYYY-MM-DD (daily), whatever the ' +
           "dataflow's frequency. The bound covers the whole period it names, so " +
           'start_period 2023 admits 2023-M01 and 2023-Q1. ' +
           'Observations before this period are excluded from the result.',
@@ -270,7 +388,14 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .optional()
       .describe(
         'Existing canvas ID to accumulate results into across multiple queries. ' +
-          'Omit to allocate a fresh canvas; the response includes a canvas_id when results spill to DataCanvas.',
+          'This selects the destination only; it does not force staging. Use output_mode="canvas" to stage an under-budget result.',
+      ),
+    output_mode: z
+      .enum(['auto', 'canvas'])
+      .default('auto')
+      .describe(
+        'Result placement. auto returns an under-budget result inline and spills only when needed. ' +
+          'canvas explicitly stages the full result, using canvas_id when supplied or allocating a fresh canvas.',
       ),
   }),
   output: z.object({
@@ -312,7 +437,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           .describe('A single time-series observation.'),
       )
       .describe(
-        'Inline observations. Empty when results spilled to canvas (see canvas_id / table_name).',
+        'Inline observation preview. For staged results this may contain the full set or a budget-limited prefix; observation_count remains the full count.',
       ),
     series_attributes: z
       .object({
@@ -373,24 +498,33 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           'against its own entry.',
       ),
     observation_count: z.number().describe('Total observations in the result.'),
+    staged: z
+      .boolean()
+      .describe(
+        'True when the complete observation set is stored on DataCanvas. canvas_id and table_name are present whenever true.',
+      ),
     truncated: z
       .boolean()
       .describe(
-        'True when the result exceeded the inline limit and was staged on a DataCanvas table; ' +
-          'canvas_id and table_name are populated and imf_dataframe_query provides SQL access to the full set.',
+        'True only when observations is an incomplete preview of observation_count. A result can be staged=true and truncated=false when every observation also fits inline.',
       ),
     canvas_id: z
       .string()
       .optional()
       .describe(
-        'DataCanvas session ID — present when truncated=true. ' +
-          'Pass to imf_dataframe_query or imf_dataframe_describe to query the full result.',
+        'DataCanvas session ID — present when staged=true. Pass first to imf_dataframe_describe, then to imf_dataframe_query.',
       ),
     table_name: z
       .string()
       .optional()
       .describe(
-        'DuckDB table name on the canvas — present when truncated=true; reference in SQL via FROM <table_name>.',
+        'DuckDB table name on the canvas — present when staged=true; reference in SQL via FROM <table_name>.',
+      ),
+    retrieval_guidance: z
+      .string()
+      .optional()
+      .describe(
+        'Present on every staged result. Identifies the imf_dataframe_describe-before-imf_dataframe_query retrieval workflow.',
       ),
     source: z
       .string()
@@ -439,7 +573,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'start_period or end_period is not one of the recognized period formats',
       recovery:
-        'Use YYYY (annual), YYYY-SN (semi-annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly), or YYYY-MM-DD (daily).',
+        'Use YYYY (annual), YYYY-SN (semi-annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly), or a calendar-valid YYYY-MM-DD (daily).',
     },
     {
       reason: 'invalid_period_range',
@@ -450,8 +584,22 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     {
       reason: 'structure_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'api.imf.org returns non-200 on the data endpoint',
-      recovery: 'Retry after a short wait.',
+      when: 'The dataflow structure (DSD) cannot be fetched after the dataflow catalog resolved successfully',
+      recovery: 'Retry the structure lookup after a short wait.',
+    },
+    {
+      reason: 'canvas_unavailable',
+      code: JsonRpcErrorCode.ConfigurationError,
+      when: 'output_mode="canvas" was requested but DataCanvas is disabled',
+      recovery:
+        'Enable DataCanvas with CANVAS_PROVIDER_TYPE=duckdb, or omit output_mode/use output_mode="auto" for an inline result.',
+    },
+    {
+      reason: 'response_too_large',
+      code: JsonRpcErrorCode.SerializationError,
+      when: 'Fixed staged-result metadata exceeds the response budget before any observation preview can be included',
+      recovery:
+        'Narrow the dimension key to fewer series so full series_metadata and the staged retrieval handle fit in one response.',
     },
     {
       reason: 'dataflow_list_unavailable',
@@ -468,9 +616,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .string()
       .optional()
       .describe(
-        'Populated when a period bound was set but some observations carry a time_period label ' +
-          'the range filter does not recognize — those rows are returned unfiltered, so the ' +
-          'requested range did not apply to them.',
+        'Populated when a period bound was set but some observations carry a time_period label the range filter does not recognize. Composes with staged retrieval_guidance when both apply.',
       ),
   },
 
@@ -592,25 +738,18 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     }
 
     // Fetch data
-    let queryResult: Awaited<ReturnType<typeof svc.fetchData>>;
-    try {
-      queryResult = await svc.fetchData(
-        dataflow.agencyId,
-        input.dataflow_id,
-        dataflow.version,
-        input.key,
-        input.start_period,
-        input.end_period,
-        ctx,
-        ctx.signal,
-      );
-    } catch {
-      throw ctx.fail(
-        'structure_unavailable',
-        `IMF SDMX data endpoint unavailable for dataflow '${input.dataflow_id}'`,
-        ctx.recoveryFor('structure_unavailable'),
-      );
-    }
+    // Preserve the service's actual McpError code, reason, retryability, and
+    // cause. A data-request failure is not evidence that the DSD was unavailable.
+    const queryResult = await svc.fetchData(
+      dataflow.agencyId,
+      input.dataflow_id,
+      dataflow.version,
+      input.key,
+      input.start_period,
+      input.end_period,
+      ctx,
+      ctx.signal,
+    );
 
     // Drop null-value padding rows (value=null AND status=null).
     // Calendar-padded series carry these for periods before data starts; they add no information.
@@ -750,16 +889,17 @@ export const imfQueryDataset = tool('imf_query_dataset', {
      * before, so say it: the response would otherwise echo a range it did not
      * apply to these rows.
      */
+    let periodNotice: string | undefined;
     if (startSpan || endSpan) {
       const unrecognized = filteredObservations.filter(
         (obs) => periodSpan(obs.time_period) === null,
       );
       if (unrecognized.length > 0) {
         const samples = [...new Set(unrecognized.map((obs) => obs.time_period))].slice(0, 3);
-        ctx.enrich.notice(
+        periodNotice =
           `${unrecognized.length} observation(s) carry a period label this tool cannot parse (${samples.join(', ')}), ` +
-            `so start_period/end_period were not applied to them and they are returned unfiltered.`,
-        );
+          `so start_period/end_period were not applied to them and they are returned unfiltered.`;
+        ctx.enrich.notice(periodNotice);
       }
     }
 
@@ -808,140 +948,107 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       series: seriesKeys.length,
     });
 
-    // Canvas spill path
-    const canvas = getCanvas();
-    if (canvas) {
-      const instance = await canvas.acquire(input.canvas_id, ctx);
-      const rows = filteredObservations.map((obs) => {
-        const attrs = attributesFor(obs.series_key);
-        return {
-          dataflow_id: input.dataflow_id,
-          series_key: obs.series_key,
-          time_period: obs.time_period,
-          value: obs.value,
-          status: obs.status,
-          unit: attrs.unit,
-          scale: attrs.scale,
-          decimals: attrs.decimals,
-        };
-      });
-
-      const result = await spillover({
-        canvas: instance,
-        source: rows,
-        previewChars: PREVIEW_CHARS,
-        signal: ctx.signal,
-      });
-
-      if (result.spilled) {
-        return {
-          dataflow_id: input.dataflow_id,
-          key: input.key,
-          ...(input.start_period ? { start_period: input.start_period } : {}),
-          ...(input.end_period ? { end_period: input.end_period } : {}),
-          observations: result.previewRows.map((r) => ({
-            series_key: r.series_key,
-            time_period: r.time_period,
-            value: r.value,
-            status: r.status,
-          })),
-          series_attributes: seriesAttributes,
-          ...(seriesMetadata ? { series_metadata: seriesMetadata } : {}),
-          observation_count: result.handle.rowCount,
-          truncated: true,
-          canvas_id: instance.canvasId,
-          table_name: result.handle.tableName,
-          source: `Source: International Monetary Fund, ${dataflow.name}, ${IMF_DATA_PORTAL}`,
-        };
-      }
-    }
-
-    // Inline path (no canvas, or result fit in preview)
-    return {
+    const source = `Source: International Monetary Fund, ${dataflow.name}, ${IMF_DATA_PORTAL}`;
+    const base = {
       dataflow_id: input.dataflow_id,
       key: input.key,
       ...(input.start_period ? { start_period: input.start_period } : {}),
       ...(input.end_period ? { end_period: input.end_period } : {}),
-      observations: filteredObservations,
       series_attributes: seriesAttributes,
       ...(seriesMetadata ? { series_metadata: seriesMetadata } : {}),
       observation_count: filteredObservations.length,
-      truncated: false,
-      source: `Source: International Monetary Fund, ${dataflow.name}, ${IMF_DATA_PORTAL}`,
+      source,
     };
-  },
 
-  format: (result) => {
-    const lines: string[] = [];
-    lines.push(`## IMF Data: ${result.dataflow_id} — \`${result.key}\``);
+    const inlineResult = {
+      ...base,
+      observations: filteredObservations,
+      staged: false,
+      truncated: false,
+    } satisfies QueryDatasetResult;
 
-    if (result.start_period || result.end_period) {
-      const range = [result.start_period, result.end_period].filter(Boolean).join(' – ');
-      lines.push(`**Period:** ${range}`);
+    // Canvas stage/spill path
+    const canvas = getCanvas();
+    if (input.output_mode === 'canvas' && !canvas) {
+      throw ctx.fail(
+        'canvas_unavailable',
+        'output_mode="canvas" requires DataCanvas, but no canvas provider is configured',
+        ctx.recoveryFor('canvas_unavailable'),
+      );
+    }
+    const explicit = input.output_mode === 'canvas';
+    if (
+      !canvas ||
+      (!explicit && serializedResultChars(inlineResult, periodNotice) <= RESPONSE_BUDGET_CHARS)
+    ) {
+      return inlineResult;
     }
 
-    /**
-     * Series attributes reach this channel too. A client that forwards only
-     * `content[]` used to see no scale, unit, or precision at all, because the
-     * whole line was gated on a meaningful scale — which also dropped `decimals`
-     * whenever scale was the `"0"` sentinel. The sentinel is still never printed
-     * as a bare `0`; it is named instead, so nothing is suppressed to avoid it.
-     */
-    const { unit, scale, decimals } = result.series_attributes;
-    const primaryMeta = [unit, scaleLabel(scale), decimals != null ? `${decimals} decimals` : null]
-      .filter(Boolean)
-      .join(' | ');
+    const instance = await canvas.acquire(input.canvas_id, ctx);
+    const tableName = `imf_${idGenerator.generateRandomString(8, TABLE_NAME_CHARS)}`;
+    const stageGuidance =
+      'The complete result is staged on DataCanvas. Call imf_dataframe_describe with canvas_id first to inspect tables and columns, then call imf_dataframe_query with canvas_id and SQL against table_name.';
+    const stagedBase = {
+      ...base,
+      staged: true,
+      canvas_id: instance.canvasId,
+      table_name: tableName,
+      retrieval_guidance: stageGuidance,
+    };
 
-    if (result.series_metadata) {
-      const shown = result.series_metadata.slice(0, SERIES_METADATA_PREVIEW_ROWS);
-      const heading =
-        shown.length < result.series_metadata.length
-          ? `\n**Series attributes** — ${shown.length} of ${result.series_metadata.length} series shown; every row on the canvas carries its own unit, scale, and decimals\n`
-          : '\n**Series attributes** — one row per series\n';
-      lines.push(heading);
-      lines.push('| Series Key | Unit | Scale | Decimals |');
-      lines.push('|:-----------|:-----|:------|---------:|');
-      for (const series of shown) {
-        lines.push(
-          `| ${series.series_key} | ${series.unit ?? '—'} | ${scaleLabel(series.scale) ?? '—'} | ${series.decimals ?? '—'} |`,
-        );
-      }
-      // Naming the series the flat field describes keeps a reader from applying
-      // it to the whole table, which is the confusion the table exists to end.
-      if (primaryMeta) {
-        lines.push(
-          `\n\`series_attributes\` describes the first row (${result.series_metadata[0]?.series_key ?? ''}): ${primaryMeta}\n`,
-        );
-      }
-    } else if (primaryMeta) {
-      lines.push(`**Series:** ${primaryMeta}`);
-    }
-
-    lines.push(
-      `**Observations:** ${result.observation_count} | **Truncated:** ${result.truncated}`,
-    );
-
-    if (result.truncated) {
-      lines.push(
-        `\n> Result exceeds inline limit. Full dataset staged on canvas.` +
-          `\n> **Canvas ID:** \`${result.canvas_id}\`` +
-          `\n> **Table:** \`${result.table_name}\`` +
-          `\n> Use \`imf_dataframe_describe\` then \`imf_dataframe_query\` to analyze.`,
+    const minimumResult = {
+      ...stagedBase,
+      observations: [],
+      truncated: filteredObservations.length > 0,
+    } satisfies QueryDatasetResult;
+    const minimumChars = serializedResultChars(minimumResult, periodNotice);
+    if (minimumChars > RESPONSE_BUDGET_CHARS) {
+      throw ctx.fail(
+        'response_too_large',
+        `The staged result's full series metadata and retrieval handle require ${minimumChars} serialized characters before any observation preview (budget ${RESPONSE_BUDGET_CHARS}).`,
+        {
+          seriesCount: seriesKeys.length,
+          serializedChars: minimumChars,
+          budgetChars: RESPONSE_BUDGET_CHARS,
+          ...ctx.recoveryFor('response_too_large'),
+        },
       );
     }
 
-    if (result.observations.length > 0) {
-      lines.push('\n| Series Key | Time Period | Value | Status |');
-      lines.push('|:-----------|:------------|------:|:-------|');
-      for (const obs of result.observations) {
-        const val = obs.value != null ? obs.value.toString() : '—';
-        const status = obs.status ?? '—';
-        lines.push(`| ${obs.series_key} | ${obs.time_period} | ${val} | ${status} |`);
-      }
+    const rows = filteredObservations.map((obs) => {
+      const attrs = attributesFor(obs.series_key);
+      return {
+        dataflow_id: input.dataflow_id,
+        series_key: obs.series_key,
+        time_period: obs.time_period,
+        value: obs.value,
+        status: obs.status,
+        unit: attrs.unit,
+        scale: attrs.scale,
+        decimals: attrs.decimals,
+      };
+    });
+    await instance.registerTable(tableName, rows, { signal: ctx.signal });
+
+    let lo = 0;
+    let hi = filteredObservations.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      const candidate = {
+        ...stagedBase,
+        observations: filteredObservations.slice(0, mid),
+        truncated: mid < filteredObservations.length,
+      } satisfies QueryDatasetResult;
+      if (serializedResultChars(candidate, periodNotice) <= RESPONSE_BUDGET_CHARS) lo = mid;
+      else hi = mid - 1;
     }
 
-    lines.push(`\n_${result.source}_`);
-
-    return [{ type: 'text', text: lines.join('\n') }];
+    return {
+      ...stagedBase,
+      observations: filteredObservations.slice(0, lo),
+      truncated: lo < filteredObservations.length,
+    };
   },
+
+  format: formatQueryDataset,
 });

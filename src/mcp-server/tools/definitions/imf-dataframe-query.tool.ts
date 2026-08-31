@@ -55,7 +55,7 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
     canvas_id: z
       .string()
       .describe(
-        'Canvas ID returned by imf_query_dataset when results were too large for inline delivery.',
+        'Canvas ID returned by imf_query_dataset whenever staged=true. Call imf_dataframe_describe with it before writing SQL.',
       ),
     sql: z
       .string()

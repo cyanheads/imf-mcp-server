@@ -21,7 +21,7 @@ export const imfDataframeDescribe = tool('imf_dataframe_describe', {
     canvas_id: z
       .string()
       .describe(
-        'Canvas ID returned by imf_query_dataset when results were too large for inline delivery.',
+        'Canvas ID returned by imf_query_dataset whenever staged=true, from automatic spillover or output_mode="canvas".',
       ),
   }),
   output: z.object({

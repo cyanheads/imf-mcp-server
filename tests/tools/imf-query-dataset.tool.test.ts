@@ -24,11 +24,6 @@ vi.mock('@/services/canvas/canvas-accessor.js', () => ({
   getCanvas: vi.fn(),
 }));
 
-vi.mock('@cyanheads/mcp-ts-core/canvas', () => ({
-  spillover: vi.fn(),
-}));
-
-import { spillover } from '@cyanheads/mcp-ts-core/canvas';
 import { imfQueryDataset } from '@/mcp-server/tools/definitions/imf-query-dataset.tool.js';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
@@ -214,40 +209,77 @@ describe('imfQueryDataset', () => {
     });
   });
 
-  it('throws ctx.fail("structure_unavailable") when data fetch fails', async () => {
-    mockSvc.fetchData.mockRejectedValue(new Error('connection timeout'));
+  it('#45 preserves the data fetch McpError code, reason, and cause', async () => {
+    const cause = new Error('socket timed out');
+    const dataError = new McpError(
+      JsonRpcErrorCode.Timeout,
+      'IMF data request timed out',
+      {
+        reason: 'upstream_timeout',
+        retryable: true,
+        recovery: { hint: 'Retry the data request.' },
+      },
+      { cause },
+    );
+    mockSvc.fetchData.mockRejectedValue(dataError);
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.NGDP_RPCH.A' });
 
-    await expect(imfQueryDataset.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.ServiceUnavailable,
-      data: { reason: 'structure_unavailable' },
-    });
+    const error = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+    expect(error).toBe(dataError);
+    expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+    expect(error.data).toMatchObject({ reason: 'upstream_timeout', retryable: true });
+    expect(error.cause).toBe(cause);
   });
 
-  it('returns canvas_id and truncated=true when spillover spills', async () => {
-    const mockInstance = { canvasId: 'canvas-abc', describe: vi.fn(), query: vi.fn() };
+  it('#45 preserves the data fetch McpError contract in both MCP result channels', async () => {
+    mockSvc.fetchData.mockRejectedValue(
+      new McpError(JsonRpcErrorCode.Timeout, 'IMF data request timed out', {
+        reason: 'upstream_timeout',
+        retryable: true,
+        recovery: { hint: 'Retry the data request.' },
+      }),
+    );
+
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+    });
+    const error = (
+      result.structuredContent as {
+        error: { code: number; message: string; data: Record<string, unknown> };
+      }
+    ).error;
+    const text = (result.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      message: 'IMF data request timed out',
+      data: { reason: 'upstream_timeout', retryable: true },
+    });
+    expect((error.data.recovery as { hint: string }).hint).toBe('Retry the data request.');
+    expect(text).toContain('IMF data request timed out');
+    expect(text).toContain('Retry the data request.');
+  });
+
+  it('stages an over-budget automatic result with a budget-limited preview', async () => {
+    const observations = Array.from({ length: 1_500 }, (_, index) => ({
+      series_key: 'USA.NGDP_RPCH.A',
+      time_period: `PERIOD_WITH_A_LONG_LABEL_${String(index).padStart(4, '0')}`,
+      value: index + 0.123456,
+      status: null,
+    }));
+    mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations });
+    const registerTable = vi.fn().mockResolvedValue({
+      tableName: 'ignored-by-explicit-registration',
+      rowCount: observations.length,
+      columns: [],
+    });
+    const mockInstance = { canvasId: 'canvas-abc', registerTable };
     const mockCanvasSvc = { acquire: vi.fn().mockResolvedValue(mockInstance) };
     (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue(mockCanvasSvc);
-
-    const spillResult = {
-      spilled: true,
-      handle: { tableName: 'spilled_abc123', rowCount: 1000, columns: [] },
-      previewRows: [
-        {
-          dataflow_id: 'WEO',
-          key: 'USA.NGDP_RPCH.A',
-          time_period: '2020',
-          value: 3.5,
-          status: null,
-          unit: 'Percent',
-          scale: null,
-          decimals: 3,
-        },
-      ],
-      truncated: false,
-    };
-    (spillover as ReturnType<typeof vi.fn>).mockResolvedValue(spillResult);
 
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.NGDP_RPCH.A' });
@@ -255,45 +287,286 @@ describe('imfQueryDataset', () => {
 
     expect(result.truncated).toBe(true);
     expect(result.canvas_id).toBe('canvas-abc');
-    expect(result.table_name).toBe('spilled_abc123');
-    expect(result.observation_count).toBe(1000);
-    // Preview rows surfaced inline
-    expect(result.observations).toHaveLength(1);
-    expect(result.observations[0]!.time_period).toBe('2020');
+    expect(result.table_name).toMatch(/^imf_[0-9a-f]{8}$/);
+    expect(result.observation_count).toBe(observations.length);
+    expect(result.observations.length).toBeLessThan(observations.length);
+    expect(registerTable).toHaveBeenCalledOnce();
     expect(result.source).toBe(
       'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     );
   });
 
-  it('returns inline observations when spillover fits (spilled=false)', async () => {
-    const mockInstance = { canvasId: 'canvas-xyz', describe: vi.fn(), query: vi.fn() };
+  it('returns an under-budget automatic result inline without acquiring a canvas', async () => {
+    const mockInstance = { canvasId: 'canvas-xyz', registerTable: vi.fn() };
     const mockCanvasSvc = { acquire: vi.fn().mockResolvedValue(mockInstance) };
     (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue(mockCanvasSvc);
 
-    // spillover returns fit — all rows fit in preview budget
-    (spillover as ReturnType<typeof vi.fn>).mockResolvedValue({
-      spilled: false,
-      previewRows: MOCK_OBSERVATIONS.map((obs) => ({
-        dataflow_id: 'WEO',
-        key: 'USA.NGDP_RPCH.A',
-        time_period: obs.time_period,
-        value: obs.value,
-        status: obs.status,
-        unit: 'Percent',
-        scale: null,
-        decimals: 3,
-      })),
-    });
-
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.NGDP_RPCH.A' });
-    // When spillover fit returns, the handler falls through to the inline path
     const result = await imfQueryDataset.handler(input, ctx);
 
-    // The inline path is taken (no spill → handler hits the bottom return)
     expect(result.truncated).toBe(false);
     expect(result.canvas_id).toBeUndefined();
     expect(result.observations).toHaveLength(3);
+    expect(mockCanvasSvc.acquire).not.toHaveBeenCalled();
+  });
+
+  it('#39 explicitly stages an under-budget result on a fresh canvas without calling it truncated', async () => {
+    const registerTable = vi.fn().mockResolvedValue({
+      tableName: 'imf_fresh',
+      rowCount: MOCK_OBSERVATIONS.length,
+      columns: [],
+    });
+    const acquire = vi.fn().mockResolvedValue({ canvasId: 'canvas-fresh', registerTable });
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({ acquire });
+
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      output_mode: 'canvas',
+    });
+    const structured = result.structuredContent as Record<string, unknown>;
+
+    expect(acquire).toHaveBeenCalledWith(undefined, expect.anything());
+    expect(registerTable).toHaveBeenCalledOnce();
+    expect(structured).toMatchObject({
+      staged: true,
+      truncated: false,
+      canvas_id: 'canvas-fresh',
+      observation_count: 3,
+    });
+    expect(structured.table_name).toMatch(/^imf_[0-9a-f]{8}$/);
+    expect(structured.observations).toHaveLength(3);
+  });
+
+  it('#39 explicitly stages into an existing canvas, while canvas_id alone keeps auto behavior', async () => {
+    const registerTable = vi.fn().mockResolvedValue({
+      tableName: 'imf_existing',
+      rowCount: MOCK_OBSERVATIONS.length,
+      columns: [],
+    });
+    const acquire = vi.fn().mockResolvedValue({ canvasId: 'canvas-existing', registerTable });
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({ acquire });
+
+    const staged = await imfQueryDataset.handler(
+      imfQueryDataset.input.parse({
+        dataflow_id: 'WEO',
+        key: 'USA.NGDP_RPCH.A',
+        canvas_id: 'canvas-existing',
+        output_mode: 'canvas',
+      }),
+      createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors }),
+    );
+    const automatic = await imfQueryDataset.handler(
+      imfQueryDataset.input.parse({
+        dataflow_id: 'WEO',
+        key: 'USA.NGDP_RPCH.A',
+        canvas_id: 'canvas-existing',
+      }),
+      createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors }),
+    );
+
+    expect(acquire).toHaveBeenCalledWith('canvas-existing', expect.anything());
+    expect(staged).toMatchObject({ staged: true, truncated: false });
+    expect(automatic).toMatchObject({ staged: false, truncated: false });
+  });
+
+  it('#39 returns canvas_unavailable recovery for explicit staging when DataCanvas is disabled', async () => {
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      output_mode: 'canvas',
+    });
+    const error = (
+      result.structuredContent as { error: { code: number; data: Record<string, unknown> } }
+    ).error;
+
+    expect(error.code).toBe(JsonRpcErrorCode.ConfigurationError);
+    expect(error.data).toMatchObject({ reason: 'canvas_unavailable' });
+    expect((error.data.recovery as { hint: string }).hint).toContain('CANVAS_PROVIDER_TYPE=duckdb');
+  });
+
+  it('#39 keeps no_data semantics for an empty explicit staging request', async () => {
+    mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations: [] });
+    const registerTable = vi.fn();
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+      acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-empty', registerTable }),
+    });
+
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      output_mode: 'canvas',
+    });
+    const error = (result.structuredContent as { error: { data: Record<string, unknown> } }).error;
+
+    expect(error.data).toMatchObject({ reason: 'no_data' });
+    expect(registerTable).not.toHaveBeenCalled();
+  });
+
+  it('#41 puts describe-before-query guidance in both result channels and composes period caveats', async () => {
+    mockSvc.fetchData.mockResolvedValue({
+      ...MOCK_QUERY_RESULT,
+      observations: [
+        ...MOCK_OBSERVATIONS,
+        { series_key: 'USA.NGDP_RPCH.A', time_period: '2023-W07', value: 1, status: null },
+      ],
+    });
+    const registerTable = vi.fn().mockResolvedValue({
+      tableName: 'imf_guidance',
+      rowCount: 4,
+      columns: [],
+    });
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+      acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-guidance', registerTable }),
+    });
+
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+      end_period: '2023',
+      output_mode: 'canvas',
+    });
+    const structured = result.structuredContent as {
+      notice: string;
+      retrieval_guidance: string;
+    };
+    const text = (result.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    for (const channel of [`${structured.retrieval_guidance} ${structured.notice}`, text]) {
+      expect(channel).toContain('imf_dataframe_describe');
+      expect(channel).toContain('imf_dataframe_query');
+      expect(channel.indexOf('imf_dataframe_describe')).toBeLessThan(
+        channel.indexOf('imf_dataframe_query'),
+      );
+      expect(channel).toContain('2023-W07');
+      expect(channel).toContain('unfiltered');
+    }
+  });
+
+  it('#48 keeps an under-budget automatic result inline instead of staging on a row-size proxy', async () => {
+    const observations = Array.from({ length: 350 }, (_, index) => ({
+      series_key: 'USA.NGDP_RPCH.A',
+      time_period: `P${String(index).padStart(4, '0')}`,
+      value: index + 0.123456,
+      status: null,
+    }));
+    mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations });
+    const acquire = vi.fn().mockResolvedValue({ canvasId: 'canvas-proxy' });
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({ acquire });
+
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+    });
+    const structured = result.structuredContent as { staged: boolean };
+
+    expect(JSON.stringify(result).length).toBeLessThanOrEqual(100_000);
+    expect(structured.staged).toBe(false);
+    expect(acquire).not.toHaveBeenCalled();
+  });
+
+  it('#48 budgets the serialized whole staged MCP result without dropping series metadata', async () => {
+    const series = Array.from(
+      { length: 210 },
+      (_, index) => `C${String(index).padStart(3, '0')}.INDICATOR_WITH_A_LONG_IDENTIFIER.A`,
+    );
+    const observations = Array.from({ length: 800 }, (_, index) => ({
+      series_key: series[index % series.length]!,
+      time_period: `${1950 + (index % 74)}`,
+      value: index + 0.123456,
+      status: null,
+    })).concat({
+      series_key: series[0]!,
+      time_period: '2023-W07',
+      value: 999.123456,
+      status: null,
+    });
+    mockSvc.fetchData.mockResolvedValue({
+      ...MOCK_QUERY_RESULT,
+      observations,
+      seriesAttributesByKey: Object.fromEntries(series.map((key) => [key, NGDPD_ATTRS])),
+    });
+    const registerTable = vi.fn().mockResolvedValue({
+      tableName: 'imf_budget',
+      rowCount: observations.length,
+      columns: [],
+    });
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+      acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-budget', registerTable }),
+    });
+
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: '*.INDICATOR_WITH_A_LONG_IDENTIFIER.A',
+      end_period: '2023',
+    });
+    const structured = result.structuredContent as {
+      notice: string;
+      observation_count: number;
+      observations: unknown[];
+      retrieval_guidance: string;
+      series_metadata: unknown[];
+      staged: boolean;
+      truncated: boolean;
+    };
+    const text = (result.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    const serializedChars = JSON.stringify(result).length;
+    expect(serializedChars).toBeGreaterThan(99_000);
+    expect(serializedChars).toBeLessThanOrEqual(100_000);
+    expect(structured).toMatchObject({ observation_count: 801, staged: true, truncated: true });
+    expect(structured.observations.length).toBeLessThan(801);
+    expect(structured.series_metadata).toHaveLength(210);
+    expect(structured.retrieval_guidance).toContain('imf_dataframe_describe');
+    expect(structured.notice).toContain('2023-W07');
+    expect(text).toContain(structured.retrieval_guidance);
+    expect(text).toContain(structured.notice);
+  });
+
+  it('#48 returns an actionable error when fixed staged metadata alone exceeds the budget', async () => {
+    const series = Array.from(
+      { length: 1_200 },
+      (_, index) => `C${String(index).padStart(4, '0')}.${'LONG_INDICATOR_'.repeat(8)}.A`,
+    );
+    const observations = series.map((series_key, index) => ({
+      series_key,
+      time_period: '2023',
+      value: index,
+      status: null,
+    }));
+    mockSvc.fetchData.mockResolvedValue({
+      ...MOCK_QUERY_RESULT,
+      observations,
+      seriesAttributesByKey: Object.fromEntries(series.map((key) => [key, NGDPD_ATTRS])),
+    });
+    const registerTable = vi.fn();
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+      acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-too-large', registerTable }),
+    });
+
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: '*.NGDPD.A',
+      output_mode: 'canvas',
+    });
+    const error = (
+      result.structuredContent as { error: { code: number; data: Record<string, unknown> } }
+    ).error;
+    const text = (result.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(error.code).toBe(JsonRpcErrorCode.SerializationError);
+    expect(error.data).toMatchObject({ reason: 'response_too_large' });
+    expect((error.data.recovery as { hint: string }).hint).toContain('Narrow the dimension key');
+    expect(text).toContain("The staged result's full series metadata");
+    expect(text).toContain('Narrow the dimension key');
+    expect(registerTable).not.toHaveBeenCalled();
   });
 
   it('formats inline observations as markdown table', () => {
@@ -303,6 +576,7 @@ describe('imfQueryDataset', () => {
       observations: MOCK_OBSERVATIONS,
       series_attributes: MOCK_SERIES_ATTRS,
       observation_count: 3,
+      staged: false,
       truncated: false,
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
@@ -341,6 +615,7 @@ describe('imfQueryDataset', () => {
       observations: MOCK_OBSERVATIONS,
       series_attributes: { unit: null, scale: '0', decimals: 0 },
       observation_count: 3,
+      staged: false,
       truncated: false,
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
@@ -359,6 +634,7 @@ describe('imfQueryDataset', () => {
       observations: MOCK_OBSERVATIONS,
       series_attributes: { unit: null, scale: '0', decimals: 0 },
       observation_count: 3,
+      staged: false,
       truncated: false,
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
@@ -375,6 +651,7 @@ describe('imfQueryDataset', () => {
       observations: MOCK_OBSERVATIONS,
       series_attributes: { unit: 'Percent', scale: '0', decimals: 2 },
       observation_count: 3,
+      staged: false,
       truncated: false,
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
@@ -392,6 +669,7 @@ describe('imfQueryDataset', () => {
       observations: MOCK_OBSERVATIONS,
       series_attributes: { unit: 'US Dollar', scale: '9', decimals: 3 },
       observation_count: 3,
+      staged: false,
       truncated: false,
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
@@ -407,6 +685,7 @@ describe('imfQueryDataset', () => {
       observations: MOCK_OBSERVATIONS,
       series_attributes: { unit: null, scale: null, decimals: null },
       observation_count: 3,
+      staged: false,
       truncated: false,
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
@@ -422,9 +701,12 @@ describe('imfQueryDataset', () => {
       observations: [],
       series_attributes: MOCK_SERIES_ATTRS,
       observation_count: 5000,
+      staged: true,
       truncated: true,
       canvas_id: 'canvas-abc',
       table_name: 'spilled_abc123',
+      retrieval_guidance:
+        'Call imf_dataframe_describe first, then imf_dataframe_query against the staged table.',
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
     const blocks = imfQueryDataset.format!(output);
@@ -756,6 +1038,7 @@ describe('imfQueryDataset', () => {
       observations: MOCK_OBSERVATIONS,
       series_attributes: MOCK_SERIES_ATTRS,
       observation_count: 3,
+      staged: false,
       truncated: false,
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
@@ -1058,6 +1341,31 @@ describe('imfQueryDataset', () => {
     }
   });
 
+  it('#35 rejects calendar-invalid daily bounds before every upstream call', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+    for (const start_period of ['2023-02-29', '2023-02-30', '2023-04-31', '2023-11-31']) {
+      const input = imfQueryDataset.input.parse({
+        dataflow_id: 'WEO',
+        key: 'USA.NGDP_RPCH.A',
+        start_period,
+      });
+      await expect(imfQueryDataset.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'invalid_period_format', field: 'start_period', value: start_period },
+      });
+    }
+
+    expect(mockSvc.findDataflow).not.toHaveBeenCalled();
+    expect(mockSvc.fetchDataflowStructure).not.toHaveBeenCalled();
+    expect(mockSvc.fetchData).not.toHaveBeenCalled();
+  });
+
+  it('#35 accepts a valid leap day and preserves non-daily period controls', async () => {
+    for (const start_period of ['2024-02-29', '2024', '2024-S1', '2024-Q1', '2024-02']) {
+      await expect(periodsReturned(['2024'], { start_period })).resolves.toEqual(['2024']);
+    }
+  });
+
   it('#21 accepts every label shape the portal emits as a bound, so time_period round-trips', async () => {
     // Each of these is a label some dataflow returns in time_period; a caller
     // that feeds one back as a bound must not be told it is malformed.
@@ -1321,6 +1629,26 @@ describe('imfQueryDataset', () => {
     expect(imfQueryDataset.description).toContain('*');
   });
 
+  it('#35 advertises calendar validity in the public daily-period contract and recovery', () => {
+    const startDescription = imfQueryDataset.input.shape.start_period.description ?? '';
+    const recovery = imfQueryDataset.errors?.find(
+      (entry) => entry.reason === 'invalid_period_format',
+    )?.recovery;
+
+    expect(startDescription).toContain('calendar-valid YYYY-MM-DD');
+    expect(recovery).toContain('calendar-valid YYYY-MM-DD');
+  });
+
+  it('#41 advertises describe-before-query in the tool-level staged-result workflow', () => {
+    const description = imfQueryDataset.description;
+
+    expect(description).toContain('imf_dataframe_describe');
+    expect(description).toContain('imf_dataframe_query');
+    expect(description.indexOf('imf_dataframe_describe')).toBeLessThan(
+      description.indexOf('imf_dataframe_query'),
+    );
+  });
+
   it('#23 declares empty_key_segment in the error contract', () => {
     const entry = imfQueryDataset.errors?.find((e) => e.reason === 'empty_key_segment');
     expect(entry?.code).toBe(JsonRpcErrorCode.ValidationError);
@@ -1464,24 +1792,27 @@ describe('imfQueryDataset', () => {
   });
 
   it('#15 stages each canvas row with its own series attributes, not the last series decoded', async () => {
-    const mockInstance = { canvasId: 'canvas-multi', describe: vi.fn(), query: vi.fn() };
+    let staged: Array<Record<string, unknown>> = [];
+    const registerTable = vi.fn(
+      async (_tableName: string, rows: Array<Record<string, unknown>>) => {
+        staged = rows;
+        return { tableName: 'imf_multi', rowCount: rows.length, columns: [] };
+      },
+    );
+    const mockInstance = { canvasId: 'canvas-multi', registerTable };
     (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
       acquire: vi.fn().mockResolvedValue(mockInstance),
     });
-    let staged: Array<Record<string, unknown>> = [];
-    (spillover as ReturnType<typeof vi.fn>).mockImplementation(
-      ({ source }: { source: Array<Record<string, unknown>> }) => {
-        staged = source;
-        return Promise.resolve({
-          spilled: true,
-          handle: { tableName: 'spilled_multi', rowCount: source.length, columns: [] },
-          previewRows: source.slice(0, 2),
-          truncated: false,
-        });
-      },
-    );
+    mockSvc.fetchData.mockResolvedValue(TWO_SERIES_RESULT);
 
-    await twoSeriesResult();
+    await imfQueryDataset.handler(
+      imfQueryDataset.input.parse({
+        dataflow_id: 'WEO',
+        key: 'USA.NGDP_RPCH+NGDPD.A',
+        output_mode: 'canvas',
+      }),
+      createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors }),
+    );
 
     // Every staged row must carry the scale of the series named in that row.
     for (const row of staged) {
@@ -1490,27 +1821,29 @@ describe('imfQueryDataset', () => {
     expect(staged.filter((row) => row.series_key === 'USA.NGDPD.A')).toHaveLength(2);
   });
 
-  it('#15 carries per-series metadata through the spill response too', async () => {
-    const mockInstance = { canvasId: 'canvas-multi', describe: vi.fn(), query: vi.fn() };
+  it('#15 carries per-series metadata through a staged response too', async () => {
+    const registerTable = vi.fn().mockResolvedValue({
+      tableName: 'imf_multi',
+      rowCount: TWO_SERIES_RESULT.observations.length,
+      columns: [],
+    });
+    const mockInstance = { canvasId: 'canvas-multi', registerTable };
     (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
       acquire: vi.fn().mockResolvedValue(mockInstance),
     });
-    (spillover as ReturnType<typeof vi.fn>).mockImplementation(
-      ({ source }: { source: Array<Record<string, unknown>> }) =>
-        Promise.resolve({
-          spilled: true,
-          handle: { tableName: 'spilled_multi', rowCount: source.length, columns: [] },
-          previewRows: source.slice(0, 1),
-          truncated: false,
-        }),
+    mockSvc.fetchData.mockResolvedValue(TWO_SERIES_RESULT);
+
+    const result = await imfQueryDataset.handler(
+      imfQueryDataset.input.parse({
+        dataflow_id: 'WEO',
+        key: 'USA.NGDP_RPCH+NGDPD.A',
+        output_mode: 'canvas',
+      }),
+      createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors }),
     );
 
-    const result = await twoSeriesResult();
-
-    expect(result.truncated).toBe(true);
-    // The preview shows one series; the staged table holds both, so the metadata
-    // has to describe the staged set rather than what happened to fit inline.
-    expect(result.observations).toHaveLength(1);
+    expect(result).toMatchObject({ staged: true, truncated: false });
+    expect(result.observations).toHaveLength(4);
     expect(result.series_metadata?.map((series) => series.series_key)).toEqual([
       'USA.NGDPD.A',
       'USA.NGDP_RPCH.A',
@@ -1555,7 +1888,8 @@ describe('imfQueryDataset', () => {
     // so counting the attribute shape is what measures the rendered table.
     const attributeRows = text.match(/\|\s*C\d{3}\.NGDPD\.A\s*\|\s*US Dollar\s*\|/g) ?? [];
     expect(attributeRows).toHaveLength(20);
-    expect(text).toContain('canvas');
+    expect(text).toContain('every entry remains in structuredContent');
+    expect(text).not.toContain('canvas');
   });
 
   // -------------------------------------------------------------------------

@@ -24,7 +24,7 @@ await createApp({
     'IMF SDMX 3.0 macroeconomic data server. Keyless — no API key required.\n' +
     'Workflow: imf_list_databases → imf_get_database → imf_query_dataset\n' +
     'Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE).\n' +
-    'Large multi-country queries spill to DataCanvas; use imf_dataframe_query for SQL analysis.\n' +
+    'Large multi-country queries spill to DataCanvas, and imf_query_dataset output_mode="canvas" explicitly stages smaller results. For any staged result, call imf_dataframe_describe before imf_dataframe_query.\n' +
     'Key legacy note: the IFS monolithic database is decomposed — use CPI, ER, IL, MFS_* instead.',
   setup(core) {
     const cfg = getServerConfig();

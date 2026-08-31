@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -69,12 +69,13 @@ Query an IMF SDMX dataflow by dimension key over a time range.
 
 - Dot-separated key in DSD keyPosition order (e.g. `USA.NGDP_RPCH.A` for WEO annual GDP at constant prices, percent change)
 - `+` combines codes at one position (e.g. `USA+GBR+DEU.NGDP_RPCH.A`); `*` matches every code at a position (`*.NGDP_RPCH.A` for all countries, `CAN.*.A` for every indicator). Every position needs a code or a `*` — a blank segment matches nothing upstream and is rejected
-- `start_period` / `end_period` accept `YYYY`, `YYYY-SN`, `YYYY-QN`, `YYYY-MM`, or `YYYY-MM-DD` whatever the series frequency, and cover the whole period they name — `end_period: 2023` includes `2023-M12` and `2023-Q4`
+- `start_period` / `end_period` accept `YYYY`, `YYYY-SN`, `YYYY-QN`, `YYYY-MM`, or a calendar-valid `YYYY-MM-DD` whatever the series frequency, and cover the whole period they name — `end_period: 2023` includes `2023-M12` and `2023-Q4`
 - Returns observations with `time_period`, `value`, `status`, and series attributes (`unit`, `scale`, `decimals`). Period labels come back as upstream emits them — `2023`, `2023-S1`, `2023-Q1`, `2023-M01`, `2023-01-05` — and any of them can be passed straight back in as a bound
 - A key resolving to several series carries `series_metadata`, one `unit`/`scale`/`decimals` entry per `series_key`, because attributes differ between them: in `USA.NGDPD+NGDP_RPCH.*`, `NGDPD` is `USD` at scale `9` while `NGDP_RPCH` is `PT` and unscaled. Canvas rows carry their own series' attributes too. A single-series query keeps the flat `series_attributes` and no list
 - `unit` is the upstream code — `PT`, `USD`, `XDC`, `IX`, `NUM`. Every key shape reports the same unit: the portal drops the unit block when a key uses `+` on the dimension that carries it, and one extra attributes-only request recovers it, so `USA.NGDP_RPCH+NGDPD.A` and `USA.NGDP_RPCH+NGDPD.*` both report `USD` and `PT`. That key shape is the only one that costs the second request; every other query makes one. A `unit: null` therefore means the dataflow publishes none, which many do
 - Scale `0` is the upstream sentinel for "no multiplier" — formatted output names it rather than printing a bare `0`, and `structuredContent` keeps the raw code
-- Large multi-country or long time-range queries automatically spill to DataCanvas — `canvas_id` and `table_name` are returned for SQL follow-up
+- Large multi-country or long time-range queries automatically spill to DataCanvas; set `output_mode: "canvas"` to explicitly stage any result, using `canvas_id` as the destination when supplied
+- `staged` reports whether the complete result is on DataCanvas; `truncated` reports only whether `observations` is an incomplete preview. Staged results always return `canvas_id`, `table_name`, and describe-before-query guidance in both MCP result channels
 - `no_data` errors include availability context from the upstream constraint endpoint: a dataflow that publishes no series at all is reported as such and points at a different dataflow, since no key would work; otherwise `series_count=0` means the code has no coverage and `dataflow_availability` names codes that do, while `series_count>0` means the combination is wrong and `available_codes` lists what does have data per dimension, stating how many of how many it is showing when a dimension is too long to list in full
 - A valid key whose data lies entirely outside the requested range fails as `no_data_in_range`, reporting the range the series actually spans — the fix is the range, not the key
 
@@ -84,9 +85,9 @@ Query an IMF SDMX dataflow by dimension key over a time range.
 
 In-conversation SQL analytics over the observation tables that `imf_query_dataset` stages on a DuckDB-backed canvas.
 
-When `imf_query_dataset` returns `truncated: true`, the full dataset is registered as a named table on the canvas. The workflow:
+When `imf_query_dataset` returns `staged: true`, the full dataset is registered as a named table on the canvas. The workflow:
 
-1. Call `imf_query_dataset` — if `truncated: true`, note the `canvas_id` and `table_name`
+1. Call `imf_query_dataset` — let large results spill automatically or set `output_mode: "canvas"`; when `staged: true`, note the `canvas_id` and `table_name`
 2. Call `imf_dataframe_describe` with the `canvas_id` to discover table schema
 3. Call `imf_dataframe_query` with a SELECT statement for aggregations, cross-country comparisons, or time-series analysis
 
@@ -128,7 +129,7 @@ Agent-friendly output:
 - Codelist entries carry both the machine code and human-readable label — agents can present meaningful names without a follow-up lookup
 - `key_format` field in every dataflow response explicitly states the dimension order, removing guesswork for key construction
 - Observations include `status` flags (e.g. `E` for estimate) so agents can communicate data quality caveats
-- Canvas spill is transparent — `truncated`, `canvas_id`, and `table_name` are always present in the output schema, letting callers branch on data rather than heuristics
+- Canvas placement is explicit — `staged` distinguishes storage from `truncated` preview completeness, and staged results carry `canvas_id`, `table_name`, and retrieval guidance
 
 ## Getting started
 

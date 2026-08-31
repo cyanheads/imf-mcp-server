@@ -8,7 +8,7 @@
 |:-----|:------------|:-----------|:------------|
 | `imf_list_databases` | List IMF SDMX dataflows available on the portal, one page at a time. Returns id, agencyID, version, name, and a shortened description. Entry point — every query requires a dataflow id. | `filter` (optional name substring), `include_vintages` (bool, default false), `limit` (1–200, default 50), `offset` (default 0) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_get_database` | Fetch bounded codelist previews for every dimension, or page one exact `dimension_id` after an optional substring filter. Resolves human terms to SDMX codes ("United States" → USA, "Constant prices" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional), `codelist_filter` (optional substring), `dimension_id` (optional exact selector), `limit` (1–200), `offset` (requires `dimension_id`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, and status, plus unit/scale/decimals per series. Large analytical result sets spill to DataCanvas for SQL — returns `canvas_id` + `table_name`. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, and status, plus unit/scale/decimals per series. Large analytical result sets spill to DataCanvas; `output_mode: canvas` explicitly stages any result. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional destination), `output_mode` (`auto` or `canvas`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call. Shows table name, row count, and column schema. | `canvas_id` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_dataframe_query` | Run a read-only SQL SELECT against a staged DataCanvas table. Enables multi-country comparisons, time-series aggregation, and cross-indicator joins without hand-rolled loops. | `canvas_id`, `sql` (one SELECT statement; a leading `WITH … SELECT` CTE is accepted) | `readOnlyHint: true`, `openWorldHint: false` |
 
@@ -98,7 +98,8 @@ errors: [
 
 **Input constraints:**
 - `key`: string — dot-separated dimension codes in DSD `keyPosition` order, one segment per dimension. Use `+` to combine codes at one position (e.g. `USA+GBR.NGDP_RPCH.A`) and `*` to match every code at a position (e.g. `*.NGDP_RPCH.A`). Every position needs a code or a `*`; a blank segment (`USA..A`) is rejected as `empty_key_segment`, and an omitted position is rejected as `key_dimension_mismatch`. Country codes are ISO 3-letter (USA, not US). Call `imf_get_database` first to obtain the correct `key_format` and valid codes.
-- `start_period` / `end_period`: string — `YYYY` (annual), `YYYY-SN` (semi-annual), `YYYY-QN` (quarterly, e.g. `2023-Q1`), `YYYY-MM` (monthly), or `YYYY-MM-DD` (daily), independent of the dataflow's own frequency. Every label the portal emits is also accepted as a bound, so an observation's `time_period` round-trips. Omit either to use the full available range. Malformed values and reversed ranges are rejected before the upstream call.
+- `start_period` / `end_period`: string — `YYYY` (annual), `YYYY-SN` (semi-annual), `YYYY-QN` (quarterly, e.g. `2023-Q1`), `YYYY-MM` (monthly), or a calendar-valid `YYYY-MM-DD` (daily), independent of the dataflow's own frequency. Every label the portal emits is also accepted as a bound, so an observation's `time_period` round-trips. Omit either to use the full available range. Malformed or calendar-invalid values and reversed ranges are rejected before the upstream call.
+- `output_mode`: `auto | canvas` — `auto` preserves spill-only behavior. `canvas` stages the full result on a fresh or supplied `canvas_id`; supplying `canvas_id` alone never forces staging.
 
 **Output (inline, no canvas spill):**
 - `dataflow_id`, `key`, `start_period`, `end_period`
@@ -106,14 +107,15 @@ errors: [
 - `series_attributes`: `{ unit: string | null, scale: string | null, decimals: number | null }` — the **first** series in the result
 - `series_metadata`: array of `{ series_key, unit, scale, decimals }`, present only when the query resolved to more than one series
 - `observation_count`: number
-- `truncated`: boolean (true when result was trimmed to preview budget; set `canvas_id` to retrieve full set)
+- `staged`: boolean (true when the complete result is stored on DataCanvas)
+- `truncated`: boolean (true only when inline `observations` is a strict preview of `observation_count`; independent of `staged`)
 
 **Output (canvas spill):**
-- `canvas_id`: string — pass to `imf_dataframe_query` / `imf_dataframe_describe`
+- `canvas_id`: string — present whenever `staged`; pass to `imf_dataframe_describe` before `imf_dataframe_query`
 - `table_name`: string
 - `observation_count`: number
 - `series_metadata` — as above, describing the whole staged table rather than the inline preview
-- `truncated: true`
+- `staged: true`; `truncated` is true only when the inline preview omits observations
 
 **Error contract:**
 ```
@@ -135,13 +137,19 @@ errors: [
     recovery: 'Put * at that position to match every code there, or a code from imf_get_database to pin it.' },
   { reason: 'invalid_period_format', code: ValidationError,
     when: 'start_period or end_period is not one of the recognized period formats',
-    recovery: 'Use YYYY (annual), YYYY-SN (semi-annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly), or YYYY-MM-DD (daily).' },
+    recovery: 'Use YYYY (annual), YYYY-SN (semi-annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly), or a calendar-valid YYYY-MM-DD (daily).' },
   { reason: 'invalid_period_range', code: ValidationError,
     when: 'start_period is later than end_period',
     recovery: 'Provide start_period less than or equal to end_period (chronological order).' },
   { reason: 'structure_unavailable', code: ServiceUnavailable,
-    when: 'api.imf.org returns non-200 on the data endpoint',
-    recovery: 'Retry after a short wait.' },
+    when: 'The dataflow structure cannot be fetched after catalog resolution',
+    recovery: 'Retry the structure lookup after a short wait.' },
+  { reason: 'canvas_unavailable', code: ConfigurationError,
+    when: 'output_mode="canvas" was requested while DataCanvas is disabled',
+    recovery: 'Enable CANVAS_PROVIDER_TYPE=duckdb or use output_mode="auto".' },
+  { reason: 'response_too_large', code: SerializationError,
+    when: 'Full series metadata and the staged retrieval handle exceed the response budget before any observation preview',
+    recovery: 'Narrow the dimension key to fewer series so full series_metadata and the handle fit.' },
   { reason: 'dataflow_list_unavailable', code: ServiceUnavailable, retryable: true,
     when: 'The dataflow catalog that dataflow_id is resolved against could not be fetched',
     recovery: 'Retry in a few moments; the catalog is cached for an hour once it succeeds.' },
@@ -200,7 +208,7 @@ None — this is a pure data server; no reusable message templates warranted.
 
 Global macroeconomic and financial statistics from the International Monetary Fund, accessed via the IMF's SDMX 3.0 portal (`api.imf.org`). Covers hundreds of dataflows including WEO projections, balance of payments, exchange rates, price indices, international liquidity, government finance, and national accounts for ~190 member countries.
 
-The server follows the **discover → describe → query** workflow: `imf_list_databases` to find a dataflow id, `imf_get_database` to resolve dimension codes, `imf_query_dataset` to fetch observations. Large analytical pulls (multi-country time series) spill to a DataCanvas table for SQL via `imf_dataframe_query`.
+The server follows the **discover → describe → query** workflow: `imf_list_databases` to find a dataflow id, `imf_get_database` to resolve dimension codes, `imf_query_dataset` to fetch observations. Large analytical pulls spill automatically and smaller pulls can be staged explicitly. A staged handle is consumed through `imf_dataframe_describe` before `imf_dataframe_query`.
 
 **Audience:** Economists, macro/sovereign-risk analysts, development researchers, financial journalists, and agents answering questions like "what's country X's current-account balance?", "how do WEO projections compare across emerging markets?", or "what are US inflation trends since 2010?"
 
@@ -278,7 +286,7 @@ Each step is independently testable.
 | 3 | `GET /data/dataflow/{agency}/{flow}/{version}/{key}?startPeriod=&endPeriod=` | Fetch observations |
 | 3b | `GET /data/dataflow/.../{key with one position widened to `*`}?attributes=series&measures=none` (conditional) | Recover a dimension-group attribute a `+` key suppressed upstream (decision 17) |
 | 4 | Observation decode | Map positional indices to time labels via `structures[0].dimensions.observation[0].values` |
-| 5 | Spillover check | If result is analytical + exceeds preview budget, register to DataCanvas and return handle |
+| 5 | Placement + final-result budget | Explicitly stage when requested, otherwise spill an oversized analytical result; size the complete MCP result envelope and rebalance only the observation preview |
 
 Steps 1–2 are cache candidates (DSD rarely changes; dataflow list changes when IMF publishes new vintages). Step 3 is always live. Step 3b runs only for the response shape it can repair — a `+` key whose group came back empty — so every other query stays at one data request, and its failure leaves the query exactly as step 3 answered it.
 
@@ -304,7 +312,7 @@ The `api.imf.org` portal does not require registration for data queries. All dat
 
 ### 2. DataCanvas: adopted
 
-IMF macro data is inherently analytical — multi-country GDP comparisons, BOP time series, WEO cross-country projections. An agent querying 30 countries × 5 indicators × 20 years = 3,000 observations is exactly the "agent would run `GROUP BY country`" shape that earns a canvas. DataCanvas is adopted. The spill threshold uses `previewChars: 100_000` (~25k tokens inline; anything larger spills to DuckDB for SQL).
+IMF macro data is inherently analytical — multi-country GDP comparisons, BOP time series, WEO cross-country projections. An agent querying 30 countries × 5 indicators × 20 years = 3,000 observations is exactly the "agent would run `GROUP BY country`" shape that earns a canvas. DataCanvas is adopted. Automatic placement measures the actual MCP success result (`structuredContent` plus rendered `content[]`, including enrichment trailers) and stages only when that result exceeds 100,000 serialized characters. Series metadata, handles, attribution, guidance, and truthful `observation_count` are fixed; the observation preview is reduced to meet the cap. If those fixed fields alone exceed the budget, the tool returns `response_too_large` and asks the caller to narrow the series key rather than silently dropping metadata.
 
 The `canvas_id` from `imf_query_dataset` is reachable via `imf_dataframe_query` and `imf_dataframe_describe` — no dead handles.
 
@@ -330,8 +338,8 @@ The portal exposes 70+ `_VINTAGE` dataflows (e.g. `WEO_2025_OCT_VINTAGE`, `CPI_2
 
 `imf_query_dataset` has two output paths (inline observations vs. canvas spill) — both must be content-complete in `format()`:
 
-- **Inline path:** render `key_format`, `start_period`–`end_period` context, unit/scale, and the observations as a markdown table (time_period | value | status). Append a `truncated: true` notice with the suggestion to use `canvas_id` if applicable.
-- **Canvas spill path:** render the canvas handle summary — `canvas_id`, `table_name`, `observation_count` — plus instructions for follow-up (`imf_dataframe_describe` → `imf_dataframe_query`). Claude Desktop clients see only `content[]`; without this, they receive no usable data on spill.
+- **Inline path:** render `start_period`–`end_period` context, unit/scale, and observations as a markdown table. `staged: false` and `truncated: false` describe the default under-budget result.
+- **Canvas path:** render the canvas handle summary — `canvas_id`, `table_name`, `observation_count`, `staged`, and `truncated` — plus instructions for follow-up (`imf_dataframe_describe` → `imf_dataframe_query`). The same instructions are carried in `structuredContent.retrieval_guidance`; when an unparsed-period `notice` also applies, both fields and both content blocks are returned together.
 
 `imf_get_database` format: render `key_format` prominently (first line), then each dimension with its codelist entries and page counts. Every preview is bounded at 50; a selected `dimension_id` can use `limit`/`offset`, and `next_offset` names the continuation call. A dimension with no entries renders one of three states: filter miss, offset past the end, or unresolved codelist.
 
