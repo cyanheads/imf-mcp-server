@@ -50,6 +50,8 @@ export const imfListDatabases = tool('imf_list_databases', {
   input: z.object({
     filter: z
       .string()
+      .trim()
+      .min(1)
       .optional()
       .describe(
         'Optional name, ID, or description substring to filter results. Case-insensitive. ' +
@@ -153,7 +155,7 @@ export const imfListDatabases = tool('imf_list_databases', {
     const totalBeforeFilter = dataflows.length;
 
     // Name/ID substring filter
-    const filterLower = input.filter?.toLowerCase().trim();
+    const filterLower = input.filter?.toLowerCase();
     if (filterLower) {
       dataflows = dataflows.filter(
         (df) =>

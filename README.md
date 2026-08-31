@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -33,8 +33,8 @@ Six tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed ca
 
 | Tool | Description |
 |:-----|:------------|
-| `imf_list_databases` | List IMF SDMX dataflows available on the portal, a page at a time, with optional name/ID substring filtering |
-| `imf_get_database` | Fetch a dataflow's dimension list and a codelist preview per dimension — resolves human terms to SDMX codes before querying |
+| `imf_list_databases` | List IMF SDMX dataflows available on the portal, a page at a time, with optional name/ID/description substring filtering |
+| `imf_get_database` | Fetch a dataflow's dimensions and page either its codelists or the codes with published data — resolves human terms to SDMX codes before querying |
 | `imf_query_dataset` | Query a dataflow by dimension key over a time range; large result sets spill to DataCanvas |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call |
 | `imf_dataframe_query` | Run a read-only SQL SELECT across staged DataCanvas tables for multi-country comparisons and aggregations |
@@ -60,6 +60,7 @@ Resolve human-readable terms to SDMX dimension codes before querying.
 - Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE)
 - `key_format` field shows the exact dot-separated dimension order required by `imf_query_dataset`
 - Every codelist preview is bounded at 50 entries, including substring-filtered previews. Set `dimension_id` to page one codelist with `limit`/`offset`; `codelist_filter` still applies its case-insensitive substring match before paging
+- Set `available_only=true` to replace codelists with codes reported by the dataflow-wide availability constraint. The response includes total series and time coverage, joins each available code to its DSD label with an ID fallback, and applies `dimension_id`, `codelist_filter`, `limit`, and `offset` after availability filtering. Omit `dimension_id` for a bounded preview of every structure dimension, including empty dimensions the constraint does not mention
 - A filter that matches nothing is reported distinctly from a codelist that could not be resolved — the two need opposite next steps
 
 ---
@@ -125,7 +126,7 @@ IMF SDMX-specific:
 - Keyless access — no API key required; the IMF SDMX 3.0 portal is fully public
 - Type-safe SDMX 3.0 compact JSON client with dimension/codelist parsing and DSD validation
 - Key dimension count validated against the DSD before each query to catch format mismatches early
-- Dataflow catalog cached in-session to minimize round trips on multi-step workflows
+- Dataflow catalog and full availability constraints cached in-session to minimize round trips on multi-step workflows
 - DuckDB-backed DataCanvas spill for large multi-country or long time-range observations
 
 Agent-friendly output:

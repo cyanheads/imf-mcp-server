@@ -26,6 +26,7 @@ import type {
   AvailabilityResult,
   CodelistEntry,
   Dataflow,
+  DataflowAvailabilityResult,
   DataflowStructure,
   DataQueryResult,
   Dimension,
@@ -40,6 +41,7 @@ import type {
 
 const DATAFLOWS_CACHE_TTL = 3600; // 1 hour
 const DSD_CACHE_TTL = 86_400; // 24 hours
+const DATAFLOW_AVAILABILITY_CACHE_TTL = 3600; // 1 hour
 
 /**
  * Most codes a dimension may list in an availability constraint — a message-size
@@ -922,6 +924,58 @@ export class ImfSdmxService {
   }
 
   /**
+   * Fetch the uncapped dataflow-wide availability constraint with tenant-scoped
+   * caching. Unlike fetchAvailabilityConstraint(), this is a positive discovery
+   * surface: it preserves every code and fails explicitly when coverage cannot
+   * be established rather than degrading to a codelist response.
+   */
+  async fetchDataflowAvailability(
+    dataflowId: string,
+    ctx: Context,
+    signal?: AbortSignal,
+  ): Promise<DataflowAvailabilityResult> {
+    const cacheKey = `imf/availability/dataflow/${dataflowId}`;
+    const cached = await ctx.state.get<DataflowAvailabilityResult>(cacheKey);
+    if (cached) {
+      ctx.log.debug('Dataflow availability served from cache', { dataflowId });
+      return cached;
+    }
+
+    const base21 = this.baseUrl.replace(/\/sdmx\/3\.0\/?$/, '/sdmx/2.1');
+    const url = `${base21}/availableconstraint/${encodeURIComponent(dataflowId)}/`;
+    const effectiveSignal = signal ?? ctx.signal;
+
+    try {
+      const response = await fetchWithTimeout(url, Math.min(this.timeoutMs, 10_000), ctx, {
+        headers: { Accept: 'application/xml, text/xml' },
+        signal: effectiveSignal,
+      });
+
+      const availability = this.parseDataflowAvailabilityXml(await response.text());
+      if (!availability) throw new Error('Availability response was not a usable SDMX constraint');
+
+      await ctx.state.set(cacheKey, availability, { ttl: DATAFLOW_AVAILABILITY_CACHE_TTL });
+      return availability;
+    } catch (err: unknown) {
+      ctx.log.error(
+        'Dataflow availability fetch failed',
+        err instanceof Error ? err : new Error(String(err)),
+        { dataflowId },
+      );
+      throw serviceUnavailable(
+        `Availability coverage is unavailable for dataflow '${dataflowId}'`,
+        {
+          reason: 'availability_unavailable',
+          retryable: true,
+          recovery: {
+            hint: 'Retry in a few moments; the IMF availability endpoint did not return usable coverage.',
+          },
+        },
+      );
+    }
+  }
+
+  /**
    * Parse the SDMX 2.1 availableconstraint XML response.
    * Extracts series_count annotation, cube-region com:KeyValue entries, and time annotations.
    */
@@ -966,6 +1020,52 @@ export class ImfSdmxService {
     }
 
     return { series_count, available_codes, time_period_start, time_period_end };
+  }
+
+  /** Parse an uncapped dataflow-wide availability constraint for discovery. */
+  private parseDataflowAvailabilityXml(xml: string): DataflowAvailabilityResult | null {
+    const seriesCountMatch =
+      /id="series_count"[^>]*>[\s\S]*?<com:AnnotationTitle>(\d+)<\/com:AnnotationTitle>/i.exec(xml);
+    if (!seriesCountMatch) return null;
+    const series_count = Number.parseInt(seriesCountMatch[1] ?? '0', 10);
+
+    const tpsMatch =
+      /id="time_period_start"[^>]*>[\s\S]*?<com:AnnotationTitle>([^<]+)<\/com:AnnotationTitle>/i.exec(
+        xml,
+      );
+    const tpeMatch =
+      /id="time_period_end"[^>]*>[\s\S]*?<com:AnnotationTitle>([^<]+)<\/com:AnnotationTitle>/i.exec(
+        xml,
+      );
+
+    const availableCodes = new Map<string, Set<string>>();
+    for (const kvMatch of xml.matchAll(
+      /<com:KeyValue\s+id="([^"]+)"[^>]*>([\s\S]*?)<\/com:KeyValue>/gi,
+    )) {
+      const dimensionId = kvMatch[1] ?? '';
+      if (!dimensionId) continue;
+      const values = availableCodes.get(dimensionId) ?? new Set<string>();
+      for (const match of (kvMatch[2] ?? '').matchAll(/<com:Value>([^<]+)<\/com:Value>/gi)) {
+        const value = match[1]?.trim();
+        if (value) values.add(value);
+      }
+      availableCodes.set(dimensionId, values);
+    }
+
+    if (series_count > 0 && ![...availableCodes.values()].some((values) => values.size > 0)) {
+      return null;
+    }
+
+    const available_codes = Object.fromEntries(
+      [...availableCodes].map(([dimensionId, values]) => [dimensionId, [...values]]),
+    );
+
+    return {
+      series_count,
+      available_codes,
+      time_period_start: tpsMatch?.[1]?.trim() ?? null,
+      time_period_end: tpeMatch?.[1]?.trim() ?? null,
+    };
   }
 
   // ---------------------------------------------------------------------------

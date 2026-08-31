@@ -196,6 +196,22 @@ export interface AvailabilityResult {
   time_period_start: string | null;
 }
 
+/**
+ * Uncapped dataflow-wide coverage from the SDMX 2.1 availability constraint.
+ * Kept separate from AvailabilityResult so no_data recovery retains its
+ * deliberately bounded 20-code diagnostic payload.
+ */
+export interface DataflowAvailabilityResult {
+  /** Every code reported for each dimension, without a presentation cap. */
+  available_codes: Record<string, string[]>;
+  /** Total series published by the dataflow. */
+  series_count: number;
+  /** Latest period with data, if present in the constraint annotations. */
+  time_period_end: string | null;
+  /** Earliest period with data, if present in the constraint annotations. */
+  time_period_start: string | null;
+}
+
 /** Raw SDMX structure response shape. */
 export interface SdmxStructureResponse {
   data?: {

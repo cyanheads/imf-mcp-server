@@ -53,6 +53,17 @@ const MOCK_STRUCTURE = {
   ],
 };
 
+const MOCK_AVAILABILITY = {
+  series_count: 8200,
+  available_codes: {
+    COUNTRY: ['USA', 'GBR'],
+    INDICATOR: ['NGDP_RPCH', 'UNKNOWN_INDICATOR'],
+    FREQUENCY: ['A'],
+  },
+  time_period_start: '1980-01-01',
+  time_period_end: '2032-01-01',
+};
+
 /**
  * The controlled error ImfSdmxService throws when the dataflow catalog fetch fails
  * (#24). Carries the reason and hint, and nothing about the upstream endpoint.
@@ -72,15 +83,356 @@ const dataflowListUnavailable = () =>
 describe('imfGetDatabase', () => {
   let mockSvc: {
     findDataflow: ReturnType<typeof vi.fn>;
+    fetchDataflowAvailability: ReturnType<typeof vi.fn>;
     fetchDataflowStructure: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
     mockSvc = {
       findDataflow: vi.fn().mockResolvedValue(MOCK_DATAFLOW),
+      fetchDataflowAvailability: vi.fn().mockResolvedValue(MOCK_AVAILABILITY),
       fetchDataflowStructure: vi.fn().mockResolvedValue(MOCK_STRUCTURE),
     };
     (getImfSdmxService as ReturnType<typeof vi.fn>).mockReturnValue(mockSvc);
+  });
+
+  it('#47 characterizes normal default previews in both result channels', async () => {
+    const response = await runToolContract(imfGetDatabase, { dataflow_id: 'WEO' });
+
+    expect(response.structuredContent).toEqual({
+      dataflow_id: 'WEO',
+      agency_id: 'IMF.RES',
+      version: '9.0.0',
+      name: 'World Economic Outlook',
+      key_format: 'COUNTRY.INDICATOR.FREQUENCY',
+      truncated: false,
+      dimensions: [
+        {
+          id: 'COUNTRY',
+          name: 'Country',
+          position: 0,
+          codelist: [
+            { id: 'USA', name: 'United States' },
+            { id: 'GBR', name: 'United Kingdom' },
+          ],
+          codelist_truncated: false,
+          unfiltered_count: 2,
+          matched_count: 2,
+          returned_count: 2,
+          offset: 0,
+        },
+        {
+          id: 'INDICATOR',
+          name: 'Indicator',
+          position: 1,
+          codelist: [{ id: 'NGDP_RPCH', name: 'GDP, Constant prices, Percent change' }],
+          codelist_truncated: false,
+          unfiltered_count: 1,
+          matched_count: 1,
+          returned_count: 1,
+          offset: 0,
+        },
+        {
+          id: 'FREQUENCY',
+          name: 'Frequency',
+          position: 2,
+          codelist: [{ id: 'A', name: 'Annual' }],
+          codelist_truncated: false,
+          unfiltered_count: 1,
+          matched_count: 1,
+          returned_count: 1,
+          offset: 0,
+        },
+      ],
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    });
+    expect(response.content).toEqual(imfGetDatabase.format!(response.structuredContent as never));
+  });
+
+  it('#47 characterizes normal selected-dimension paging in both result channels', async () => {
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      dimension_id: 'COUNTRY',
+      limit: 1,
+      offset: 1,
+    });
+
+    expect(response.structuredContent).toEqual({
+      dataflow_id: 'WEO',
+      agency_id: 'IMF.RES',
+      version: '9.0.0',
+      name: 'World Economic Outlook',
+      dimension_id: 'COUNTRY',
+      key_format: 'COUNTRY.INDICATOR.FREQUENCY',
+      truncated: true,
+      dimensions: [
+        {
+          id: 'COUNTRY',
+          name: 'Country',
+          position: 0,
+          codelist: [{ id: 'GBR', name: 'United Kingdom' }],
+          codelist_truncated: true,
+          unfiltered_count: 2,
+          matched_count: 2,
+          returned_count: 1,
+          offset: 1,
+        },
+      ],
+      source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+    });
+    expect(response.content).toEqual(imfGetDatabase.format!(response.structuredContent as never));
+  });
+
+  it('#47 keeps explicit available_only=false byte-identical to the omitted normal mode', async () => {
+    const omitted = await runToolContract(imfGetDatabase, { dataflow_id: 'WEO' });
+    const explicitFalse = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      available_only: false,
+    });
+
+    expect(explicitFalse.structuredContent).toEqual(omitted.structuredContent);
+    expect(explicitFalse.content).toEqual(omitted.content);
+    expect(mockSvc.fetchDataflowAvailability).not.toHaveBeenCalled();
+  });
+
+  it('#47 exposes default availability previews for every structure dimension in both channels', async () => {
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      available_only: true,
+    });
+    const structured = response.structuredContent as {
+      available_only: boolean;
+      series_count: number;
+      time_period_start: string | null;
+      time_period_end: string | null;
+      dimensions: Array<{
+        id: string;
+        available_count: number;
+        returned_count: number;
+        codelist: Array<{ id: string; name: string }>;
+      }>;
+    };
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(structured).toMatchObject({
+      available_only: true,
+      series_count: 8200,
+      time_period_start: '1980-01-01',
+      time_period_end: '2032-01-01',
+    });
+    expect(structured.dimensions.map((dimension) => dimension.id)).toEqual([
+      'COUNTRY',
+      'INDICATOR',
+      'FREQUENCY',
+    ]);
+    expect(structured.dimensions.find((dimension) => dimension.id === 'INDICATOR')).toMatchObject({
+      available_count: 2,
+      returned_count: 2,
+      codelist: expect.arrayContaining([
+        { id: 'NGDP_RPCH', name: 'GDP, Constant prices, Percent change' },
+        { id: 'UNKNOWN_INDICATOR', name: 'UNKNOWN_INDICATOR' },
+      ]),
+    });
+    expect(text).toContain('**Availability coverage:** true');
+    expect(text).toContain('8,200 series');
+    expect(text).toContain('1980-01-01');
+    expect(text).toContain('UNKNOWN_INDICATOR');
+    expect(text).toContain('2 available');
+  });
+
+  it('#47 includes constraint-absent dimensions as empty coverage', async () => {
+    mockSvc.fetchDataflowAvailability.mockResolvedValue({
+      ...MOCK_AVAILABILITY,
+      available_codes: { COUNTRY: ['USA'] },
+    });
+
+    const result = await imfGetDatabase.handler(
+      imfGetDatabase.input.parse({ dataflow_id: 'WEO', available_only: true }),
+      createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors }),
+    );
+
+    expect(result.dimensions.find((dimension) => dimension.id === 'INDICATOR')).toMatchObject({
+      available_count: 0,
+      returned_count: 0,
+      codelist: [],
+      codelist_truncated: false,
+    });
+  });
+
+  it('#47 renders selected availability page counts, truncation, and continuation', async () => {
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      available_only: true,
+      dimension_id: 'COUNTRY',
+      limit: 1,
+      offset: 0,
+    });
+    const structured = response.structuredContent as {
+      dimension_id: string;
+      truncated: boolean;
+      dimensions: Array<{
+        available_count: number;
+        returned_count: number;
+        offset: number;
+        codelist_truncated: boolean;
+        next_offset?: number;
+      }>;
+    };
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(structured).toMatchObject({
+      dimension_id: 'COUNTRY',
+      truncated: true,
+      dimensions: [
+        {
+          available_count: 2,
+          returned_count: 1,
+          offset: 0,
+          codelist_truncated: true,
+          next_offset: 1,
+        },
+      ],
+    });
+    expect(text).toContain('**Selected dimension:** `COUNTRY`');
+    expect(text).toContain('**Truncated:** true');
+    expect(text).toContain('2 available before filtering');
+    expect(text).toContain('offset=1');
+  });
+
+  it('#47 composes availability filtering, label joining, and selected-dimension paging', async () => {
+    const codes = Array.from({ length: 55 }, (_, index) => ({
+      id: `CODE_${index}`,
+      name: index % 2 === 0 ? `Keep ${index}` : `Drop ${index}`,
+    }));
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dimensions: [{ id: 'INDICATOR', name: 'Indicator', position: 0, codelist: codes }],
+    });
+    mockSvc.fetchDataflowAvailability.mockResolvedValue({
+      ...MOCK_AVAILABILITY,
+      available_codes: { INDICATOR: codes.map((code) => code.id) },
+    });
+    const input = (offset: number) =>
+      imfGetDatabase.input.parse({
+        dataflow_id: 'WEO',
+        available_only: true,
+        dimension_id: 'INDICATOR',
+        codelist_filter: 'keep',
+        limit: 10,
+        offset,
+      });
+
+    const first = await imfGetDatabase.handler(
+      input(0),
+      createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors }),
+    );
+    const middle = await imfGetDatabase.handler(
+      input(10),
+      createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors }),
+    );
+    const final = await imfGetDatabase.handler(
+      input(20),
+      createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors }),
+    );
+    const pastEndCtx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const pastEnd = await imfGetDatabase.handler(input(30), pastEndCtx);
+
+    expect(first.dimensions[0]).toMatchObject({
+      available_count: 55,
+      matched_count: 28,
+      returned_count: 10,
+      offset: 0,
+      codelist_truncated: true,
+      next_offset: 10,
+    });
+    expect([
+      ...first.dimensions[0]!.codelist,
+      ...middle.dimensions[0]!.codelist,
+      ...final.dimensions[0]!.codelist,
+    ]).toEqual(codes.filter((code) => code.name.startsWith('Keep')));
+    expect(final.dimensions[0]).toMatchObject({
+      returned_count: 8,
+      offset: 20,
+      codelist_truncated: true,
+    });
+    expect(final.dimensions[0]).not.toHaveProperty('next_offset');
+    expect(pastEnd.dimensions[0]).toMatchObject({ returned_count: 0, offset: 30 });
+    expect(getEnrichment(pastEndCtx).notice).toContain('past the end');
+  });
+
+  it('#47 reports an availability filter miss in both result channels', async () => {
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      available_only: true,
+      dimension_id: 'COUNTRY',
+      codelist_filter: 'no such published code',
+    });
+    const structured = response.structuredContent as {
+      codelist_filter: string;
+      dimensions: Array<{ available_count: number; matched_count: number; returned_count: number }>;
+    };
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(structured.codelist_filter).toBe('no such published code');
+    expect(structured.dimensions[0]).toMatchObject({
+      available_count: 2,
+      matched_count: 0,
+      returned_count: 0,
+    });
+    expect(text).toContain('no matches for codelist_filter');
+    expect(text).toContain('No codes matched codelist_filter');
+  });
+
+  it('#47 preserves dimension_not_found in availability mode before fetching coverage', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+
+    await expect(
+      imfGetDatabase.handler(
+        imfGetDatabase.input.parse({
+          dataflow_id: 'WEO',
+          available_only: true,
+          dimension_id: 'UNKNOWN',
+        }),
+        ctx,
+      ),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'dimension_not_found' },
+    });
+    expect(mockSvc.fetchDataflowAvailability).not.toHaveBeenCalled();
+  });
+
+  it('#47 declares and returns retryable availability_unavailable without a codelist fallback', async () => {
+    mockSvc.fetchDataflowAvailability.mockRejectedValue(new Error('malformed coverage'));
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      available_only: true,
+    });
+    const error = (
+      response.structuredContent as { error: { code: number; data: Record<string, unknown> } }
+    ).error;
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(
+      imfGetDatabase.errors?.find((entry) => entry.reason === 'availability_unavailable'),
+    ).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+    });
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'availability_unavailable' },
+    });
+    expect(text).toContain('Retry');
+    expect(text).not.toContain('United States');
   });
 
   it('returns structure with dimensions and key_format', async () => {

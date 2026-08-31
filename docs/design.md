@@ -6,8 +6,8 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `imf_list_databases` | List IMF SDMX dataflows available on the portal, one page at a time. Returns id, agencyID, version, name, and a shortened description. Entry point — every query requires a dataflow id. | `filter` (optional name substring), `include_vintages` (bool, default false), `limit` (1–200, default 50), `offset` (default 0) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `imf_get_database` | Fetch bounded codelist previews for every dimension, or page one exact `dimension_id` after an optional substring filter. Resolves human terms to SDMX codes ("United States" → USA, "Constant prices" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional), `codelist_filter` (optional substring), `dimension_id` (optional exact selector), `limit` (1–200), `offset` (requires `dimension_id`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `imf_list_databases` | List IMF SDMX dataflows available on the portal, one page at a time. Returns id, agencyID, version, name, and a shortened description. Entry point — every query requires a dataflow id. | `filter` (optional nonblank name/ID/description substring), `include_vintages` (bool, default false), `limit` (1–200, default 50), `offset` (default 0) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `imf_get_database` | Fetch bounded codelist previews for every dimension, or opt into paged codes with published data. Resolves human terms to SDMX codes ("United States" → USA, "Constant prices" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional), `available_only` (bool, default false), `codelist_filter` (optional substring), `dimension_id` (optional exact selector), `limit` (1–200), `offset` (requires `dimension_id`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, and status, plus unit/scale/decimals per series. Large analytical result sets spill to DataCanvas; `output_mode: canvas` explicitly stages any result. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional destination), `output_mode` (`auto` or `canvas`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call. Shows table name, row count, and column schema. | `canvas_id` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_dataframe_query` | Run a read-only SQL SELECT against a staged DataCanvas table. Enables multi-country comparisons, time-series aggregation, and cross-indicator joins without hand-rolled loops. | `canvas_id`, `sql` (one SELECT statement; a leading `WITH … SELECT` CTE is accepted) | `readOnlyHint: true`, `openWorldHint: false` |
@@ -54,15 +54,17 @@ The service applies the error boundary: a failed catalog fetch is logged with it
 
 **Input constraints:**
 - `dataflow_id`: string — value from `imf_list_databases`. No structural regex needed (codes are opaque alphanumeric, validated against the live dataflow list).
+- `available_only`: boolean, default false. When true, project the uncapped dataflow-wide availability constraint through the same bounded preview and selected-dimension paging path. Normal codelist mode remains unchanged when false or omitted.
 - `codelist_filter`: optional non-blank string — trimmed once, then matched as a case-insensitive substring of code ID or name before paging.
 - `dimension_id`: optional exact dimension selector. `limit` (1–200, default 50) and `offset` (integer ≥ 0, default 0) are valid only when this selector is present.
 
 **Output:**
 - `dataflow_id`, `agency_id`, `version`, `name`, `description`
 - `codelist_filter`: string, present only when a filter was applied — echoing it is what separates "your filter matched nothing" from "this codelist could not be resolved", since both render as an empty array
+- `available_only`, `series_count`, `time_period_start`, `time_period_end`: present in availability mode. Every structure dimension remains in the default preview; a constraint-absent dimension has zero available and returned codes.
 - `dimension_id`: present when one dimension was selected for paging
 - `key_format`: string — dimension names in order, e.g. `"COUNTRY.INDICATOR.FREQUENCY"` (agents must see this to construct keys without re-fetching the DSD)
-- `dimensions`: array of `{ id, name, position, codelist, codelist_truncated, unfiltered_count, matched_count, returned_count, offset, next_offset? }`. All previews are capped at 50; a selected dimension uses the requested `limit`/`offset`. `codelist_truncated` is true whenever matching entries were omitted before or after the returned page.
+- `dimensions`: array of `{ id, name, position, codelist, codelist_truncated, available_count?, unfiltered_count, matched_count, returned_count, offset, next_offset? }`. All previews are capped at 50; a selected dimension uses the requested `limit`/`offset`. In availability mode, `available_count` is the pre-filter coverage count, code labels come from the DSD with ID fallback, then `codelist_filter` and paging compose in that order. `codelist_truncated` is true whenever matching entries were omitted before or after the returned page.
 
 **Enrichment:**
 - `notice`: emitted when `codelist_filter` matched nothing in any dimension (names the filter and the unfiltered entry counts), when a dimension has no resolvable codelist, or when an offset is past the final match. Reaches both `structuredContent` and the `content[]` trailer.
@@ -90,6 +92,9 @@ errors: [
   { reason: 'dataflow_list_unavailable', code: ServiceUnavailable, retryable: true,
     when: 'The dataflow catalog that dataflow_id is resolved against could not be fetched',
     recovery: 'Retry in a few moments; the catalog is cached for an hour once it succeeds.' },
+  { reason: 'availability_unavailable', code: ServiceUnavailable, retryable: true,
+    when: 'available_only is true and the dataflow-wide availability constraint cannot be fetched or parsed',
+    recovery: 'Retry in a few moments; the IMF availability endpoint did not return usable coverage.' },
 ]
 ```
 
@@ -270,7 +275,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 1. **Config and server setup** — `src/config/server-config.ts` with `IMF_BASE_URL`, `IMF_REQUEST_TIMEOUT_MS`; canvas accessor wired in `setup()`
 2. **ImfSdmxService** — `fetchDataflows()`, `fetchDataStructure()`, `fetchData()` with retry, timeout, SDMX-JSON parse; dimension key builder; observation decoder (position index → time label)
 3. **`imf_list_databases`** — list + name-filter, paged with `limit`/`offset` and shortened descriptions (the full catalog does not fit a single response worth spending)
-4. **`imf_get_database`** — DSD fetch with `?references=all`; dimensions + codelists; local name→code resolution
+4. **`imf_get_database`** — DSD fetch with `?references=all`; dimensions + codelists; local name→code resolution; optional dataflow-wide availability projection
 5. **`imf_query_dataset`** — key validation, data fetch, observation decode, spillover for large results
 6. **`imf_dataframe_describe` + `imf_dataframe_query` + `imf_dataframe_drop`** — canvas inspection, bounded SQL, and opt-in table cleanup (no-op when canvas disabled)
 7. **`imf://database/{dataflow_id}` resource** — DSD fetch + bounded codelist discovery, stable URI
@@ -357,12 +362,13 @@ The portal exposes 70+ `_VINTAGE` dataflows (e.g. `WEO_2025_OCT_VINTAGE`, `CPI_2
 - **Inline path:** render `start_period`–`end_period` context, unit/scale, and observations as a markdown table. `staged: false` and `truncated: false` describe the default under-budget result.
 - **Canvas path:** render the canvas handle summary — `canvas_id`, `table_name`, `observation_count`, `staged`, and `truncated` — plus instructions for follow-up (`imf_dataframe_describe` → `imf_dataframe_query`). The same instructions are carried in `structuredContent.retrieval_guidance`; when an unparsed-period `notice` also applies, both fields and both content blocks are returned together.
 
-`imf_get_database` format: render `key_format` prominently (first line), then each dimension with its codelist entries and page counts. Every preview is bounded at 50; a selected `dimension_id` can use `limit`/`offset`, and `next_offset` names the continuation call. A dimension with no entries renders one of three states: filter miss, offset past the end, or unresolved codelist.
+`imf_get_database` format: render `key_format` prominently (first line), then each dimension with its codelist or availability entries and page counts. Every preview is bounded at 50; a selected `dimension_id` can use `limit`/`offset`, and `next_offset` names the continuation call. Availability mode also renders series/time coverage and per-dimension available counts. A dimension with no entries distinguishes filter miss, offset past the end, unresolved codelist, and no published coverage.
 
 ### 8. Caching strategy
 
 - Dataflow list: cache 1 hour — changes only when IMF publishes new releases
 - DSD + codelists: cache 24 hours per `(agency, dsd_id, version)` — rarely changes within a version
+- Full dataflow availability: cache 1 hour per dataflow — reused across preview and selected-dimension pages
 - Data observations: no cache — always live
 - MCP metadata responses: public one-hour cache hints on all six cacheable 2026-07-28 operations (`tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, `resources/read`, `server/discover`); 2025 responses are unchanged
 
@@ -388,13 +394,13 @@ Two unrelated causes used to share one reason. Period filtering is client-side, 
 
 The handler now checks the pre-filter observation count. Non-empty before filtering and empty after is `no_data_in_range`: it reports the requested range, the range the response actually spans, and the count excluded, and skips the availability probe entirely (both a wasted round-trip and a misleading answer for a range problem). `no_data` keeps the coverage diagnosis and the enrichment, for a key the dataflow genuinely has no series for.
 
-### 11. Availability discloses its own listing cap
+### 11. Query recovery availability discloses its own listing cap
 
-The `no_data` enrichment is the caller's only view of coverage — no tool exposes the availability endpoint, and `imf_get_database` answers a different question (the code universe, not what has data). A 20-code cap keeps the message bounded, but an unannotated slice presents itself as the complete set, so a caller that does not find its own valid code in the list concludes the code is uncovered.
+The `no_data` enrichment is a bounded diagnostic on the query failure path. Its separate `AvailabilityResult` parser keeps a 20-code cap so an error stays compact, but an unannotated slice presents itself as the complete set, so a caller that does not find its own valid code in the list concludes the code is uncovered. The opt-in `imf_get_database available_only=true` discovery path uses a separate uncapped parser and cache, then bounds the full coverage through ordinary preview or selected-dimension paging; it does not widen or alter this recovery payload.
 
 `AvailabilityDimension` therefore carries the pre-cap `count` alongside the `codes` slice, and the message states both: `INDICATOR: 20 of 46 codes with data shown (…)`. A dimension inside the cap prints its codes plain, and reads as complete because it is.
 
-Annotating rather than suppressing the sample. Suppression removes the only coverage-grounded code list the caller ever sees, and the remaining route — searching `imf_get_database` — cannot answer coverage by construction: `PIP`'s `ACCOUNTING_ENTRY` codelist runs past the 50-entry preview while exactly two of its codes have data. Mid-size dimensions are the common case and the one where a sample earns its tokens: 20 of `PIP`'s 46 covered indicators is enough to spot a mistyped code, where 20 of 210 countries is not — but the annotation costs nothing in either case, and neither misleads.
+Annotating rather than suppressing the sample keeps the failure immediately useful without forcing another call. `imf_get_database available_only=true` is the continuation when the complete coverage set matters: for example, `PIP`'s `ACCOUNTING_ENTRY` codelist runs past the 50-entry preview while exactly two of its codes have data. Mid-size dimensions are the common case and the one where a sample earns its tokens: 20 of `PIP`'s 46 covered indicators is enough to spot a mistyped code, where 20 of 210 countries is not — but the annotation costs nothing in either case, and neither misleads.
 
 ### 12. Series attributes belong to a series, not to a query
 

@@ -1185,6 +1185,136 @@ describe('ImfSdmxService.fetchAvailabilityConstraint (#26)', () => {
   });
 });
 
+describe('ImfSdmxService.fetchDataflowAvailability (#47)', () => {
+  let svc: ImfSdmxService;
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+  });
+
+  it('preserves every code, series count, time bound, and variable dimension shape', async () => {
+    const indicators = Array.from({ length: 145 }, (_, index) => `I${index}`);
+    fetchWithTimeout.mockResolvedValue({
+      status: 200,
+      ok: true,
+      text: () =>
+        Promise.resolve(
+          availabilityXml(8200, {
+            COUNTRY: TWO_HUNDRED_TEN_COUNTRIES,
+            INDICATOR: indicators,
+            FREQUENCY: ['A'],
+            UNIT_MEASURE: ['PT', 'USD'],
+          }),
+        ),
+    });
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const result = await svc.fetchDataflowAvailability('WEO', ctx);
+
+    expect(result).toEqual({
+      series_count: 8200,
+      available_codes: {
+        COUNTRY: TWO_HUNDRED_TEN_COUNTRIES,
+        INDICATOR: indicators,
+        FREQUENCY: ['A'],
+        UNIT_MEASURE: ['PT', 'USD'],
+      },
+      time_period_start: '1980-01-01',
+      time_period_end: '2032-01-01',
+    });
+  });
+
+  it.each([
+    ['timeout', () => fetchWithTimeout.mockRejectedValue(new Error('timed out'))],
+    [
+      'non-success response',
+      () => fetchWithTimeout.mockRejectedValue(new Error('Fetch failed. Status: 503')),
+    ],
+    [
+      'malformed response',
+      () =>
+        fetchWithTimeout.mockResolvedValue({
+          status: 200,
+          ok: true,
+          text: () => Promise.resolve('<html>not an SDMX constraint</html>'),
+        }),
+    ],
+    [
+      'response missing series metadata',
+      () =>
+        fetchWithTimeout.mockResolvedValue({
+          status: 200,
+          ok: true,
+          text: () =>
+            Promise.resolve(
+              availabilityXml(1, { COUNTRY: ['USA'] }).replace(
+                /<com:Annotation id="series_count">[\s\S]*?<\/com:Annotation>/,
+                '',
+              ),
+            ),
+        }),
+    ],
+    [
+      'positive series count without coverage dimensions',
+      () =>
+        fetchWithTimeout.mockResolvedValue({
+          text: () => Promise.resolve(availabilityXml(1, {})),
+        }),
+    ],
+  ])('returns availability_unavailable for a %s', async (_name, arrange) => {
+    arrange();
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    await expect(svc.fetchDataflowAvailability('WEO', ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'availability_unavailable' },
+    });
+  });
+
+  it('reuses the full availability cache across page-sized consumers', async () => {
+    fetchWithTimeout.mockResolvedValue({
+      status: 200,
+      ok: true,
+      text: () => Promise.resolve(availabilityXml(8200, { COUNTRY: TWO_HUNDRED_TEN_COUNTRIES })),
+    });
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const firstResult = await svc.fetchDataflowAvailability('WEO', ctx);
+    const firstPage = firstResult.available_codes.COUNTRY?.slice(0, 100);
+    const secondResult = await svc.fetchDataflowAvailability('WEO', ctx);
+    const secondPage = secondResult.available_codes.COUNTRY?.slice(100, 200);
+
+    expect(firstPage).toHaveLength(100);
+    expect(secondPage).toHaveLength(100);
+    expect(secondPage?.[0]).toBe('C100');
+    expect(fetchWithTimeout).toHaveBeenCalledOnce();
+  });
+
+  it('retries after a failed request rather than caching the failure', async () => {
+    const failedCtx = createMockContext({ tenantId: 'retry' });
+    fetchWithTimeout.mockRejectedValueOnce(new Error('temporary failure'));
+    await expect(svc.fetchDataflowAvailability('CPI', failedCtx)).rejects.toMatchObject({
+      data: { reason: 'availability_unavailable' },
+    });
+    fetchWithTimeout.mockResolvedValueOnce({
+      status: 200,
+      ok: true,
+      text: () => Promise.resolve(availabilityXml(1, { FREQUENCY: ['M'] })),
+    });
+
+    await expect(svc.fetchDataflowAvailability('CPI', failedCtx)).resolves.toMatchObject({
+      series_count: 1,
+      available_codes: { FREQUENCY: ['M'] },
+    });
+  });
+});
+
 // --- #24: dataflow-list error boundary -------------------------------------------
 
 /**

@@ -9,7 +9,7 @@
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { captureMcpError } from '../helpers/errors.js';
 
@@ -104,6 +104,50 @@ describe('imfListDatabases', () => {
 
     expect(result.total_count).toBe(1);
     expect(result.dataflows[0]!.id).toBe('CPI');
+  });
+
+  it('#46 rejects a whitespace-only filter at the schema boundary', () => {
+    expect(imfListDatabases.input.safeParse({ filter: '   ' }).success).toBe(false);
+    expect(mockSvc.fetchDataflows).not.toHaveBeenCalled();
+  });
+
+  it('#46 normalizes padded filters and keeps case-insensitive ID, name, and full-description matching', async () => {
+    const longDescription = `${'x'.repeat(250)} Sovereign Arrears`;
+    mockSvc.fetchDataflows.mockResolvedValue([
+      { id: 'WEO', agencyId: 'IMF.RES', version: '9.0.0', name: 'World Economic Outlook' },
+      { id: 'BOP', agencyId: 'IMF.STA', version: '1.0.0', name: 'Balance of Payments' },
+      {
+        id: 'ARR',
+        agencyId: 'IMF.STA',
+        version: '1.0.0',
+        name: 'Arrears',
+        description: longDescription,
+      },
+    ]);
+
+    for (const [filter, id] of [
+      ['  weo  ', 'WEO'],
+      ['  BALANCE  ', 'BOP'],
+      ['  sovereign arrears  ', 'ARR'],
+    ] as const) {
+      const parsed = imfListDatabases.input.parse({ filter });
+      expect(parsed.filter).toBe(filter.trim());
+      const result = await imfListDatabases.handler(
+        parsed,
+        createMockContext({ tenantId: 'test', errors: imfListDatabases.errors }),
+      );
+      expect(result.dataflows.map((dataflow) => dataflow.id)).toEqual([id]);
+    }
+  });
+
+  it('#46 uses normalized filter text in the content[] enrichment trailer', async () => {
+    const response = await runToolContract(imfListDatabases, { filter: '  no such dataflow  ' });
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(text).toContain('No dataflows matched filter "no such dataflow"');
+    expect(text).not.toContain('  no such dataflow  ');
   });
 
   it('returns empty list when filter matches nothing', async () => {

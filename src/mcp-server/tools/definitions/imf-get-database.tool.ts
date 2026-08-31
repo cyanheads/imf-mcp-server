@@ -1,7 +1,8 @@
 /**
  * @fileoverview Tool: imf_get_database — fetch a dataflow's dimension list with a
- * labelled, capped codelist preview per dimension, and a notice separating a
- * codelist_filter that matched nothing from a codelist that could not be resolved.
+ * labelled, capped codelist preview per dimension or opt-in pages of codes with
+ * published data, and a notice separating a codelist_filter that matched nothing
+ * from a codelist that could not be resolved.
  * @module mcp-server/tools/definitions/imf-get-database.tool
  */
 
@@ -25,6 +26,7 @@ export const imfGetDatabase = tool('imf_get_database', {
     'Required before imf_query_dataset — SDMX keys are opaque without codelist lookups. ' +
     `Each codelist is capped at the first ${CODELIST_PREVIEW_LIMIT} entries by default, including previews filtered by codelist_filter. ` +
     'Set dimension_id to retrieve one codelist with bounded limit/offset paging after the optional substring filter. ' +
+    'Set available_only=true to page codes the dataflow actually publishes, with series and time coverage metadata; availability filtering happens before codelist_filter and paging. ' +
     'The imf://database/{dataflow_id} resource provides the same bounded discovery summary. ' +
     'Country codes are ISO 3-letter (USA, GBR, DEU), not ISO 2-letter (US, GB, DE). ' +
     'The key_format field shows the exact dimension order required by imf_query_dataset. ' +
@@ -64,6 +66,12 @@ export const imfGetDatabase = tool('imf_get_database', {
           "Optional case-insensitive substring to search within each dimension's codelist (code ID and name). " +
             `Filtering runs before the ${CODELIST_PREVIEW_LIMIT}-entry preview or selected-dimension page. ` +
             'Example: "CPI" or "Constant prices" surfaces matching WEO indicator codes.',
+        ),
+      available_only: z
+        .boolean()
+        .default(false)
+        .describe(
+          'Return only codes reported by the dataflow-wide availability constraint. Default false keeps ordinary codelist discovery unchanged.',
         ),
       dimension_id: z
         .string()
@@ -136,6 +144,26 @@ export const imfGetDatabase = tool('imf_get_database', {
         'Echo of the codelist_filter that produced this result. Absent when no filter was applied — ' +
           'an empty codelist then means the codelist could not be resolved, not that the filter missed.',
       ),
+    available_only: z
+      .literal(true)
+      .optional()
+      .describe(
+        'True when dimensions contain published availability coverage rather than codelists.',
+      ),
+    series_count: z
+      .number()
+      .optional()
+      .describe('Total series published by the dataflow. Present when available_only is true.'),
+    time_period_start: z
+      .string()
+      .nullable()
+      .optional()
+      .describe('Earliest period with published data, or null when the constraint omits it.'),
+    time_period_end: z
+      .string()
+      .nullable()
+      .optional()
+      .describe('Latest period with published data, or null when the constraint omits it.'),
     dimension_id: z
       .string()
       .optional()
@@ -171,19 +199,25 @@ export const imfGetDatabase = tool('imf_get_database', {
                   .describe('A single codelist entry: machine code and human-readable name.'),
               )
               .describe(
-                'Valid codes for this dimension. ' +
+                'Valid codelist codes for this dimension, or codes reported with published data when available_only is true. ' +
                   `Unselected previews show up to ${CODELIST_PREVIEW_LIMIT} entries after optional filtering. ` +
                   'Select dimension_id and use limit/offset for a bounded page of up to 200 entries. ' +
-                  'Empty means the filter matched nothing when codelist_filter is echoed back, ' +
-                  'and that the codelist could not be resolved when it is not — see notice.',
+                  'Empty means the filter matched nothing when codelist_filter is echoed back, no coverage was reported in availability mode, ' +
+                  'or the codelist could not be resolved in normal mode — see notice.',
               ),
             codelist_truncated: z
               .boolean()
               .describe('True when matching codes were omitted before or after this page.'),
+            available_count: z
+              .number()
+              .optional()
+              .describe(
+                'Codes reported with published data before codelist_filter. Present when available_only is true.',
+              ),
             unfiltered_count: z
               .number()
               .describe(
-                'Codes in the complete resolved codelist before codelist_filter is applied.',
+                'Source codes before codelist_filter: the complete resolved codelist normally, or published codes when available_only is true.',
               ),
             matched_count: z
               .number()
@@ -195,7 +229,7 @@ export const imfGetDatabase = tool('imf_get_database', {
               .optional()
               .describe('Offset for the next page when later matching codes remain.'),
           })
-          .describe('A single dimension with its codelist.'),
+          .describe('A single dimension with its codelist or published availability coverage.'),
       )
       .describe('All dimension previews, or the one selected dimension page.'),
     source: z
@@ -231,6 +265,14 @@ export const imfGetDatabase = tool('imf_get_database', {
       retryable: true,
       recovery:
         'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
+    },
+    {
+      reason: 'availability_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'available_only is true and the dataflow-wide availability constraint cannot be fetched or parsed',
+      retryable: true,
+      recovery:
+        'Retry in a few moments; the IMF availability endpoint did not return usable coverage.',
     },
   ],
 
@@ -295,16 +337,40 @@ export const imfGetDatabase = tool('imf_get_database', {
     }
 
     const dimensionsToProject = selectedDimension ? [selectedDimension] : structure.dimensions;
-    const dimensions = dimensionsToProject.map((dimension) => ({
-      id: dimension.id,
-      name: dimension.name,
-      position: dimension.position,
-      ...projectCodelist(dimension.codelist, {
-        ...(input.codelist_filter ? { filter: input.codelist_filter } : {}),
-        ...(selectedDimension && input.limit !== undefined ? { limit: input.limit } : {}),
-        ...(selectedDimension && input.offset !== undefined ? { offset: input.offset } : {}),
-      }),
-    }));
+    let availability: Awaited<ReturnType<typeof svc.fetchDataflowAvailability>> | undefined;
+    if (input.available_only) {
+      try {
+        availability = await svc.fetchDataflowAvailability(input.dataflow_id, ctx, ctx.signal);
+      } catch (err: unknown) {
+        if (err instanceof McpError && err.data?.reason === 'availability_unavailable') throw err;
+        throw ctx.fail(
+          'availability_unavailable',
+          `Availability coverage is unavailable for dataflow '${input.dataflow_id}'`,
+          ctx.recoveryFor('availability_unavailable'),
+        );
+      }
+    }
+
+    const dimensions = dimensionsToProject.map((dimension) => {
+      const codelistNames = new Map(dimension.codelist.map((entry) => [entry.id, entry.name]));
+      const sourceEntries = availability
+        ? (availability.available_codes[dimension.id] ?? []).map((id) => ({
+            id,
+            name: codelistNames.get(id) ?? id,
+          }))
+        : dimension.codelist;
+      return {
+        id: dimension.id,
+        name: dimension.name,
+        position: dimension.position,
+        ...(availability ? { available_count: sourceEntries.length } : {}),
+        ...projectCodelist(sourceEntries, {
+          ...(input.codelist_filter ? { filter: input.codelist_filter } : {}),
+          ...(selectedDimension && input.limit !== undefined ? { limit: input.limit } : {}),
+          ...(selectedDimension && input.offset !== undefined ? { offset: input.offset } : {}),
+        }),
+      };
+    });
 
     /**
      * An empty codelist has two causes that render identically but need opposite
@@ -326,9 +392,11 @@ export const imfGetDatabase = tool('imf_get_database', {
           `Try a shorter or broader substring, or omit codelist_filter to browse the first ${CODELIST_PREVIEW_LIMIT} entries per dimension.`,
       );
     } else {
-      const unresolved = dimensions
-        .filter((dimension) => dimension.unfiltered_count === 0)
-        .map((dimension) => dimension.id);
+      const unresolved = availability
+        ? []
+        : dimensions
+            .filter((dimension) => dimension.unfiltered_count === 0)
+            .map((dimension) => dimension.id);
       if (unresolved.length > 0) {
         ctx.enrich.notice(
           `No codelist resolved for ${unresolved.join(', ')} — this response lists no codes for ${unresolved.length === 1 ? 'that position' : 'those positions'} of the key. ` +
@@ -354,6 +422,14 @@ export const imfGetDatabase = tool('imf_get_database', {
       name: structure.name,
       ...(structure.description ? { description: structure.description } : {}),
       ...(input.codelist_filter ? { codelist_filter: input.codelist_filter } : {}),
+      ...(availability
+        ? {
+            available_only: true as const,
+            series_count: availability.series_count,
+            time_period_start: availability.time_period_start,
+            time_period_end: availability.time_period_end,
+          }
+        : {}),
       ...(input.dimension_id ? { dimension_id: input.dimension_id } : {}),
       key_format: structure.keyFormat,
       truncated: dimensions.some((dimension) => dimension.codelist_truncated),
@@ -375,9 +451,20 @@ export const imfGetDatabase = tool('imf_get_database', {
       lines.push(dsdParts.join(' | '));
     }
     if (result.description) lines.push(`\n${result.description}`);
+    if (result.available_only) {
+      if (result.series_count === undefined) {
+        throw new Error('available_only output requires series_count');
+      }
+      lines.push(
+        `**Availability coverage:** true — ${result.series_count.toLocaleString()} series published.`,
+      );
+      lines.push(
+        `**Available time range:** ${result.time_period_start ?? 'unknown'} – ${result.time_period_end ?? 'unknown'}`,
+      );
+    }
     if (result.codelist_filter) {
       lines.push(
-        `**Codelist filter:** \`${result.codelist_filter}\` — applied before each bounded preview or selected-dimension page.`,
+        `**Codelist filter:** \`${result.codelist_filter}\` — applied ${result.available_only ? 'after availability filtering and before the ' : 'before each '}bounded preview or selected-dimension page.`,
       );
     }
     if (result.dimension_id) lines.push(`**Selected dimension:** \`${result.dimension_id}\``);
@@ -390,9 +477,18 @@ export const imfGetDatabase = tool('imf_get_database', {
     for (const dim of result.dimensions) {
       lines.push(`#### ${dim.id} (position ${dim.position})`);
       lines.push(`**Name:** ${dim.name}`);
-      lines.push(
-        `**Codelist page:** ${dim.returned_count} returned from offset ${dim.offset}; ${dim.matched_count} matched; ${dim.unfiltered_count} before filtering.`,
-      );
+      if (result.available_only) {
+        if (dim.available_count === undefined) {
+          throw new Error('available_only dimension output requires available_count');
+        }
+        lines.push(
+          `**Availability page:** ${dim.returned_count} returned from offset ${dim.offset}; ${dim.available_count} available before filtering (${dim.unfiltered_count} source entries); ${dim.matched_count} matched.`,
+        );
+      } else {
+        lines.push(
+          `**Codelist page:** ${dim.returned_count} returned from offset ${dim.offset}; ${dim.matched_count} matched; ${dim.unfiltered_count} before filtering.`,
+        );
+      }
       if (dim.codelist.length > 0) {
         lines.push('**Codes:**');
         for (const code of dim.codelist) {
@@ -412,6 +508,8 @@ export const imfGetDatabase = tool('imf_get_database', {
         // different lines. What to do about each is stated once — in the filter
         // header above, or in the enrichment notice — not repeated per dimension.
         lines.push(`_(no matches for codelist_filter \`${result.codelist_filter}\`)_`);
+      } else if (result.available_only) {
+        lines.push('_(no published coverage reported for this dimension)_');
       } else {
         lines.push('_(no codelist resolved — see notice)_');
       }
