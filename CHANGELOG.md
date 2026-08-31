@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-08-30
+
+imf_query_dataset adds explicit DataCanvas staging and response-budgeted previews, with calendar-valid period bounds and preserved upstream error contracts
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-08-30 · ⚠️ Breaking
 
 imf://database/{dataflow_id} now returns bounded codelist previews with continuation into imf_get_database, which pages one selected dimension and emits 2026 metadata cache hints
