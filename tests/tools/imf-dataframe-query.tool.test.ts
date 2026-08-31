@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { captureMcpError } from '../helpers/errors.js';
 
@@ -19,6 +19,19 @@ const MOCK_ROWS = [
   { time_period: '2020', value: 3.5, status: null },
   { time_period: '2021', value: 5.1, status: 'E' },
 ];
+
+const RESPONSE_ENVELOPE_CHAR_LIMIT = 100_000;
+
+function serializedSuccessEnvelopeLength(result: {
+  rows: Array<Record<string, unknown>>;
+  row_count: number;
+  truncated: boolean;
+}): number {
+  return JSON.stringify({
+    structuredContent: result,
+    content: imfDataframeQuery.format!(result),
+  }).length;
+}
 
 /** Wire a canvas whose `query()` resolves or rejects with the supplied outcome. */
 function mockCanvasQuery(outcome: { resolve: unknown } | { reject: unknown }) {
@@ -170,10 +183,10 @@ describe('imfDataframeQuery', () => {
   // -------------------------------------------------------------------------
 
   it('#16 surfaces truncated=true when DataCanvas caps the result', async () => {
-    // DataCanvas caps at rowLimit and sets truncated; rowCount is the number of
-    // MATERIALIZED rows, so it equals the cap — there is no pre-cap total.
+    // DataCanvas sets truncated without reporting a pre-cap total. The server's
+    // row_count remains the number of rows it actually returns.
     mockCanvasQuery({
-      resolve: { rows: MOCK_ROWS, rowCount: 10_000, truncated: true, columns: [] },
+      resolve: { rows: MOCK_ROWS, rowCount: MOCK_ROWS.length, truncated: true, columns: [] },
     });
     const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeQuery.errors });
     const input = imfDataframeQuery.input.parse({
@@ -183,7 +196,8 @@ describe('imfDataframeQuery', () => {
 
     const result = await imfDataframeQuery.handler(input, ctx);
     expect(result.truncated).toBe(true);
-    expect(result.row_count).toBe(10_000);
+    expect(result.row_count).toBe(MOCK_ROWS.length);
+    expect(result.row_count).toBe(result.rows.length);
   });
 
   it('#16 reports truncated=false when DataCanvas omits the flag', async () => {
@@ -232,6 +246,96 @@ describe('imfDataframeQuery', () => {
     const description = imfDataframeQuery.output.shape.row_count.description ?? '';
     expect(description).not.toMatch(/before the cap|may exceed/i);
     expect(description).toMatch(/materialized/i);
+  });
+
+  // -------------------------------------------------------------------------
+  // #38: the complete two-channel response stays within its character budget
+  // -------------------------------------------------------------------------
+
+  it('#38 caps a 10,000-row dual-channel success envelope at 100,000 characters', async () => {
+    const rows = Array.from({ length: 10_000 }, (_, index) => ({
+      series_key: `USA.NGDP_RPCH.A.${index}`,
+      time_period: String(2000 + (index % 100)),
+      value: index / 10,
+      status: index % 2 === 0 ? null : 'E',
+    }));
+    mockCanvasQuery({ resolve: { rows, rowCount: rows.length, truncated: false, columns: [] } });
+    const input = imfDataframeQuery.input.parse({
+      canvas_id: 'canvas-abc',
+      sql: 'SELECT * FROM spilled_abc123 ORDER BY series_key',
+    });
+
+    const call = await runToolContract(imfDataframeQuery, input, {
+      context: { tenantId: 'test' },
+    });
+    const result = imfDataframeQuery.output.parse(call.structuredContent);
+
+    expect(JSON.stringify(call).length).toBeLessThanOrEqual(RESPONSE_ENVELOPE_CHAR_LIMIT);
+    expect(result.row_count).toBe(result.rows.length);
+    expect(result.truncated).toBe(true);
+    expect(result.rows).toEqual(rows.slice(0, result.row_count));
+    expect(
+      serializedSuccessEnvelopeLength({
+        rows: rows.slice(0, result.row_count + 1),
+        row_count: result.row_count + 1,
+        truncated: true,
+      }),
+    ).toBeGreaterThan(RESPONSE_ENVELOPE_CHAR_LIMIT);
+
+    const content = JSON.stringify(imfDataframeQuery.format!(result));
+    expect(content).toContain(String(result.rows.at(-1)?.series_key));
+    expect(content).not.toContain(String(rows[result.row_count]?.series_key));
+  });
+
+  it('#38 keeps a complete result whose emitted envelope is exactly 100,000 characters', async () => {
+    const rows = [{ payload: 'x'.repeat(49_911), n: 0 }];
+    mockCanvasQuery({ resolve: { rows, rowCount: 1, truncated: false, columns: [] } });
+    const input = imfDataframeQuery.input.parse({
+      canvas_id: 'canvas-abc',
+      sql: 'SELECT payload, n FROM spilled_abc123',
+    });
+
+    const call = await runToolContract(imfDataframeQuery, input, {
+      context: { tenantId: 'test' },
+    });
+    const result = imfDataframeQuery.output.parse(call.structuredContent);
+
+    expect(JSON.stringify(call).length).toBe(RESPONSE_ENVELOPE_CHAR_LIMIT);
+    expect(result).toEqual({ rows, row_count: 1, truncated: false });
+  });
+
+  it('#38 rejects a single row that cannot fit with actionable recovery', async () => {
+    const rows = [{ payload: 'x'.repeat(49_912), n: 0 }];
+    mockCanvasQuery({ resolve: { rows, rowCount: 1, truncated: false, columns: [] } });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeQuery.errors });
+    const input = imfDataframeQuery.input.parse({
+      canvas_id: 'canvas-abc',
+      sql: 'SELECT payload, n FROM spilled_abc123',
+    });
+
+    const error = await captureMcpError(() => imfDataframeQuery.handler(input, ctx));
+
+    expect(error.code).toBe(JsonRpcErrorCode.SerializationError);
+    expect(error.data?.reason).toBe('response_too_large');
+    expect(error.data?.recovery).toMatchObject({
+      hint: expect.stringMatching(/fewer columns|aggregate|shorter values/i),
+    });
+  });
+
+  it('#38 reports an exhausted empty page as complete', async () => {
+    mockCanvasQuery({ resolve: { rows: [], rowCount: 0, truncated: false, columns: [] } });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeQuery.errors });
+    const input = imfDataframeQuery.input.parse({
+      canvas_id: 'canvas-abc',
+      sql: 'SELECT * FROM spilled_abc123 ORDER BY series_key LIMIT 100 OFFSET 10000',
+    });
+
+    const result = await imfDataframeQuery.handler(input, ctx);
+    const text = (imfDataframeQuery.format!(result)[0] as { text: string }).text;
+
+    expect(result).toEqual({ rows: [], row_count: 0, truncated: false });
+    expect(text).not.toContain('OFFSET');
+    expect(text).not.toMatch(/truncated/i);
   });
 
   // -------------------------------------------------------------------------

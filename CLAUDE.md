@@ -1,7 +1,7 @@
 # Developer Protocol
 
 **Server:** imf-mcp-server
-**Version:** 0.3.1
+**Version:** 0.4.0
 **Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.12.3`
 **Engines:** Bun ≥1.3.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
@@ -15,7 +15,7 @@
 
 **imf-mcp-server** wraps the IMF SDMX 3.0 public portal. No API key required.
 
-**Surface area:** 5 tools, 1 resource, 0 prompts.
+**Surface area:** 6 tools, 1 resource, 0 prompts.
 
 **Workflow:** `imf_list_databases` → `imf_get_database` → `imf_query_dataset`. Large result sets spill to DataCanvas — `imf_dataframe_describe` then `imf_dataframe_query` for SQL access.
 
@@ -139,6 +139,7 @@ import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 const ServerConfigSchema = z.object({
   baseUrl: z.string().default('https://api.imf.org/external/sdmx/3.0').describe('IMF SDMX 3.0 base URL'),
   requestTimeoutMs: z.coerce.number().default(30_000).describe('Per-request timeout in milliseconds'),
+  enableDataframeDrop: z.stringbool().default(false).describe('Whether imf_dataframe_drop is enabled'),
 });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
@@ -146,6 +147,7 @@ export function getServerConfig() {
   _config ??= parseEnvConfig(ServerConfigSchema, {
     baseUrl: 'IMF_BASE_URL',
     requestTimeoutMs: 'IMF_REQUEST_TIMEOUT_MS',
+    enableDataframeDrop: 'IMF_ENABLE_DATAFRAME_DROP',
   });
   return _config;
 }
@@ -255,6 +257,7 @@ src/
       imf-query-dataset.tool.ts        # Query by key + time range; spills to canvas
       imf-dataframe-describe.tool.ts   # List canvas tables and schema
       imf-dataframe-query.tool.ts      # SQL SELECT on staged canvas tables
+      imf-dataframe-drop.tool.ts       # Opt-in table/view cleanup on a canvas
     resources/definitions/
       imf-database.resource.ts         # imf://database/{dataflow_id} — bounded DSD discovery resource
 ```

@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "imf-mcp-server",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Query IMF SDMX 3.0 macroeconomic dataflows — WEO, BOP, CPI, exchange rates, 190 countries.",
   "author": { "name": "cyanheads" },
   "repository": {
@@ -19,6 +19,7 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
+        "IMF_ENABLE_DATAFRAME_DROP": "${user_config.imf_enable_dataframe_drop}",
         "NODE_ENV": "production"
       }
     }
@@ -28,5 +29,13 @@
   },
   "tools_generated": true,
   "prompts_generated": true,
-  "user_config": {}
+  "user_config": {
+    "imf_enable_dataframe_drop": {
+      "type": "boolean",
+      "title": "Enable DataCanvas cleanup",
+      "description": "Allow imf_dataframe_drop to remove staged tables and views.",
+      "required": false,
+      "default": false
+    }
+  }
 }

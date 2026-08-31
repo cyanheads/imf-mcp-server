@@ -11,6 +11,7 @@
 | `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, and status, plus unit/scale/decimals per series. Large analytical result sets spill to DataCanvas; `output_mode: canvas` explicitly stages any result. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional destination), `output_mode` (`auto` or `canvas`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call. Shows table name, row count, and column schema. | `canvas_id` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_dataframe_query` | Run a read-only SQL SELECT against a staged DataCanvas table. Enables multi-country comparisons, time-series aggregation, and cross-indicator joins without hand-rolled loops. | `canvas_id`, `sql` (one SELECT statement; a leading `WITH … SELECT` CTE is accepted) | `readOnlyHint: true`, `openWorldHint: false` |
+| `imf_dataframe_drop` | Remove one staged DataCanvas table or view without affecting other tables on the same canvas. Disabled by default and retained in the HTML landing-page inventory. | `canvas_id`, `table_name` from `imf_dataframe_describe` | `readOnlyHint: false`, `idempotentHint: true`, `destructiveHint: true`, `openWorldHint: false` |
 
 ### Tool Details
 
@@ -158,9 +159,9 @@ errors: [
 
 ---
 
-#### `imf_dataframe_describe` and `imf_dataframe_query`
+#### `imf_dataframe_describe`, `imf_dataframe_query`, and `imf_dataframe_drop`
 
-**Error contract (both tools):**
+**Error contract (all three tools):**
 ```
 errors: [
   { reason: 'canvas_not_found', code: NotFound,
@@ -181,14 +182,28 @@ errors: [
   { reason: 'sql_not_permitted', code: ValidationError,
     when: 'sql parses as SELECT but the read-only gate refuses it — external-data/PRAGMA table function, system catalog, or a non-allowlisted plan operator',
     recovery: 'Query only the tables listed by imf_dataframe_describe using plain SELECT features.' },
+  { reason: 'response_too_large', code: SerializationError,
+    when: 'The first result row cannot fit in the complete structured and formatted response budget',
+    recovery: 'Select fewer columns, aggregate the result, or return shorter values so one complete row fits the response budget.' },
 ]
 ```
 
 Every reason the DataCanvas gate can raise on `query()` is mapped onto one of these four before it leaves the handler. The framework's own hints name `registerTable()` / `describe()`, which no MCP client can call.
 
+**Additional error contract on `imf_dataframe_drop`:**
+```
+errors: [
+  { reason: 'invalid_table_name', code: ValidationError,
+    when: 'table_name is empty, malformed, longer than 63 characters, or a reserved SQL keyword',
+    recovery: 'Copy an exact table name from imf_dataframe_describe and try again.' },
+]
+```
+
+The tool calls the atomic `CanvasInstance.drop(table_name)` primitive directly. A missing table or repeated drop is a successful `dropped: false` result; only the core identifier reasons map to `invalid_table_name`, and unrelated framework errors pass through unchanged. `disabledTool()` keeps the definition in the HTML landing-page inventory with `IMF_ENABLE_DATAFRAME_DROP=true` as its enable hint while omitting it from `tools/list` when the flag is false. The SEP-1649 discovery document at `/.well-known/mcp.json` intentionally carries capabilities and connection metadata without tool definitions.
+
 **Additional constraints on `imf_dataframe_query`:**
 - `sql`: one statement, starting with `SELECT` or `WITH`. The handler's `/^\s*(?:SELECT|WITH)\b/i` shape check runs *before* canvas acquisition so `invalid_sql` stays reachable when the canvas is disabled; it deliberately mirrors the framework gate's own `isSelectShaped` test. Statement typing is authoritative in the framework, which parses with DuckDB — `WITH … SELECT` types as `SELECT`, `WITH … INSERT` types as `INSERT` and is rejected.
-- Output carries `truncated`. DataCanvas caps a result at the canvas row limit (default 10,000) and reports no pre-cap total, so `row_count` is the number of *materialized* rows and equals the cap when `truncated` is true. `format()` appends a paging note in the same case.
+- Output carries `truncated`. DataCanvas first caps materialization at its row limit (default 10,000); the server then retains the largest prefix whose complete `structuredContent` plus formatted `content[]` fits 100,000 serialized characters. `row_count` always equals returned `rows` and never claims a pre-cap total. `truncated` is true when either cap omitted rows, and `format()` appends deterministic `ORDER BY` plus `LIMIT`/`OFFSET` guidance in both cases. If the first row cannot fit, `response_too_large` directs the caller to project fewer columns, aggregate, or shorten values rather than dropping the row.
 
 ### Resources
 
@@ -208,7 +223,7 @@ None — this is a pure data server; no reusable message templates warranted.
 
 Global macroeconomic and financial statistics from the International Monetary Fund, accessed via the IMF's SDMX 3.0 portal (`api.imf.org`). Covers hundreds of dataflows including WEO projections, balance of payments, exchange rates, price indices, international liquidity, government finance, and national accounts for ~190 member countries.
 
-The server follows the **discover → describe → query** workflow: `imf_list_databases` to find a dataflow id, `imf_get_database` to resolve dimension codes, `imf_query_dataset` to fetch observations. Large analytical pulls spill automatically and smaller pulls can be staged explicitly. A staged handle is consumed through `imf_dataframe_describe` before `imf_dataframe_query`.
+The server follows the **discover → describe → query** workflow: `imf_list_databases` to find a dataflow id, `imf_get_database` to resolve dimension codes, `imf_query_dataset` to fetch observations. Large analytical pulls spill automatically and smaller pulls can be staged explicitly. A staged handle is consumed through `imf_dataframe_describe` before `imf_dataframe_query`, then its table can be reclaimed through opt-in `imf_dataframe_drop`.
 
 **Audience:** Economists, macro/sovereign-risk analysts, development researchers, financial journalists, and agents answering questions like "what's country X's current-account balance?", "how do WEO projections compare across emerging markets?", or "what are US inflation trends since 2010?"
 
@@ -226,7 +241,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 - Country codes are ISO 3-letter (USA, GBR, DEU, …), not ISO 2-letter
 - Observations returned in compact SDMX-JSON format: indexed by position (e.g. `"0":["-0.257"]`) requiring resolution against `structures[0].dimensions.observation[0].values` for time labels
 - Attribute data carried per-series (SCALE, DECIMALS_DISPLAYED, UNIT, IFS_FLAG) and per-observation (STATUS, PRECISION) — the series-level ids are not uniform across the catalog (see decision 15)
-- DataCanvas (DuckDB) for large analytical result sets — opt-in via `CANVAS_PROVIDER_TYPE=duckdb`
+- DataCanvas (DuckDB) for large analytical result sets — opt-in via `CANVAS_PROVIDER_TYPE=duckdb`; table-level cleanup is separately opt-in via `IMF_ENABLE_DATAFRAME_DROP=true`
 
 ---
 
@@ -234,8 +249,8 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 
 | Service | Wraps | Used By |
 |:--------|:------|:--------|
-| `ImfSdmxService` | `api.imf.org` SDMX 3.0 REST API | All tools |
-| Canvas accessor | `DataCanvas` from mcp-ts-core | `imf_query_dataset`, `imf_dataframe_describe`, `imf_dataframe_query` |
+| `ImfSdmxService` | `api.imf.org` SDMX 3.0 REST API | `imf_list_databases`, `imf_get_database`, `imf_query_dataset`, `imf://database/{dataflow_id}` |
+| Canvas accessor | `DataCanvas` from mcp-ts-core | `imf_query_dataset`, `imf_dataframe_describe`, `imf_dataframe_query`, `imf_dataframe_drop` |
 
 ---
 
@@ -244,6 +259,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 | Env Var | Required | Description |
 |:--------|:---------|:------------|
 | `CANVAS_PROVIDER_TYPE` | No (default: `none`) | Set to `duckdb` to enable DataCanvas for large query result spill. Requires `@duckdb/node-api` peer dep. |
+| `IMF_ENABLE_DATAFRAME_DROP` | No (default: `false`) | Set to `true` to register the destructive `imf_dataframe_drop` table-cleanup tool. |
 | `IMF_BASE_URL` | No (default: `https://api.imf.org/external/sdmx/3.0`) | Override base URL for testing or proxied environments. |
 | `IMF_REQUEST_TIMEOUT_MS` | No (default: `30000`) | Per-request timeout in milliseconds. IMF SDMX 3.0 responses can be slow on large dataflows. |
 
@@ -256,7 +272,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 3. **`imf_list_databases`** — list + name-filter, paged with `limit`/`offset` and shortened descriptions (the full catalog does not fit a single response worth spending)
 4. **`imf_get_database`** — DSD fetch with `?references=all`; dimensions + codelists; local name→code resolution
 5. **`imf_query_dataset`** — key validation, data fetch, observation decode, spillover for large results
-6. **`imf_dataframe_describe` + `imf_dataframe_query`** — canvas query pair (no-op when canvas disabled)
+6. **`imf_dataframe_describe` + `imf_dataframe_query` + `imf_dataframe_drop`** — canvas inspection, bounded SQL, and opt-in table cleanup (no-op when canvas disabled)
 7. **`imf://database/{dataflow_id}` resource** — DSD fetch + bounded codelist discovery, stable URI
 
 Each step is independently testable.
@@ -271,7 +287,7 @@ Each step is independently testable.
 | Dimension | list per dataflow, resolve code by name | Part of `imf_get_database` |
 | Codelist | fetch per DSD dimension | Returned inline in `imf_get_database` |
 | Observation | fetch by dimension key + time range | `imf_query_dataset` |
-| Canvas table | register (spill), describe, query | `imf_query_dataset` + dataframe pair |
+| Canvas table | register (spill), describe, query, drop | `imf_query_dataset` + dataframe trio |
 
 ---
 
@@ -314,7 +330,7 @@ The `api.imf.org` portal does not require registration for data queries. All dat
 
 IMF macro data is inherently analytical — multi-country GDP comparisons, BOP time series, WEO cross-country projections. An agent querying 30 countries × 5 indicators × 20 years = 3,000 observations is exactly the "agent would run `GROUP BY country`" shape that earns a canvas. DataCanvas is adopted. Automatic placement measures the actual MCP success result (`structuredContent` plus rendered `content[]`, including enrichment trailers) and stages only when that result exceeds 100,000 serialized characters. Series metadata, handles, attribution, guidance, and truthful `observation_count` are fixed; the observation preview is reduced to meet the cap. If those fixed fields alone exceed the budget, the tool returns `response_too_large` and asks the caller to narrow the series key rather than silently dropping metadata.
 
-The `canvas_id` from `imf_query_dataset` is reachable via `imf_dataframe_query` and `imf_dataframe_describe` — no dead handles.
+The `canvas_id` from `imf_query_dataset` is reachable via `imf_dataframe_query` and `imf_dataframe_describe`; opt-in `imf_dataframe_drop` reclaims one completed table without deleting unrelated tables or invalidating the canvas.
 
 ### 3. Key format: dimension-positional, DSD-local
 

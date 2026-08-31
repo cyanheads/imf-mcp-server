@@ -6,7 +6,7 @@
     "url": "https://github.com/cyanheads/imf-mcp-server",
     "source": "github"
   },
-  "version": "0.3.1",
+  "version": "0.4.0",
   "remotes": [
     {
       "type": "streamable-http",
@@ -19,7 +19,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/imf-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.1",
+      "version": "0.4.0",
       "packageArguments": [
         {
           "type": "positional",
@@ -31,6 +31,13 @@
         }
       ],
       "environmentVariables": [
+        {
+          "name": "IMF_ENABLE_DATAFRAME_DROP",
+          "description": "Enable imf_dataframe_drop for removing staged DataCanvas tables and views.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        },
         {
           "name": "MCP_LOG_LEVEL",
           "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
@@ -48,7 +55,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/imf-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.1",
+      "version": "0.4.0",
       "packageArguments": [
         {
           "type": "positional",
@@ -60,6 +67,13 @@
         }
       ],
       "environmentVariables": [
+        {
+          "name": "IMF_ENABLE_DATAFRAME_DROP",
+          "description": "Enable imf_dataframe_drop for removing staged DataCanvas tables and views.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        },
         {
           "name": "MCP_HTTP_HOST",
           "description": "The hostname for the HTTP server.",

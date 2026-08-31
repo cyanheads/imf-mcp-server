@@ -4,12 +4,14 @@
  */
 
 export { imfDataframeDescribe } from './imf-dataframe-describe.tool.js';
+export { imfDataframeDrop } from './imf-dataframe-drop.tool.js';
 export { imfDataframeQuery } from './imf-dataframe-query.tool.js';
 export { imfGetDatabase } from './imf-get-database.tool.js';
 export { imfListDatabases } from './imf-list-databases.tool.js';
 export { imfQueryDataset } from './imf-query-dataset.tool.js';
 
 import { imfDataframeDescribe } from './imf-dataframe-describe.tool.js';
+import { imfDataframeDrop } from './imf-dataframe-drop.tool.js';
 import { imfDataframeQuery } from './imf-dataframe-query.tool.js';
 import { imfGetDatabase } from './imf-get-database.tool.js';
 import { imfListDatabases } from './imf-list-databases.tool.js';
@@ -21,4 +23,5 @@ export const allToolDefinitions = [
   imfQueryDataset,
   imfDataframeDescribe,
   imfDataframeQuery,
+  imfDataframeDrop,
 ];

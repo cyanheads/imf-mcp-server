@@ -15,6 +15,73 @@ import { getCanvas } from '@/services/canvas/canvas-accessor.js';
  * `WITH … INSERT` as INSERT.
  */
 const SELECT_SHAPED = /^\s*(?:SELECT|WITH)\b/i;
+const RESPONSE_ENVELOPE_CHAR_LIMIT = 100_000;
+
+type DataframeQueryResult = {
+  rows: Array<Record<string, unknown>>;
+  row_count: number;
+  truncated: boolean;
+};
+
+function formatDataframeQueryResult(result: DataframeQueryResult) {
+  const header = `**${result.row_count} row${result.row_count === 1 ? '' : 's'}**`;
+  const truncationNote = result.truncated
+    ? '\n\n_**Truncated** — capped by the response-size budget or canvas row limit, and more rows may match. Page the remainder with a stable ORDER BY plus LIMIT/OFFSET, or narrow the query._'
+    : '';
+
+  if (result.rows.length === 0) {
+    return [{ type: 'text' as const, text: `${header}${truncationNote}` }];
+  }
+
+  const columns = Object.keys(result.rows[0] as object);
+  const lines: string[] = [
+    `${header}\n`,
+    `| ${columns.join(' | ')} |`,
+    `| ${columns.map(() => ':---').join(' | ')} |`,
+  ];
+
+  for (const row of result.rows) {
+    const cells = columns.map((col) => {
+      const value = row[col];
+      return value == null ? '—' : String(value);
+    });
+    lines.push(`| ${cells.join(' | ')} |`);
+  }
+
+  return [{ type: 'text' as const, text: lines.join('\n') + truncationNote }];
+}
+
+function serializedSuccessEnvelopeLength(result: DataframeQueryResult): number {
+  return JSON.stringify({
+    structuredContent: result,
+    content: formatDataframeQueryResult(result),
+  }).length;
+}
+
+function fitResponseEnvelope(
+  rows: Array<Record<string, unknown>>,
+  canvasTruncated: boolean,
+): DataframeQueryResult | undefined {
+  const completeResult = { rows, row_count: rows.length, truncated: canvasTruncated };
+  if (serializedSuccessEnvelopeLength(completeResult) <= RESPONSE_ENVELOPE_CHAR_LIMIT) {
+    return completeResult;
+  }
+
+  let low = 0;
+  let high = rows.length;
+  while (low < high) {
+    const midpoint = Math.ceil((low + high) / 2);
+    const candidate = { rows: rows.slice(0, midpoint), row_count: midpoint, truncated: true };
+    if (serializedSuccessEnvelopeLength(candidate) <= RESPONSE_ENVELOPE_CHAR_LIMIT) {
+      low = midpoint;
+    } else {
+      high = midpoint - 1;
+    }
+  }
+
+  if (low === 0 && rows.length > 0) return undefined;
+  return { rows: rows.slice(0, low), row_count: low, truncated: true };
+}
 
 type ContractReason = 'canvas_not_found' | 'missing_table' | 'invalid_sql' | 'sql_not_permitted';
 
@@ -74,16 +141,18 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
             'A result row — keys are the selected column names, values match the column DuckDB types (string, number, null).',
           ),
       )
-      .describe('Query result rows, capped at the canvas row limit (default 10,000).'),
+      .describe(
+        'Largest result-row prefix whose complete structured and formatted response fits the 100,000-character response budget, after the canvas row limit (default 10,000) is applied.',
+      ),
     row_count: z
       .number()
       .describe(
-        'Number of rows materialized in rows. Equals the canvas row limit when truncated is true — DataCanvas does not report a pre-cap total, so this is never larger than rows.length.',
+        'Number of materialized rows returned in rows. Always equals rows.length and never claims a pre-cap total.',
       ),
     truncated: z
       .boolean()
       .describe(
-        'True when the query matched more rows than the canvas row limit and the result was capped. ' +
+        'True when DataCanvas capped the query at its row limit or the server omitted materialized rows to fit the response-size budget. ' +
           'Page the remainder with a stable ORDER BY plus LIMIT/OFFSET, or narrow the query with WHERE or aggregation.',
       ),
   }),
@@ -115,6 +184,13 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
       when: 'sql parses as a SELECT but the read-only gate refuses it — it calls an external-data or PRAGMA table function, reads a system catalog, or plans an operator outside the read-only allowlist',
       recovery:
         'Query only the tables listed by imf_dataframe_describe using plain SELECT features; file-reading functions and catalog introspection are not available here.',
+    },
+    {
+      reason: 'response_too_large',
+      code: JsonRpcErrorCode.SerializationError,
+      when: 'The first result row cannot fit in the complete structured and formatted response budget',
+      recovery:
+        'Select fewer columns, aggregate the result, or return shorter values so one complete row fits the response budget.',
     },
   ],
 
@@ -183,43 +259,22 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
       });
     }
 
-    const truncated = result.truncated === true;
+    const response = fitResponseEnvelope(result.rows, result.truncated === true);
+    if (!response) {
+      throw ctx.fail(
+        'response_too_large',
+        'The first query row exceeds the 100,000-character response budget.',
+        ctx.recoveryFor('response_too_large'),
+      );
+    }
     ctx.log.info('Canvas query executed', {
       canvasId: input.canvas_id,
-      rowCount: result.rowCount,
-      truncated,
+      rowCount: response.row_count,
+      truncated: response.truncated,
     });
 
-    return { rows: result.rows, row_count: result.rowCount, truncated };
+    return response;
   },
 
-  format: (result) => {
-    const header = `**${result.row_count} row${result.row_count === 1 ? '' : 's'}**`;
-    // Rendered only when it fires: a complete result carries no truncation line,
-    // and the note itself names the field so format-parity resolves `truncated`.
-    const truncationNote = result.truncated
-      ? `\n\n_**Truncated** — capped at the canvas row limit, and more rows match. Page the remainder with a stable ORDER BY plus LIMIT/OFFSET, or narrow the query._`
-      : '';
-
-    if (result.rows.length === 0) {
-      return [{ type: 'text', text: `${header}${truncationNote}` }];
-    }
-
-    const columns = Object.keys(result.rows[0] as object);
-    const lines: string[] = [
-      `${header}\n`,
-      `| ${columns.join(' | ')} |`,
-      `| ${columns.map(() => ':---').join(' | ')} |`,
-    ];
-
-    for (const row of result.rows) {
-      const cells = columns.map((col) => {
-        const v = (row as Record<string, unknown>)[col];
-        return v == null ? '—' : String(v);
-      });
-      lines.push(`| ${cells.join(' | ')} |`);
-    }
-
-    return [{ type: 'text', text: lines.join('\n') + truncationNote }];
-  },
+  format: formatDataframeQueryResult,
 });

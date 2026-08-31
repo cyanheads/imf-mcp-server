@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/imf-mcp-server</h1>
   <p><b>Query IMF SDMX 3.0 macroeconomic data — hundreds of dataflows across 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP.</b>
-  <div>5 Tools • 1 Resource</div>
+  <div>6 Tools • 1 Resource</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Tools
 
-Five tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed canvas layer for SQL analytics over large multi-country result sets:
+Six tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed canvas layer for SQL analytics over large multi-country result sets:
 
 | Tool | Description |
 |:-----|:------------|
@@ -38,6 +38,7 @@ Five tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed c
 | `imf_query_dataset` | Query a dataflow by dimension key over a time range; large result sets spill to DataCanvas |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call |
 | `imf_dataframe_query` | Run a read-only SQL SELECT across staged DataCanvas tables for multi-country comparisons and aggregations |
+| `imf_dataframe_drop` | Remove one staged table or view without affecting other tables on the canvas; disabled by default |
 
 ### `imf_list_databases`
 
@@ -81,7 +82,7 @@ Query an IMF SDMX dataflow by dimension key over a time range.
 
 ---
 
-### `imf_dataframe_describe` / `imf_dataframe_query`
+### `imf_dataframe_describe` / `imf_dataframe_query` / `imf_dataframe_drop`
 
 In-conversation SQL analytics over the observation tables that `imf_query_dataset` stages on a DuckDB-backed canvas.
 
@@ -90,8 +91,11 @@ When `imf_query_dataset` returns `staged: true`, the full dataset is registered 
 1. Call `imf_query_dataset` — let large results spill automatically or set `output_mode: "canvas"`; when `staged: true`, note the `canvas_id` and `table_name`
 2. Call `imf_dataframe_describe` with the `canvas_id` to discover table schema
 3. Call `imf_dataframe_query` with a SELECT statement for aggregations, cross-country comparisons, or time-series analysis
+4. When table cleanup is enabled, call `imf_dataframe_drop` with a name from `imf_dataframe_describe` to remove only that table or view
 
-One SELECT statement per call; a leading `WITH … SELECT` common table expression is accepted. DML and DDL are rejected. A query result is capped at the canvas row limit (default 10,000) — a capped response reports `truncated: true`, and the remainder is reachable with a stable `ORDER BY` plus `LIMIT`/`OFFSET`. Requires `CANVAS_PROVIDER_TYPE=duckdb`.
+One SELECT statement per call; a leading `WITH … SELECT` common table expression is accepted. DML and DDL are rejected. DataCanvas first caps materialization at its row limit (default 10,000), then the server retains the largest row prefix whose complete structured and formatted response fits 100,000 serialized characters. `row_count` always equals the returned rows; `truncated: true` means either cap omitted rows, and the remainder is reachable with a stable `ORDER BY` plus `LIMIT`/`OFFSET`. If one row cannot fit, `response_too_large` asks the caller to select fewer columns, aggregate, or shorten values. Requires `CANVAS_PROVIDER_TYPE=duckdb`.
+
+`imf_dataframe_drop` is opt-in because it mutates the canvas. Set `IMF_ENABLE_DATAFRAME_DROP=true` to register it in `tools/list`; disabled HTTP deployments retain the exact enable hint in the HTML landing-page inventory. The SEP-1649 discovery document at `/.well-known/mcp.json` does not enumerate tool definitions. A successful removal returns `dropped: true`; an absent or previously removed name returns `dropped: false` while leaving the canvas and its other tables intact.
 
 ## Resource
 
@@ -204,7 +208,7 @@ Or with Docker:
 }
 ```
 
-To enable SQL analytics over large result sets, add `CANVAS_PROVIDER_TYPE=duckdb` to the `env` block.
+To enable SQL analytics over large result sets, add `CANVAS_PROVIDER_TYPE=duckdb` to the `env` block. Add `IMF_ENABLE_DATAFRAME_DROP=true` only when agents should be able to remove staged tables.
 
 For Streamable HTTP, set the transport and start the server:
 
@@ -250,6 +254,7 @@ cp .env.example .env
 | Variable | Description | Default |
 |:---------|:------------|:--------|
 | `CANVAS_PROVIDER_TYPE` | Set to `duckdb` to enable DataCanvas spill for large result sets. | — |
+| `IMF_ENABLE_DATAFRAME_DROP` | Advertise and enable destructive table-level DataCanvas cleanup. | `false` |
 | `IMF_BASE_URL` | IMF SDMX 3.0 base URL. Override for testing or proxied environments. | `https://api.imf.org/external/sdmx/3.0` |
 | `IMF_REQUEST_TIMEOUT_MS` | Per-request timeout in milliseconds. | `30000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |

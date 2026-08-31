@@ -15,6 +15,10 @@ const ServerConfigSchema = z.object({
     .number()
     .default(30_000)
     .describe('Per-request timeout in milliseconds'),
+  enableDataframeDrop: z
+    .stringbool()
+    .default(false)
+    .describe('Whether the destructive imf_dataframe_drop tool is enabled'),
 });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
@@ -24,6 +28,7 @@ export function getServerConfig(): z.infer<typeof ServerConfigSchema> {
   _config ??= parseEnvConfig(ServerConfigSchema, {
     baseUrl: 'IMF_BASE_URL',
     requestTimeoutMs: 'IMF_REQUEST_TIMEOUT_MS',
+    enableDataframeDrop: 'IMF_ENABLE_DATAFRAME_DROP',
   });
   return _config;
 }
