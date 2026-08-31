@@ -45,7 +45,7 @@ export const imfListDatabases = tool('imf_list_databases', {
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
-    openWorldHint: false,
+    openWorldHint: true,
   },
   input: z.object({
     filter: z

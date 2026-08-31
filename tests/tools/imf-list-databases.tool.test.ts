@@ -62,6 +62,14 @@ describe('imfListDatabases', () => {
     (getImfSdmxService as ReturnType<typeof vi.fn>).mockReturnValue(mockSvc);
   });
 
+  it('#37 declares external-world access at the tool-definition boundary', () => {
+    expect(imfListDatabases.annotations).toMatchObject({
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    });
+  });
+
   it('returns all non-vintage dataflows by default', async () => {
     const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({});

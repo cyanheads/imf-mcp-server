@@ -1903,7 +1903,7 @@ describe('ImfSdmxService.fetchData dimension-group attributes (#33)', () => {
   };
 
   it('reports the unit WEO carries for a series instead of null', async () => {
-    // The live `USA.NGDP_RPCH.A` response: real GDP growth is a percentage and
+    // The live `USA.NGDP_RPCH.A` response: GDP at constant prices is a percentage and
     // the payload says so, in the one bucket the decode never read.
     const result = await decode(
       weoDimensionGroupFixture({

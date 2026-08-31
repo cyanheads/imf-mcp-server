@@ -99,6 +99,14 @@ describe('imfGetDatabase', () => {
     );
   });
 
+  it('#37 declares external-world access at the tool-definition boundary', () => {
+    expect(imfGetDatabase.annotations).toMatchObject({
+      readOnlyHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    });
+  });
+
   it('#12 surfaces dsd_version and structure_ref when the structure carries them', async () => {
     mockSvc.fetchDataflowStructure.mockResolvedValue({
       ...MOCK_STRUCTURE,
@@ -128,6 +136,7 @@ describe('imfGetDatabase', () => {
       structure_ref: 'DSD_BOP',
       name: 'International Investment Position (IIP)',
       key_format: 'COUNTRY.INDICATOR.FREQUENCY',
+      truncated: false,
       dimensions: [
         {
           id: 'COUNTRY',
@@ -135,6 +144,10 @@ describe('imfGetDatabase', () => {
           position: 0,
           codelist: [{ id: 'USA', name: 'United States' }],
           codelist_truncated: false,
+          unfiltered_count: 1,
+          matched_count: 1,
+          returned_count: 1,
+          offset: 0,
         },
       ],
       source:
@@ -216,6 +229,7 @@ describe('imfGetDatabase', () => {
       version: '9.0.0',
       name: 'World Economic Outlook',
       key_format: 'COUNTRY.INDICATOR.FREQUENCY',
+      truncated: false,
       dimensions: [
         {
           id: 'COUNTRY',
@@ -223,6 +237,10 @@ describe('imfGetDatabase', () => {
           position: 0,
           codelist: [{ id: 'USA', name: 'United States' }],
           codelist_truncated: false,
+          unfiltered_count: 1,
+          matched_count: 1,
+          returned_count: 1,
+          offset: 0,
         },
       ],
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
@@ -245,6 +263,7 @@ describe('imfGetDatabase', () => {
       version: '9.0.0',
       name: 'World Economic Outlook',
       key_format: 'COUNTRY.INDICATOR.FREQUENCY',
+      truncated: true,
       dimensions: [
         {
           id: 'COUNTRY',
@@ -252,13 +271,18 @@ describe('imfGetDatabase', () => {
           position: 0,
           codelist: [{ id: 'USA', name: 'United States' }],
           codelist_truncated: true,
+          unfiltered_count: 60,
+          matched_count: 60,
+          returned_count: 50,
+          offset: 0,
+          next_offset: 50,
         },
       ],
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
     const blocks = imfGetDatabase.format!(output);
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('truncated');
+    expect(text).toContain('more matches remain');
   });
 
   // -------------------------------------------------------------------------
@@ -315,7 +339,7 @@ describe('imfGetDatabase', () => {
     expect(dim.codelist[0]!.id).toBe('PCPIPCH');
   });
 
-  it('codelist_filter returns all matches — not capped at 50', async () => {
+  it('#40 bounds an unselected filtered preview at 50 entries', async () => {
     // 80 entries that all match "match"
     const largeCodelist = Array.from({ length: 80 }, (_, i) => ({
       id: `MATCH_${i}`,
@@ -329,12 +353,29 @@ describe('imfGetDatabase', () => {
       ],
     });
 
-    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
-    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: 'match' });
-    const result = await imfGetDatabase.handler(input, ctx);
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      codelist_filter: 'match',
+    });
+    const result = response.structuredContent as Awaited<ReturnType<typeof imfGetDatabase.handler>>;
+    const text = (response.content as Array<{ type: string; text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
 
-    expect(result.dimensions[0]!.codelist).toHaveLength(80);
-    expect(result.dimensions[0]!.codelist_truncated).toBe(false);
+    expect(result.truncated).toBe(true);
+    expect(result.dimensions[0]).toMatchObject({
+      codelist: expect.arrayContaining([{ id: 'MATCH_0', name: 'Match entry 0' }]),
+      unfiltered_count: 80,
+      matched_count: 80,
+      returned_count: 50,
+      offset: 0,
+      codelist_truncated: true,
+      next_offset: 50,
+    });
+    expect(result.dimensions[0]!.codelist).toHaveLength(50);
+    expect(text).toContain('50 returned');
+    expect(text).toContain('80 matched');
+    expect(text).toContain('offset=50');
   });
 
   it('without codelist_filter: behavior unchanged (first 50, truncated flag)', async () => {
@@ -354,8 +395,233 @@ describe('imfGetDatabase', () => {
     const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO' });
     const result = await imfGetDatabase.handler(input, ctx);
 
+    expect(result.dimensions[0]).toMatchObject({
+      unfiltered_count: 60,
+      matched_count: 60,
+      returned_count: 50,
+      offset: 0,
+      codelist_truncated: true,
+      next_offset: 50,
+    });
+    expect(result.truncated).toBe(true);
     expect(result.dimensions[0]!.codelist).toHaveLength(50);
-    expect(result.dimensions[0]!.codelist_truncated).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // #36: filter validation and normalization
+  // -------------------------------------------------------------------------
+
+  it('#36 rejects a whitespace-only codelist_filter at the schema boundary', () => {
+    expect(() =>
+      imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: '   ' }),
+    ).toThrow();
+  });
+
+  it('#36 trims a padded filter once for matching, structured output, and content[]', async () => {
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      codelist_filter: '  Constant prices  ',
+    });
+    const structured = response.structuredContent as {
+      codelist_filter?: string;
+      dimensions: Array<{ codelist: Array<{ id: string }> }>;
+    };
+    const text = (response.content as Array<{ type: string; text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(structured.codelist_filter).toBe('Constant prices');
+    expect(structured.dimensions.flatMap((dimension) => dimension.codelist)).toContainEqual(
+      expect.objectContaining({ id: 'NGDP_RPCH' }),
+    );
+    expect(text).toContain('`Constant prices`');
+    expect(text).not.toContain('  Constant prices  ');
+  });
+
+  // -------------------------------------------------------------------------
+  // #40: selected-dimension pagination and bounded response metadata
+  // -------------------------------------------------------------------------
+
+  it('#40 pages one selected dimension through the first, final, and past-end pages', async () => {
+    const codelist = Array.from({ length: 55 }, (_, index) => ({
+      id: `CODE_${index}`,
+      name: `Code ${index}`,
+    }));
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dimensions: [
+        { id: 'INDICATOR', name: 'Indicator', position: 0, codelist },
+        ...MOCK_STRUCTURE.dimensions.slice(1),
+      ],
+    });
+    const ctx = () => createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+
+    const first = await imfGetDatabase.handler(
+      imfGetDatabase.input.parse({
+        dataflow_id: 'WEO',
+        dimension_id: 'INDICATOR',
+        limit: 30,
+        offset: 0,
+      }),
+      ctx(),
+    );
+    const final = await imfGetDatabase.handler(
+      imfGetDatabase.input.parse({
+        dataflow_id: 'WEO',
+        dimension_id: 'INDICATOR',
+        limit: 30,
+        offset: 30,
+      }),
+      ctx(),
+    );
+    const pastEnd = await imfGetDatabase.handler(
+      imfGetDatabase.input.parse({
+        dataflow_id: 'WEO',
+        dimension_id: 'INDICATOR',
+        limit: 30,
+        offset: 60,
+      }),
+      ctx(),
+    );
+
+    expect(first.dimensions).toHaveLength(1);
+    expect(first.dimensions[0]).toMatchObject({
+      id: 'INDICATOR',
+      unfiltered_count: 55,
+      matched_count: 55,
+      returned_count: 30,
+      offset: 0,
+      codelist_truncated: true,
+      next_offset: 30,
+    });
+    expect(final.dimensions[0]).toMatchObject({
+      returned_count: 25,
+      offset: 30,
+      codelist_truncated: true,
+    });
+    expect(final.dimensions[0]).not.toHaveProperty('next_offset');
+    expect(pastEnd.dimensions[0]).toMatchObject({
+      matched_count: 55,
+      returned_count: 0,
+      offset: 60,
+      codelist: [],
+      codelist_truncated: true,
+    });
+    expect(pastEnd.dimensions[0]).not.toHaveProperty('next_offset');
+    expect((imfGetDatabase.format!(pastEnd)[0] as { text: string }).text).toContain(
+      'offset 60 is past the end',
+    );
+  });
+
+  it('#40 applies codelist_filter before selected-dimension paging', async () => {
+    const codelist = Array.from({ length: 70 }, (_, index) => ({
+      id: index % 2 === 0 ? `MATCH_${index}` : `OTHER_${index}`,
+      name: `Code ${index}`,
+    }));
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dimensions: [{ id: 'INDICATOR', name: 'Indicator', position: 0, codelist }],
+    });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const result = await imfGetDatabase.handler(
+      imfGetDatabase.input.parse({
+        dataflow_id: 'WEO',
+        dimension_id: 'INDICATOR',
+        codelist_filter: 'match_',
+        limit: 10,
+        offset: 10,
+      }),
+      ctx,
+    );
+
+    expect(result.dimensions[0]).toMatchObject({
+      unfiltered_count: 70,
+      matched_count: 35,
+      returned_count: 10,
+      offset: 10,
+      codelist_truncated: true,
+      next_offset: 20,
+    });
+    expect(result.dimensions[0]!.codelist.every((entry) => entry.id.startsWith('MATCH_'))).toBe(
+      true,
+    );
+  });
+
+  it('#40 rejects paging controls without dimension_id', () => {
+    expect(() => imfGetDatabase.input.parse({ dataflow_id: 'WEO', limit: 10 })).toThrow();
+    expect(() => imfGetDatabase.input.parse({ dataflow_id: 'WEO', offset: 10 })).toThrow();
+  });
+
+  it('#40 returns a declared structured error for an unknown dimension_id', async () => {
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO', dimension_id: 'UNKNOWN' });
+
+    await expect(imfGetDatabase.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'dimension_not_found',
+        availableDimensions: ['COUNTRY', 'INDICATOR', 'FREQUENCY'],
+      },
+    });
+  });
+
+  it('#40 distinguishes a filtered zero-match page from an unresolved codelist', async () => {
+    const filtered = await imfGetDatabase.handler(
+      imfGetDatabase.input.parse({
+        dataflow_id: 'WEO',
+        dimension_id: 'INDICATOR',
+        codelist_filter: 'zzzznomatch',
+      }),
+      createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors }),
+    );
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dimensions: [{ id: 'EMPTY', name: 'Empty', position: 0, codelist: [] }],
+    });
+    const unresolved = await imfGetDatabase.handler(
+      imfGetDatabase.input.parse({ dataflow_id: 'WEO', dimension_id: 'EMPTY' }),
+      createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors }),
+    );
+
+    expect(filtered.dimensions[0]).toMatchObject({ unfiltered_count: 1, matched_count: 0 });
+    expect(unresolved.dimensions[0]).toMatchObject({ unfiltered_count: 0, matched_count: 0 });
+  });
+
+  it('#40 carries page metadata and continuation through structuredContent and content[]', async () => {
+    const codelist = Array.from({ length: 55 }, (_, index) => ({
+      id: `CODE_${index}`,
+      name: `Code ${index}`,
+    }));
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dimensions: [{ id: 'INDICATOR', name: 'Indicator', position: 0, codelist }],
+    });
+
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      dimension_id: 'INDICATOR',
+      limit: 20,
+      offset: 20,
+    });
+    const structured = response.structuredContent as {
+      dimensions: Array<Record<string, unknown>>;
+    };
+    const text = (response.content as Array<{ type: string; text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(structured.dimensions[0]).toMatchObject({
+      matched_count: 55,
+      returned_count: 20,
+      offset: 20,
+      next_offset: 40,
+    });
+    expect(structured).toMatchObject({ truncated: true });
+    expect(text).toContain('20 returned');
+    expect(text).toContain('55 matched');
+    expect(text).toContain('offset 20');
+    expect(text).toContain('offset=40');
+    expect(text).toContain('**Truncated:** true');
   });
 
   // -------------------------------------------------------------------------
@@ -400,7 +666,7 @@ describe('imfGetDatabase', () => {
 
     const notice = getEnrichment(ctx).notice as string;
     expect(notice).toContain('COUNTERPART_COUNTRY');
-    expect(notice).toContain('imf://database/WEO');
+    expect(notice).toContain('structure did not provide codes');
     // The filter-miss wording must not appear — it would send the caller the wrong way.
     expect(notice).not.toContain('codelist_filter');
     // And no filter echo, which is the structured signal for this cause.
@@ -429,12 +695,11 @@ describe('imfGetDatabase', () => {
   });
 
   it('#27 separates the two causes in structuredContent AND content[] end to end', async () => {
-    mockSvc.fetchDataflowStructure.mockResolvedValue(emptyEverywhere());
-
     const filtered = await runToolContract(imfGetDatabase, {
       dataflow_id: 'WEO',
       codelist_filter: 'zzzznomatch',
     });
+    mockSvc.fetchDataflowStructure.mockResolvedValue(emptyEverywhere());
     const unfiltered = await runToolContract(imfGetDatabase, { dataflow_id: 'WEO' });
 
     const sc = (r: typeof filtered) => r.structuredContent as Record<string, unknown>;
@@ -450,7 +715,7 @@ describe('imfGetDatabase', () => {
     // content[]: the per-dimension line discriminates the cause and the
     // enrichment trailer carries the remediation — both reach content[].
     expect(text(filtered)).toContain('zzzznomatch');
-    expect(text(unfiltered)).toContain('imf://database/WEO');
+    expect(text(unfiltered)).toContain('structure did not provide codes');
     expect(text(filtered)).not.toContain('no codelist resolved');
     expect(text(unfiltered)).not.toContain('zzzznomatch');
   });
@@ -480,6 +745,7 @@ describe('imfGetDatabase', () => {
       version: '1.0.0',
       name: 'Balance of Payments',
       key_format: 'COUNTRY',
+      truncated: false,
       dimensions: [
         {
           id: 'COUNTRY',
@@ -487,6 +753,10 @@ describe('imfGetDatabase', () => {
           position: 0,
           codelist: [],
           codelist_truncated: false,
+          unfiltered_count: 1,
+          matched_count: 0,
+          returned_count: 0,
+          offset: 0,
         },
       ],
       source: 'Source: International Monetary Fund, Balance of Payments, https://data.imf.org/',
@@ -495,7 +765,12 @@ describe('imfGetDatabase', () => {
     const filtered = (
       imfGetDatabase.format!({ ...base, codelist_filter: 'zzzznomatch' })[0] as { text: string }
     ).text;
-    const unfiltered = (imfGetDatabase.format!(base)[0] as { text: string }).text;
+    const unfiltered = (
+      imfGetDatabase.format!({
+        ...base,
+        dimensions: [{ ...base.dimensions[0]!, unfiltered_count: 0 }],
+      })[0] as { text: string }
+    ).text;
 
     expect(filtered).not.toBe(unfiltered);
     // Each line names its own cause; neither repeats the remediation, which the
@@ -510,18 +785,19 @@ describe('imfGetDatabase', () => {
   });
 
   // -------------------------------------------------------------------------
-  // #19: the description matches the default response
+  // #19/#40: the description matches the bounded response
   // -------------------------------------------------------------------------
 
-  it('#19 description states the cap and names both complete-retrieval paths', () => {
+  it('#19/#40 description states the cap and names the selected-dimension paging path', () => {
     const d = imfGetDatabase.description;
-    // The default response is a preview, not the complete codelist it used to promise.
     expect(d).not.toContain('dimension list and complete codelist');
     expect(d).toContain('codelist preview');
     expect(d).toContain(`capped at the first ${50} entries`);
-    // Both retrieval paths named, so a capped caller knows where to go.
     expect(d).toContain('codelist_filter');
+    expect(d).toContain('dimension_id');
+    expect(d).toContain('limit/offset');
     expect(d).toContain('imf://database/{dataflow_id}');
+    expect(d).not.toContain('complete codelists');
   });
 
   it('truncation notice in format output names the escape hatch', () => {
@@ -531,6 +807,7 @@ describe('imfGetDatabase', () => {
       version: '9.0.0',
       name: 'World Economic Outlook',
       key_format: 'COUNTRY.INDICATOR.FREQUENCY',
+      truncated: true,
       dimensions: [
         {
           id: 'INDICATOR',
@@ -538,14 +815,19 @@ describe('imfGetDatabase', () => {
           position: 0,
           codelist: [{ id: 'NGDP_RPCH', name: 'GDP growth' }],
           codelist_truncated: true,
+          unfiltered_count: 80,
+          matched_count: 80,
+          returned_count: 50,
+          offset: 0,
+          next_offset: 50,
         },
       ],
       source: 'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
     };
     const blocks = imfGetDatabase.format!(output);
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('codelist_filter');
-    expect(text).toContain('imf://database');
+    expect(text).toContain('dimension_id="INDICATOR"');
+    expect(text).toContain('offset=50');
   });
 
   // -------------------------------------------------------------------------
@@ -568,5 +850,16 @@ describe('imfGetDatabase', () => {
     expect(err.data?.reason).toBe('dataflow_list_unavailable');
     expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('Retry') });
     expect(JSON.stringify({ message: err.message, data: err.data })).not.toContain('/structure/');
+  });
+
+  it('#24 keeps dataflow_list_unavailable from the structure lookup', async () => {
+    mockSvc.fetchDataflowStructure.mockRejectedValue(dataflowListUnavailable());
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO' });
+
+    const err = await captureMcpError(() => imfGetDatabase.handler(input, ctx));
+
+    expect(err.data?.reason).toBe('dataflow_list_unavailable');
+    expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('Retry') });
   });
 });

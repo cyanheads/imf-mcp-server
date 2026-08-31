@@ -4,7 +4,8 @@
  */
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { projectCodelist } from '@/mcp-server/codelist-page.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
 export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
@@ -12,7 +13,7 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
   title: 'IMF Dataflow Metadata',
   description:
     'Metadata for a single IMF SDMX dataflow — dimensions with their concept-scheme labels and ' +
-    'full codelists, key_format, name, and description. ' +
+    'bounded codelist previews, counts, key_format, name, and description. ' +
     'Stable URI-addressable reference for known dataflow IDs (WEO, BOP, CPI, etc.).',
   mimeType: 'application/json',
   params: z.object({
@@ -53,21 +54,73 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
                   })
                   .describe('A single codelist entry.'),
               )
-              .describe('Every valid code for this dimension — full list, never truncated.'),
+              .describe('Bounded preview of valid codes for this dimension.'),
+            codelist_truncated: z
+              .boolean()
+              .describe('True when matching codes were omitted after this preview.'),
+            unfiltered_count: z
+              .number()
+              .describe('Codes in the complete resolved codelist before response bounding.'),
+            matched_count: z.number().describe('Codes matching this unfiltered resource read.'),
+            returned_count: z.number().describe('Codes returned in this bounded preview.'),
+            offset: z.number().describe('Codes skipped before this preview; always 0 here.'),
+            next_offset: z
+              .number()
+              .optional()
+              .describe('Offset for imf_get_database when later codes remain.'),
           })
           .describe('A single dimension of the data structure definition.'),
       )
-      .describe('Dimensions in key order, each with its complete codelist.'),
+      .describe('Dimensions in key order, each with a bounded codelist preview and counts.'),
+    continuation: z
+      .object({
+        tool: z
+          .literal('imf_get_database')
+          .describe('Tool that retrieves selected codelist pages.'),
+        dataflow_id: z.string().describe('Dataflow ID to pass to the continuation tool.'),
+        dimension_selector: z
+          .literal('dimension_id')
+          .describe('Parameter that selects the dimension to page.'),
+        page_limit: z.literal('limit').describe('Parameter that controls selected page size.'),
+        page_offset: z
+          .literal('offset')
+          .describe('Parameter that advances through selected pages.'),
+      })
+      .describe('Machine-readable path for retrieving every code through imf_get_database.'),
   }),
+
+  errors: [
+    {
+      reason: 'dataflow_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'dataflow_id does not match any known dataflow on api.imf.org',
+      recovery: 'Call imf_list_databases to browse available dataflow IDs.',
+    },
+    {
+      reason: 'structure_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'api.imf.org returns no usable data structure for the selected dataflow',
+      recovery:
+        'Retry after a short wait; distinguish this upstream failure from an invalid dataflow ID.',
+    },
+    {
+      reason: 'dataflow_list_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The dataflow catalog used to resolve dataflow_id could not be fetched',
+      retryable: true,
+      recovery:
+        'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
+    },
+  ],
 
   async handler(params, ctx) {
     const svc = getImfSdmxService();
 
     const dataflow = await svc.findDataflow(params.dataflow_id, undefined, undefined, ctx);
     if (!dataflow) {
-      throw notFound(`Dataflow '${params.dataflow_id}' not found`, {
-        reason: 'dataflow_not_found',
+      throw ctx.fail('dataflow_not_found', `Dataflow '${params.dataflow_id}' not found`, {
         dataflowId: params.dataflow_id,
+        ...ctx.recoveryFor('dataflow_not_found'),
       });
     }
 
@@ -80,22 +133,25 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
         ctx,
       );
     } catch (err: unknown) {
+      if (err instanceof McpError && err.data?.reason === 'dataflow_list_unavailable') throw err;
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('not found')) {
-        throw notFound(
+        throw ctx.fail(
+          'dataflow_not_found',
           `Dataflow '${params.dataflow_id}' not found`,
           {
-            reason: 'dataflow_not_found',
             dataflowId: params.dataflow_id,
+            ...ctx.recoveryFor('dataflow_not_found'),
           },
           { cause: err },
         );
       }
-      throw serviceUnavailable(
+      throw ctx.fail(
+        'structure_unavailable',
         `Structure unavailable for dataflow '${params.dataflow_id}'`,
         {
-          reason: 'structure_unavailable',
           dataflowId: params.dataflow_id,
+          ...ctx.recoveryFor('structure_unavailable'),
         },
         { cause: err },
       );
@@ -114,8 +170,15 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
         id: dim.id,
         name: dim.name,
         position: dim.position,
-        codelist: dim.codelist,
+        ...projectCodelist(dim.codelist),
       })),
+      continuation: {
+        tool: 'imf_get_database' as const,
+        dataflow_id: structure.dataflowId,
+        dimension_selector: 'dimension_id' as const,
+        page_limit: 'limit' as const,
+        page_offset: 'offset' as const,
+      },
     };
   },
 });

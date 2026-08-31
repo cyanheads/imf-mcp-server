@@ -6,8 +6,8 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `imf_list_databases` | List IMF SDMX dataflows available on the portal, one page at a time. Returns id, agencyID, version, name, and a shortened description. Entry point — every query requires a dataflow id. | `filter` (optional name substring), `include_vintages` (bool, default false), `limit` (1–200, default 50), `offset` (default 0) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
-| `imf_get_database` | Fetch a dataflow's dimension list plus a codelist preview for each dimension — first 50 entries by default, every substring match when `codelist_filter` is set, and complete codelists from the `imf://database/{dataflow_id}` resource. Resolves human terms to SDMX codes ("United States" → USA, "real GDP growth" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional), `codelist_filter` (optional substring) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
+| `imf_list_databases` | List IMF SDMX dataflows available on the portal, one page at a time. Returns id, agencyID, version, name, and a shortened description. Entry point — every query requires a dataflow id. | `filter` (optional name substring), `include_vintages` (bool, default false), `limit` (1–200, default 50), `offset` (default 0) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `imf_get_database` | Fetch bounded codelist previews for every dimension, or page one exact `dimension_id` after an optional substring filter. Resolves human terms to SDMX codes ("United States" → USA, "Constant prices" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional), `codelist_filter` (optional substring), `dimension_id` (optional exact selector), `limit` (1–200), `offset` (requires `dimension_id`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, and status, plus unit/scale/decimals per series. Large analytical result sets spill to DataCanvas for SQL — returns `canvas_id` + `table_name`. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
 | `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call. Shows table name, row count, and column schema. | `canvas_id` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_dataframe_query` | Run a read-only SQL SELECT against a staged DataCanvas table. Enables multi-country comparisons, time-series aggregation, and cross-indicator joins without hand-rolled loops. | `canvas_id`, `sql` (one SELECT statement; a leading `WITH … SELECT` CTE is accepted) | `readOnlyHint: true`, `openWorldHint: false` |
@@ -53,15 +53,18 @@ The service applies the error boundary: a failed catalog fetch is logged with it
 
 **Input constraints:**
 - `dataflow_id`: string — value from `imf_list_databases`. No structural regex needed (codes are opaque alphanumeric, validated against the live dataflow list).
+- `codelist_filter`: optional non-blank string — trimmed once, then matched as a case-insensitive substring of code ID or name before paging.
+- `dimension_id`: optional exact dimension selector. `limit` (1–200, default 50) and `offset` (integer ≥ 0, default 0) are valid only when this selector is present.
 
 **Output:**
 - `dataflow_id`, `agency_id`, `version`, `name`, `description`
 - `codelist_filter`: string, present only when a filter was applied — echoing it is what separates "your filter matched nothing" from "this codelist could not be resolved", since both render as an empty array
+- `dimension_id`: present when one dimension was selected for paging
 - `key_format`: string — dimension names in order, e.g. `"COUNTRY.INDICATOR.FREQUENCY"` (agents must see this to construct keys without re-fetching the DSD)
-- `dimensions`: array of `{ id, name, position, codelist: [{ id, name }], codelist_truncated }` — `name` is the label from the DSD concept scheme (`WGT_TYPE` → `Weight Type`), falling back to the id when the structure names no concept; `codelist` is capped at 50 entries unless `codelist_filter` is set
+- `dimensions`: array of `{ id, name, position, codelist, codelist_truncated, unfiltered_count, matched_count, returned_count, offset, next_offset? }`. All previews are capped at 50; a selected dimension uses the requested `limit`/`offset`. `codelist_truncated` is true whenever matching entries were omitted before or after the returned page.
 
 **Enrichment:**
-- `notice`: emitted when `codelist_filter` matched nothing in any dimension (names the filter and the unfiltered entry counts) or when a dimension has no resolvable codelist (names the dimensions and points at the resource). Reaches both `structuredContent` and the `content[]` trailer.
+- `notice`: emitted when `codelist_filter` matched nothing in any dimension (names the filter and the unfiltered entry counts), when a dimension has no resolvable codelist, or when an offset is past the final match. Reaches both `structuredContent` and the `content[]` trailer.
 
 **Codelist resolution.** Each dimension's codelist is resolved from the `?references=all` payload, authoritative references first:
 
@@ -77,6 +80,9 @@ errors: [
   { reason: 'dataflow_not_found', code: NotFound,
     when: 'dataflow_id does not match any known dataflow',
     recovery: 'Call imf_list_databases to browse available dataflow IDs.' },
+  { reason: 'dimension_not_found', code: ValidationError,
+    when: 'dimension_id does not match a dimension in the selected dataflow',
+    recovery: 'Use an exact dimension ID returned by imf_get_database.' },
   { reason: 'structure_unavailable', code: ServiceUnavailable,
     when: 'api.imf.org returns non-200 on the DSD endpoint',
     recovery: 'Retry after a short wait; the IMF SDMX 3.0 portal is occasionally slow.' },
@@ -180,9 +186,9 @@ Every reason the DataCanvas gate can raise on `query()` is mapped onto one of th
 
 | URI Template | Description | Pagination |
 |:-------------|:------------|:-----------|
-| `imf://database/{dataflow_id}` | Metadata for a single dataflow — dimensions, codelists, name, description. Stable reference for known dataflow IDs (WEO, BOP, CPI, etc.). | None (single record) |
+| `imf://database/{dataflow_id}` | Bounded discovery metadata for one dataflow — dimensions, up to 50 codes each, counts, name, description, and continuation metadata. | None (single record) |
 
-**Resource error behavior:** throws `notFound()` when `dataflow_id` is not in the live dataflow list, and a `serviceUnavailable` carrying `reason: 'dataflow_list_unavailable'` when the catalog itself cannot be fetched. Shares `imf_get_database`'s shape (`key_format`, `dimensions`) and resolution, but returns complete codelists — no 50-entry cap and no `codelist_filter`.
+**Resource error behavior:** declares and emits `dataflow_not_found`, `structure_unavailable`, and `dataflow_list_unavailable`, each with sanitized recovery guidance. Shares `imf_get_database`'s bounded projection and returns a continuation object naming `imf_get_database`, `dimension_id`, `limit`, and `offset`; the existing URI remains discovery-only rather than encoding paging controls.
 
 ### Prompts
 
@@ -243,7 +249,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 4. **`imf_get_database`** — DSD fetch with `?references=all`; dimensions + codelists; local name→code resolution
 5. **`imf_query_dataset`** — key validation, data fetch, observation decode, spillover for large results
 6. **`imf_dataframe_describe` + `imf_dataframe_query`** — canvas query pair (no-op when canvas disabled)
-7. **`imf://database/{dataflow_id}` resource** — DSD fetch + codelist, stable URI
+7. **`imf://database/{dataflow_id}` resource** — DSD fetch + bounded codelist discovery, stable URI
 
 Each step is independently testable.
 
@@ -327,13 +333,14 @@ The portal exposes 70+ `_VINTAGE` dataflows (e.g. `WEO_2025_OCT_VINTAGE`, `CPI_2
 - **Inline path:** render `key_format`, `start_period`–`end_period` context, unit/scale, and the observations as a markdown table (time_period | value | status). Append a `truncated: true` notice with the suggestion to use `canvas_id` if applicable.
 - **Canvas spill path:** render the canvas handle summary — `canvas_id`, `table_name`, `observation_count` — plus instructions for follow-up (`imf_dataframe_describe` → `imf_dataframe_query`). Claude Desktop clients see only `content[]`; without this, they receive no usable data on spill.
 
-`imf_get_database` format: render `key_format` prominently (first line), then each dimension with its codelist entries as a markdown list. The codelist can be large — truncate at 50 entries per dimension and name the two ways to reach the rest (`codelist_filter`, the resource). A dimension with no entries renders one of two lines depending on whether `codelist_filter` is echoed in the result: a filter miss, or a codelist that could not be resolved.
+`imf_get_database` format: render `key_format` prominently (first line), then each dimension with its codelist entries and page counts. Every preview is bounded at 50; a selected `dimension_id` can use `limit`/`offset`, and `next_offset` names the continuation call. A dimension with no entries renders one of three states: filter miss, offset past the end, or unresolved codelist.
 
 ### 8. Caching strategy
 
 - Dataflow list: cache 1 hour — changes only when IMF publishes new releases
 - DSD + codelists: cache 24 hours per `(agency, dsd_id, version)` — rarely changes within a version
 - Data observations: no cache — always live
+- MCP metadata responses: public one-hour cache hints on all six cacheable 2026-07-28 operations (`tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, `resources/read`, `server/discover`); 2025 responses are unchanged
 
 Use `ctx.state` for in-process per-tenant caching; TTL-backed via the `ttl` option on `ctx.state.set`.
 

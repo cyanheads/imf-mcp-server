@@ -96,7 +96,7 @@ describe('imfDatabaseResource', () => {
   });
 
   it('returns dataflow metadata for a known dataflow_id', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
     const params = resourceParams.parse({ dataflow_id: 'WEO' });
     const result = await imfDatabaseResource.handler(params, ctx);
 
@@ -108,11 +108,24 @@ describe('imfDatabaseResource', () => {
       key_format: 'COUNTRY.INDICATOR.FREQUENCY',
     });
     expect(result.dimensions).toHaveLength(3);
-    expect(result.dimensions[0]?.codelist).toHaveLength(2);
+    expect(result.dimensions[0]).toMatchObject({
+      unfiltered_count: 2,
+      matched_count: 2,
+      returned_count: 2,
+      offset: 0,
+      codelist_truncated: false,
+    });
+    expect(result.continuation).toMatchObject({
+      tool: 'imf_get_database',
+      dataflow_id: 'WEO',
+      dimension_selector: 'dimension_id',
+      page_limit: 'limit',
+      page_offset: 'offset',
+    });
   });
 
   it('parses against the declared output schema, optional fields included', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
     const params = resourceParams.parse({ dataflow_id: 'WEO' });
     mockSvc.fetchDataflowStructure.mockResolvedValue({
       ...MOCK_STRUCTURE,
@@ -131,7 +144,7 @@ describe('imfDatabaseResource', () => {
   });
 
   it('parses against the output schema when every optional field is absent', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
     const params = resourceParams.parse({ dataflow_id: 'WEO' });
     const { description: _description, ...minimal } = MOCK_STRUCTURE;
     mockSvc.fetchDataflowStructure.mockResolvedValue(minimal);
@@ -146,26 +159,49 @@ describe('imfDatabaseResource', () => {
   });
 
   it('includes description when present', async () => {
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
     const params = resourceParams.parse({ dataflow_id: 'WEO' });
     const result = await imfDatabaseResource.handler(params, ctx);
 
     expect(result.description).toBe('Biannual WEO projections');
   });
 
-  it('throws NotFound when dataflow_id does not exist', async () => {
+  it('#43 declares every reachable resource failure with aligned codes', () => {
+    expect(imfDatabaseResource.errors).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reason: 'dataflow_not_found',
+          code: JsonRpcErrorCode.NotFound,
+        }),
+        expect.objectContaining({
+          reason: 'structure_unavailable',
+          code: JsonRpcErrorCode.ServiceUnavailable,
+        }),
+        expect.objectContaining({
+          reason: 'dataflow_list_unavailable',
+          code: JsonRpcErrorCode.ServiceUnavailable,
+        }),
+      ]),
+    );
+  });
+
+  it('#43 returns dataflow_not_found with actionable recovery for an unknown id', async () => {
     mockSvc.findDataflow.mockResolvedValue(undefined);
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
     const params = resourceParams.parse({ dataflow_id: 'UNKNOWN' });
 
     await expect(imfDatabaseResource.handler(params, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'dataflow_not_found',
+        recovery: { hint: expect.stringContaining('imf_list_databases') },
+      },
     });
   });
 
   it('throws NotFound when structure fetch returns not-found error', async () => {
     mockSvc.fetchDataflowStructure.mockRejectedValue(new Error('not found'));
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
     const params = resourceParams.parse({ dataflow_id: 'WEO' });
 
     await expect(imfDatabaseResource.handler(params, ctx)).rejects.toMatchObject({
@@ -173,18 +209,21 @@ describe('imfDatabaseResource', () => {
     });
   });
 
-  it('throws ServiceUnavailable when structure fetch fails with non-notfound error', async () => {
+  it('#43 returns structure_unavailable with retry recovery when the DSD fails', async () => {
     mockSvc.fetchDataflowStructure.mockRejectedValue(new Error('connection reset'));
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
     const params = resourceParams.parse({ dataflow_id: 'WEO' });
 
     await expect(imfDatabaseResource.handler(params, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
+      data: {
+        reason: 'structure_unavailable',
+        recovery: { hint: expect.stringMatching(/retry/i) },
+      },
     });
   });
 
-  it('returns full codelist (not truncated) unlike the tool', async () => {
-    // The resource returns full codelists (no 50-entry cap unlike imf_get_database tool)
+  it('#40 bounds codelists at 50 entries and exposes tool continuation metadata', async () => {
     const largeCodelist = Array.from({ length: 80 }, (_, i) => ({
       id: `C${i}`,
       name: `Country ${i}`,
@@ -197,11 +236,23 @@ describe('imfDatabaseResource', () => {
       ],
     });
 
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
     const params = resourceParams.parse({ dataflow_id: 'WEO' });
     const result = await imfDatabaseResource.handler(params, ctx);
 
-    expect(result.dimensions[0]?.codelist).toHaveLength(80);
+    expect(result.dimensions[0]).toMatchObject({
+      unfiltered_count: 80,
+      matched_count: 80,
+      returned_count: 50,
+      offset: 0,
+      codelist_truncated: true,
+      next_offset: 50,
+    });
+    expect(result.dimensions[0]?.codelist).toHaveLength(50);
+    expect(result.continuation).toMatchObject({
+      tool: 'imf_get_database',
+      dataflow_id: 'WEO',
+    });
   });
 
   it('#28 surfaces the concept label for each dimension rather than repeating the id', async () => {
@@ -220,7 +271,7 @@ describe('imfDatabaseResource', () => {
       ],
     });
 
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
     const params = resourceParams.parse({ dataflow_id: 'CTOT' });
     const result = await imfDatabaseResource.handler(params, ctx);
 
@@ -233,20 +284,32 @@ describe('imfDatabaseResource', () => {
   // #24: the resource path no longer echoes the upstream URL or response body
   // -------------------------------------------------------------------------
 
-  it('#24 surfaces a controlled dataflow_list_unavailable with no upstream detail', async () => {
+  it('#24/#43 preserves controlled dataflow_list_unavailable recovery with no upstream detail', async () => {
     mockSvc.findDataflow.mockRejectedValue(dataflowListUnavailable());
-    const ctx = createMockContext({ tenantId: 'test' });
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
     const params = resourceParams.parse({ dataflow_id: 'WEO' });
 
     const err = await captureMcpError(() => imfDatabaseResource.handler(params, ctx));
 
     expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
     expect(err.data?.reason).toBe('dataflow_list_unavailable');
+    expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('Retry') });
 
     // The resource previously returned the upstream body verbatim under data.responseBody.
     const wire = JSON.stringify({ message: err.message, data: err.data });
     expect(wire).not.toContain('responseBody');
     expect(wire).not.toContain('/structure/');
     expect(wire).not.toContain('Fetch failed');
+  });
+
+  it('#24/#43 preserves dataflow_list_unavailable from the structure lookup', async () => {
+    mockSvc.fetchDataflowStructure.mockRejectedValue(dataflowListUnavailable());
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
+    const params = resourceParams.parse({ dataflow_id: 'WEO' });
+
+    const err = await captureMcpError(() => imfDatabaseResource.handler(params, ctx));
+
+    expect(err.data?.reason).toBe('dataflow_list_unavailable');
+    expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('Retry') });
   });
 });

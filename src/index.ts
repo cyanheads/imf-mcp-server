@@ -5,6 +5,7 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
+import { IMF_METADATA_CACHE_HINTS } from './config/cache-hints.js';
 import { getServerConfig } from './config/server-config.js';
 import { allPromptDefinitions } from './mcp-server/prompts/definitions/index.js';
 import { allResourceDefinitions } from './mcp-server/resources/definitions/index.js';
@@ -15,6 +16,7 @@ import { initImfSdmxService } from './services/imf-sdmx/imf-sdmx-service.js';
 await createApp({
   name: 'imf-mcp-server',
   title: 'imf-mcp-server',
+  cacheHints: IMF_METADATA_CACHE_HINTS,
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,
