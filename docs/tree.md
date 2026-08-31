@@ -1,6 +1,6 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-08-31 02:39:19
+Generated on: 2026-08-31 06:29:41
 
 ```text
 imf-mcp-server/
@@ -25,6 +25,7 @@ imf-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -145,6 +146,7 @@ imf-mcp-server/
 │   │   ├── tools/
 │   │   │   └── definitions/
 │   │   │       ├── imf-dataframe-describe.tool.ts
+│   │   │       ├── imf-dataframe-drop.tool.ts
 │   │   │       ├── imf-dataframe-query.tool.ts
 │   │   │       ├── imf-get-database.tool.ts
 │   │   │       ├── imf-list-databases.tool.ts
@@ -169,6 +171,8 @@ imf-mcp-server/
 │   │       └── imf-sdmx-service.test.ts
 │   ├── tools/
 │   │   ├── imf-dataframe-describe.tool.test.ts
+│   │   ├── imf-dataframe-drop.registry.test.ts
+│   │   ├── imf-dataframe-drop.tool.test.ts
 │   │   ├── imf-dataframe-query.tool.test.ts
 │   │   ├── imf-get-database.tool.test.ts
 │   │   ├── imf-list-databases.tool.test.ts
