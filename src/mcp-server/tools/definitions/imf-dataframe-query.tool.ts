@@ -4,6 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 
@@ -119,11 +120,9 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
     openWorldHint: false,
   },
   input: z.object({
-    canvas_id: z
-      .string()
-      .describe(
-        'Canvas ID returned by imf_query_dataset whenever staged=true. Call imf_dataframe_describe with it before writing SQL.',
-      ),
+    canvas_id: CanvasIdSchema.describe(
+      'Canvas ID returned by imf_query_dataset whenever staged=true. Call imf_dataframe_describe with it before writing SQL.',
+    ),
     sql: z
       .string()
       .describe(
@@ -162,12 +161,14 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
       reason: 'canvas_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'canvas_id does not match any registered DataCanvas session (expired, wrong session, or canvas disabled)',
+      severity: 'warning',
       recovery: 'Re-run imf_query_dataset to obtain a fresh canvas_id.',
     },
     {
       reason: 'missing_table',
       code: JsonRpcErrorCode.NotFound,
       when: 'The canvas exists but sql references a table that is not staged on it — the table expired, was dropped, or the name is wrong',
+      severity: 'warning',
       recovery:
         'Call imf_dataframe_describe with this canvas_id to list the tables currently staged, or re-run imf_query_dataset to stage the source data again.',
     },
@@ -175,6 +176,7 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
       reason: 'invalid_sql',
       code: JsonRpcErrorCode.ValidationError,
       when: 'sql is not a single SELECT statement (a leading WITH … SELECT counts as one), or it is SELECT-shaped but fails to prepare — unknown column, unknown function, or a syntax error',
+      severity: 'warning',
       recovery:
         'Send exactly one SELECT (or WITH … SELECT) statement and check every column and table name against imf_dataframe_describe.',
     },
@@ -182,6 +184,7 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
       reason: 'sql_not_permitted',
       code: JsonRpcErrorCode.ValidationError,
       when: 'sql parses as a SELECT but the read-only gate refuses it — it calls an external-data or PRAGMA table function, reads a system catalog, or plans an operator outside the read-only allowlist',
+      severity: 'warning',
       recovery:
         'Query only the tables listed by imf_dataframe_describe using plain SELECT features; file-reading functions and catalog introspection are not available here.',
     },

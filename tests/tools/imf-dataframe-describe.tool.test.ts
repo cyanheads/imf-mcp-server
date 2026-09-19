@@ -3,8 +3,9 @@
  * @module tests/tools/imf-dataframe-describe.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/canvas/canvas-accessor.js', () => ({
@@ -13,6 +14,14 @@ vi.mock('@/services/canvas/canvas-accessor.js', () => ({
 
 import { imfDataframeDescribe } from '@/mcp-server/tools/definitions/imf-dataframe-describe.tool.js';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
+
+/**
+ * A canvas id the registry does not hold, in the shape `CanvasIdSchema`
+ * advertises — 10 characters from `[A-Za-z0-9_-]`. It has to be well-formed:
+ * a malformed id is rejected at argument validation and never reaches the
+ * handler, so a badly-shaped literal here would test the schema, not the miss.
+ */
+const EXPIRED_CANVAS_ID = 'cv0expired';
 
 const MOCK_TABLE_INFOS = [
   {
@@ -46,7 +55,7 @@ describe('imfDataframeDescribe', () => {
     const mockCanvasSvc = { acquire: vi.fn().mockRejectedValue(new Error('not found')) };
     (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue(mockCanvasSvc);
     const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeDescribe.errors });
-    const input = imfDataframeDescribe.input.parse({ canvas_id: 'expired-canvas' });
+    const input = imfDataframeDescribe.input.parse({ canvas_id: EXPIRED_CANVAS_ID });
 
     await expect(imfDataframeDescribe.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
@@ -119,5 +128,73 @@ describe('imfDataframeDescribe', () => {
       imfDataframeDescribe.errors?.find((e) => e.reason === 'canvas_not_found')?.recovery ?? '';
     expect(recovery).toContain('imf_query_dataset');
     expect(recovery).not.toContain('CANVAS_PROVIDER_TYPE');
+  });
+
+  // -------------------------------------------------------------------------
+  // canvas_id carries the minted CanvasIdSchema shape in inputSchema
+  // -------------------------------------------------------------------------
+
+  describe('canvas_id shape', () => {
+    /** Every rejected form and why the schema refuses it. */
+    const MALFORMED = [
+      ['too short', 'cv0expire'],
+      ['too long', 'expired-canvas'],
+      ['character outside the minted set', 'cv0expire!'],
+      ['empty', ''],
+    ] as const;
+
+    it.each(MALFORMED)('rejects a %s canvas_id before the handler runs', async (_label, id) => {
+      const acquire = vi.fn();
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({ acquire });
+
+      const result = await runToolContract(imfDataframeDescribe, { canvas_id: id });
+      const error = (
+        result.structuredContent as { error: { code: number; data?: { reason?: string } } }
+      ).error;
+
+      // Argument validation, not the tool's own canvas_not_found — the handler
+      // never runs, so the canvas is never touched.
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data?.reason).toBe('invalid_arguments');
+      expect(acquire).not.toHaveBeenCalled();
+
+      // Both consumption paths carry the rejection: structuredContent above,
+      // content[] here. The framework appends its own recovery and reason
+      // trailers, so assert containment rather than the exact text.
+      const text = (result.content[0] as { text: string }).text;
+      expect(text).toContain('canvas_id');
+    });
+
+    it('accepts a well-formed canvas_id and reaches the handler', async () => {
+      const describeTables = vi.fn().mockResolvedValue(MOCK_TABLE_INFOS);
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+        acquire: vi
+          .fn()
+          .mockResolvedValue({ canvasId: EXPIRED_CANVAS_ID, describe: describeTables }),
+      });
+
+      const result = await runToolContract(imfDataframeDescribe, {
+        canvas_id: EXPIRED_CANVAS_ID,
+      });
+
+      expect(describeTables).toHaveBeenCalledOnce();
+      expect(result.structuredContent).toMatchObject({
+        canvas_id: EXPIRED_CANVAS_ID,
+        table_count: 1,
+      });
+      expect((result.content[0] as { text: string }).text).toContain('spilled_abc123');
+    });
+
+    it('advertises the minted shape in the JSON Schema a client reads', () => {
+      const { properties } = z.toJSONSchema(imfDataframeDescribe.input, { io: 'input' });
+
+      expect(properties?.canvas_id).toMatchObject({
+        // The constraint has to reach the wire, not just the handler — that is
+        // the whole point of declaring the field with CanvasIdSchema.
+        pattern: '^[A-Za-z0-9_-]{10}$',
+        // The pattern alone says nothing about where an id comes from.
+        description: expect.stringContaining('imf_query_dataset'),
+      });
+    });
   });
 });

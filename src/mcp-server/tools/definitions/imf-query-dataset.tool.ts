@@ -8,6 +8,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { idGenerator } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
@@ -383,13 +384,10 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           'end_period 2023 admits 2023-M12 and 2023-Q4. ' +
           'Observations after this period are excluded from the result.',
       ),
-    canvas_id: z
-      .string()
-      .optional()
-      .describe(
-        'Existing canvas ID to accumulate results into across multiple queries. ' +
-          'This selects the destination only; it does not force staging. Use output_mode="canvas" to stage an under-budget result.',
-      ),
+    canvas_id: CanvasIdSchema.optional().describe(
+      'Existing canvas ID to accumulate results into across multiple queries. ' +
+        'This selects the destination only; it does not force staging. Use output_mode="canvas" to stage an under-budget result.',
+    ),
     output_mode: z
       .enum(['auto', 'canvas'])
       .default('auto')
@@ -538,12 +536,20 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       reason: 'dataflow_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'dataflow_id does not match any known dataflow on api.imf.org',
+      severity: 'warning',
       recovery: 'Call imf_list_databases to browse available dataflow IDs.',
     },
     {
       reason: 'no_data',
       code: JsonRpcErrorCode.NotFound,
       when: 'Key is structurally valid but the dataflow holds no series for this code combination, or the dataflow publishes no series at all',
+      /**
+       * A coverage miss is this tool's ordinary negative answer, not an
+       * incident — the response carries availability the caller acts on. Logging
+       * it at `error` beside upstream faults is what makes the error stream
+       * unreadable at the level alerting works on.
+       */
+      severity: 'notice',
       recovery:
         'Read the availability context in the error. An empty dataflow means no key will return data — call imf_list_databases and pick another dataflow. Otherwise, series_count 0 means the code itself has no coverage and dataflow_availability names codes that do, while series_count above 0 means the combination is wrong and available_codes names the codes that have data, stating how many of a dimension it shows when the list is capped.',
     },
@@ -551,6 +557,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       reason: 'no_data_in_range',
       code: JsonRpcErrorCode.NotFound,
       when: 'The key returned observations but start_period/end_period excluded every one of them',
+      severity: 'notice',
       recovery:
         'The key is valid — widen start_period/end_period to overlap the period range reported in the error, or omit both to get the full series.',
     },
@@ -558,6 +565,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       reason: 'key_dimension_mismatch',
       code: JsonRpcErrorCode.ValidationError,
       when: "Number of dot-separated segments in key does not match the dataflow's DSD dimension count",
+      severity: 'warning',
       recovery:
         'Call imf_get_database to get the correct key_format for this dataflow, then reconstruct the key.',
     },
@@ -565,6 +573,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       reason: 'empty_key_segment',
       code: JsonRpcErrorCode.ValidationError,
       when: 'A dot-separated position in key is empty or blank, which matches no series upstream',
+      severity: 'warning',
       recovery:
         'Put * at that position to match every code there, or a code from imf_get_database to pin it.',
     },
@@ -572,6 +581,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       reason: 'invalid_period_format',
       code: JsonRpcErrorCode.ValidationError,
       when: 'start_period or end_period is not one of the recognized period formats',
+      severity: 'warning',
       recovery:
         'Use YYYY (annual), YYYY-SN (semi-annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly), or a calendar-valid YYYY-MM-DD (daily).',
     },
@@ -579,6 +589,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       reason: 'invalid_period_range',
       code: JsonRpcErrorCode.ValidationError,
       when: 'start_period is later than end_period',
+      severity: 'warning',
       recovery: 'Provide start_period less than or equal to end_period (chronological order).',
     },
     {
@@ -606,6 +617,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The dataflow catalog that dataflow_id is resolved against could not be fetched — fires before the DSD and data lookups are attempted',
       retryable: true,
+      // Raised inside ImfSdmxService.fetchDataflows() and re-thrown untouched.
+      thrownBy: 'service',
       recovery:
         'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
     },

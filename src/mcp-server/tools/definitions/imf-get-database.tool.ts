@@ -244,12 +244,14 @@ export const imfGetDatabase = tool('imf_get_database', {
       reason: 'dataflow_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'dataflow_id does not match any known dataflow on api.imf.org',
+      severity: 'warning',
       recovery: 'Call imf_list_databases to browse available dataflow IDs.',
     },
     {
       reason: 'dimension_not_found',
       code: JsonRpcErrorCode.ValidationError,
       when: 'dimension_id does not match a dimension in the selected dataflow',
+      severity: 'warning',
       recovery: 'Use an exact dimension ID returned by imf_get_database for this dataflow.',
     },
     {
@@ -263,6 +265,8 @@ export const imfGetDatabase = tool('imf_get_database', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The dataflow catalog that dataflow_id is resolved against could not be fetched — fires before the DSD lookup is attempted',
       retryable: true,
+      // Raised inside ImfSdmxService.fetchDataflows() and re-thrown untouched.
+      thrownBy: 'service',
       recovery:
         'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
     },

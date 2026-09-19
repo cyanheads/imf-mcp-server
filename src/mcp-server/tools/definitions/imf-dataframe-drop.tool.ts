@@ -4,6 +4,7 @@
  */
 
 import { disabledTool, tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
@@ -25,7 +26,9 @@ const imfDataframeDropDefinition = tool('imf_dataframe_drop', {
     openWorldHint: false,
   },
   input: z.object({
-    canvas_id: z.string().describe('Canvas ID returned by imf_query_dataset whenever staged=true.'),
+    canvas_id: CanvasIdSchema.describe(
+      'Canvas ID returned by imf_query_dataset whenever staged=true.',
+    ),
     table_name: z.string().describe('Exact table or view name returned by imf_dataframe_describe.'),
   }),
   output: z.object({
@@ -42,12 +45,14 @@ const imfDataframeDropDefinition = tool('imf_dataframe_drop', {
       reason: 'canvas_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'canvas_id does not match any registered DataCanvas session (expired, wrong session, or canvas disabled)',
+      severity: 'warning',
       recovery: 'Re-run imf_query_dataset to obtain a fresh canvas_id.',
     },
     {
       reason: 'invalid_table_name',
       code: JsonRpcErrorCode.ValidationError,
       when: 'table_name is empty, malformed, longer than 63 characters, or a reserved SQL keyword',
+      severity: 'warning',
       recovery: 'Copy an exact table name from imf_dataframe_describe and try again.',
     },
   ],

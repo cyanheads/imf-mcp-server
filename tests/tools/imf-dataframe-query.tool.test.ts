@@ -20,6 +20,14 @@ const MOCK_ROWS = [
   { time_period: '2021', value: 5.1, status: 'E' },
 ];
 
+/**
+ * A canvas id the registry does not hold, in the shape `CanvasIdSchema`
+ * advertises — 10 characters from `[A-Za-z0-9_-]`. It has to be well-formed:
+ * a malformed id is rejected at argument validation and never reaches the
+ * handler, so a badly-shaped literal here would test the schema, not the miss.
+ */
+const EXPIRED_CANVAS_ID = 'cv0expired';
+
 const RESPONSE_ENVELOPE_CHAR_LIMIT = 100_000;
 
 function serializedSuccessEnvelopeLength(result: {
@@ -96,7 +104,7 @@ describe('imfDataframeQuery', () => {
     });
     const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeQuery.errors });
     const input = imfDataframeQuery.input.parse({
-      canvas_id: 'expired-canvas',
+      canvas_id: EXPIRED_CANVAS_ID,
       sql: 'SELECT * FROM spilled_abc123',
     });
 

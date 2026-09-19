@@ -4,6 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 
@@ -18,11 +19,9 @@ export const imfDataframeDescribe = tool('imf_dataframe_describe', {
     openWorldHint: false,
   },
   input: z.object({
-    canvas_id: z
-      .string()
-      .describe(
-        'Canvas ID returned by imf_query_dataset whenever staged=true, from automatic spillover or output_mode="canvas".',
-      ),
+    canvas_id: CanvasIdSchema.describe(
+      'Canvas ID returned by imf_query_dataset whenever staged=true, from automatic spillover or output_mode="canvas".',
+    ),
   }),
   output: z.object({
     canvas_id: z.string().describe('Canvas session ID that was introspected.'),
@@ -56,6 +55,7 @@ export const imfDataframeDescribe = tool('imf_dataframe_describe', {
       reason: 'canvas_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'canvas_id does not match any registered DataCanvas session (expired, wrong session, or canvas disabled)',
+      severity: 'warning',
       recovery: 'Re-run imf_query_dataset to obtain a fresh canvas_id.',
     },
   ],

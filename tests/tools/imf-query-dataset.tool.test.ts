@@ -56,6 +56,13 @@ const MOCK_OBSERVATIONS = [
 
 const MOCK_SERIES_ATTRS = { unit: 'Percent', scale: null, decimals: 3 };
 
+/**
+ * A canvas id to accumulate into, in the shape `CanvasIdSchema` advertises —
+ * 10 characters from `[A-Za-z0-9_-]`. `canvas_id` is validated as an argument,
+ * so a badly-shaped literal never reaches the handler.
+ */
+const EXISTING_CANVAS_ID = 'cvExisting';
+
 const MOCK_QUERY_RESULT = {
   dataflowId: 'WEO',
   key: 'USA.NGDP_RPCH.A',
@@ -345,14 +352,14 @@ describe('imfQueryDataset', () => {
       rowCount: MOCK_OBSERVATIONS.length,
       columns: [],
     });
-    const acquire = vi.fn().mockResolvedValue({ canvasId: 'canvas-existing', registerTable });
+    const acquire = vi.fn().mockResolvedValue({ canvasId: EXISTING_CANVAS_ID, registerTable });
     (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({ acquire });
 
     const staged = await imfQueryDataset.handler(
       imfQueryDataset.input.parse({
         dataflow_id: 'WEO',
         key: 'USA.NGDP_RPCH.A',
-        canvas_id: 'canvas-existing',
+        canvas_id: EXISTING_CANVAS_ID,
         output_mode: 'canvas',
       }),
       createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors }),
@@ -361,12 +368,12 @@ describe('imfQueryDataset', () => {
       imfQueryDataset.input.parse({
         dataflow_id: 'WEO',
         key: 'USA.NGDP_RPCH.A',
-        canvas_id: 'canvas-existing',
+        canvas_id: EXISTING_CANVAS_ID,
       }),
       createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors }),
     );
 
-    expect(acquire).toHaveBeenCalledWith('canvas-existing', expect.anything());
+    expect(acquire).toHaveBeenCalledWith(EXISTING_CANVAS_ID, expect.anything());
     expect(staged).toMatchObject({ staged: true, truncated: false });
     expect(automatic).toMatchObject({ staged: false, truncated: false });
   });

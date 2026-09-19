@@ -121,6 +121,8 @@ export const imfListDatabases = tool('imf_list_databases', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The IMF SDMX structure endpoint that backs the dataflow catalog did not return a usable response',
       retryable: true,
+      // Raised inside ImfSdmxService.fetchDataflows(), below this handler.
+      thrownBy: 'service',
       recovery:
         'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
     },

@@ -108,6 +108,8 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The dataflow catalog used to resolve dataflow_id could not be fetched',
       retryable: true,
+      // Raised inside ImfSdmxService.fetchDataflows() and re-thrown untouched.
+      thrownBy: 'service',
       recovery:
         'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
     },

@@ -16,6 +16,14 @@ import { initImfSdmxService } from './services/imf-sdmx/imf-sdmx-service.js';
 await createApp({
   name: 'imf-mcp-server',
   title: 'imf-mcp-server',
+  /**
+   * Every tool here answers from one upstream round-trip — none calls
+   * `ctx.requestInput`, so nothing needs a session to come back to. Declaring it
+   * in source rather than leaving it to `MCP_SESSION_MODE` keeps a deployment
+   * that forgets the variable on the posture the surface was built for; a
+   * deployment that does set it to a meaningful value still wins.
+   */
+  sessionMode: 'stateless',
   cacheHints: IMF_METADATA_CACHE_HINTS,
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
