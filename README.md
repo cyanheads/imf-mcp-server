@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.1-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -27,9 +27,11 @@
 
 ---
 
-## Tools
+## Overview
 
-Six tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed canvas layer for SQL analytics over large multi-country result sets:
+IMF SDMX 3.0 macroeconomic data — hundreds of dataflows spanning WEO projections, balance of payments, CPI, exchange rates, and national accounts across 190 countries. Browse the dataflow catalog, resolve dimension codes, and query time series from any MCP client, with large multi-country results staged to DataCanvas for SQL analysis. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+
+### Tools
 
 | Tool | Description |
 |:-----|:------------|
@@ -40,88 +42,83 @@ Six tools covering the full IMF SDMX 3.0 query workflow, plus a DuckDB-backed ca
 | `imf_dataframe_query` | Run a read-only SQL SELECT across staged DataCanvas tables for multi-country comparisons and aggregations |
 | `imf_dataframe_drop` | Remove one staged table or view without affecting other tables on the canvas; disabled by default |
 
-### `imf_list_databases`
+### Resources
 
-Entry point for every IMF query workflow — browse and filter the dataflow catalog, a page at a time.
+| Resource | Description |
+|:---|:---|
+| `imf://database/{dataflow_id}` | Bounded discovery metadata for one IMF SDMX dataflow — dimensions, codelist previews, `key_format`, and continuation guidance |
 
-- Hundreds of dataflows covering WEO projections, balance of payments, CPI, exchange rates, money/finance statistics, and national accounts
-- Vintage (historical snapshot) dataflows excluded by default; set `include_vintages=true` to include them
-- Case-insensitive substring filter across ID, name, and description — matched against the full description, not the shortened one returned
-- Paged: `limit` (default 50, max 200) and `offset`. `total_count` is the number of matches, `returned_count` the size of the page, and a notice names the next `offset` while matches remain
-- Descriptions are cut to 200 characters here; `imf_get_database` and the `imf://database/{dataflow_id}` resource return the full text for the dataflow you settle on
+Continuation beyond the resource's bounded codelist preview runs through `imf_get_database`.
 
----
+## Capability reference
 
-### `imf_get_database`
+### `imf_list_databases` <sub>tool</sub>
 
-Resolve human-readable terms to SDMX dimension codes before querying.
-
-- Returns every dimension ID, its position, its label from the DSD concept scheme (`WGT_TYPE` → `Weight Type`), and a codelist preview (e.g. `"United States"` → `USA`, `"Constant prices"` → `NGDP_RPCH`)
-- Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE)
-- `key_format` field shows the exact dot-separated dimension order required by `imf_query_dataset`
-- Every codelist preview is bounded at 50 entries, including substring-filtered previews. Set `dimension_id` to page one codelist with `limit`/`offset`; `codelist_filter` still applies its case-insensitive substring match before paging
-- Set `available_only=true` to replace codelists with codes reported by the dataflow-wide availability constraint. The response includes total series and time coverage, joins each available code to its DSD label with an ID fallback, and applies `dimension_id`, `codelist_filter`, `limit`, and `offset` after availability filtering. Omit `dimension_id` for a bounded preview of every structure dimension, including empty dimensions the constraint does not mention
-- A filter that matches nothing is reported distinctly from a codelist that could not be resolved — the two need opposite next steps
+- Case-insensitive substring filter across ID, name, and description, matched against the full text — not the shortened preview this tool returns
+- Vintage (historical snapshot) dataflows such as `WEO_2025_OCT_VINTAGE` are excluded by default; set `include_vintages=true` to include them
+- Paged: `limit` (default 50, max 200) and `offset`; `total_count` reports total matches, `returned_count` the page size, and a notice names the next `offset` while matches remain
+- Descriptions are cut to 200 characters here — `imf_get_database` and the `imf://database/{dataflow_id}` resource return the full text
 
 ---
 
-### `imf_query_dataset`
+### `imf_get_database` <sub>tool</sub>
 
-Query an IMF SDMX dataflow by dimension key over a time range.
-
-- Dot-separated key in DSD keyPosition order (e.g. `USA.NGDP_RPCH.A` for WEO annual GDP at constant prices, percent change)
-- `+` combines codes at one position (e.g. `USA+GBR+DEU.NGDP_RPCH.A`); `*` matches every code at a position (`*.NGDP_RPCH.A` for all countries, `CAN.*.A` for every indicator). Every position needs a code or a `*` — a blank segment matches nothing upstream and is rejected
-- `start_period` / `end_period` accept `YYYY`, `YYYY-SN`, `YYYY-QN`, `YYYY-MM`, or a calendar-valid `YYYY-MM-DD` whatever the series frequency, and cover the whole period they name — `end_period: 2023` includes `2023-M12` and `2023-Q4`
-- Returns observations with `time_period`, `value`, `status`, and series attributes (`unit`, `scale`, `decimals`). Period labels come back as upstream emits them — `2023`, `2023-S1`, `2023-Q1`, `2023-M01`, `2023-01-05` — and any of them can be passed straight back in as a bound
-- A key resolving to several series carries `series_metadata`, one `unit`/`scale`/`decimals` entry per `series_key`, because attributes differ between them: in `USA.NGDPD+NGDP_RPCH.*`, `NGDPD` is `USD` at scale `9` while `NGDP_RPCH` is `PT` and unscaled. Canvas rows carry their own series' attributes too. A single-series query keeps the flat `series_attributes` and no list
-- `unit` is the upstream code — `PT`, `USD`, `XDC`, `IX`, `NUM`. Every key shape reports the same unit: the portal drops the unit block when a key uses `+` on the dimension that carries it, and one extra attributes-only request recovers it, so `USA.NGDP_RPCH+NGDPD.A` and `USA.NGDP_RPCH+NGDPD.*` both report `USD` and `PT`. That key shape is the only one that costs the second request; every other query makes one. A `unit: null` therefore means the dataflow publishes none, which many do
-- Scale `0` is the upstream sentinel for "no multiplier" — formatted output names it rather than printing a bare `0`, and `structuredContent` keeps the raw code
-- Large multi-country or long time-range queries automatically spill to DataCanvas; set `output_mode: "canvas"` to explicitly stage any result, using `canvas_id` as the destination when supplied
-- `staged` reports whether the complete result is on DataCanvas; `truncated` reports only whether `observations` is an incomplete preview. Staged results always return `canvas_id`, `table_name`, and describe-before-query guidance in both MCP result channels
-- `no_data` errors include availability context from the upstream constraint endpoint: a dataflow that publishes no series at all is reported as such and points at a different dataflow, since no key would work; otherwise `series_count=0` means the code has no coverage and `dataflow_availability` names codes that do, while `series_count>0` means the combination is wrong and `available_codes` lists what does have data per dimension, stating how many of how many it is showing when a dimension is too long to list in full
-- A valid key whose data lies entirely outside the requested range fails as `no_data_in_range`, reporting the range the series actually spans — the fix is the range, not the key
+- Resolves human-readable terms to SDMX dimension codes (e.g. "United States" → `USA`) and returns each dimension's DSD concept-scheme label
+- Country codes are ISO 3-letter (`USA`, `GBR`, `DEU`), not ISO 2-letter (`US`, `GB`, `DE`)
+- `key_format` names the exact dot-separated dimension order `imf_query_dataset` requires
+- Codelist previews are capped at 50 entries by default; set `dimension_id` to page one dimension with `limit`/`offset` (max 200), and `codelist_filter` applies before paging
+- Set `available_only=true` to page codes the dataflow actually publishes, with series count and time coverage, instead of the full codelist
+- A `codelist_filter` that matches nothing is reported distinctly from a codelist that could not be resolved — the two need opposite next steps
 
 ---
 
-### `imf_dataframe_describe` / `imf_dataframe_query` / `imf_dataframe_drop`
+### `imf_query_dataset` <sub>tool</sub>
 
-In-conversation SQL analytics over the observation tables that `imf_query_dataset` stages on a DuckDB-backed canvas.
+- Dot-separated key in DSD keyPosition order; `+` combines codes at one position, `*` matches every code there — every position needs a code or `*`, a blank segment is rejected
+- `start_period`/`end_period` accept `YYYY`, `YYYY-SN`, `YYYY-QN`, `YYYY-MM`, or a calendar-valid `YYYY-MM-DD`; each bound covers its whole period (`end_period: 2023` includes `2023-M12`)
+- Returns `time_period`, `value`, `status`, and series attributes (`unit`, `scale`, `decimals`); a key resolving to multiple series carries one `series_metadata` entry per series, since attributes can differ between them
+- `unit`/`scale` are upstream codes (`PT`, `USD`, `XDC`, `IX`, `NUM`); a `null` unit means the dataflow publishes none, and scale `"0"` means no multiplier
+- Large multi-country or long-range results automatically spill to DataCanvas (`output_mode: "canvas"` forces staging); `staged` reports storage, `truncated` reports only whether `observations` is an incomplete preview — a staged result can still be untruncated
+- `no_data` errors carry availability context naming codes that do have coverage; a key with data entirely outside the requested range fails as `no_data_in_range` and reports the range that does
 
-When `imf_query_dataset` returns `staged: true`, the full dataset is registered as a named table on the canvas. The workflow:
+---
 
-1. Call `imf_query_dataset` — let large results spill automatically or set `output_mode: "canvas"`; when `staged: true`, note the `canvas_id` and `table_name`
-2. Call `imf_dataframe_describe` with the `canvas_id` to discover table schema
-3. Call `imf_dataframe_query` with a SELECT statement for aggregations, cross-country comparisons, or time-series analysis
-4. When table cleanup is enabled, call `imf_dataframe_drop` with a name from `imf_dataframe_describe` to remove only that table or view
+### `imf_dataframe_describe` <sub>tool</sub>
 
-One SELECT statement per call; a leading `WITH … SELECT` common table expression is accepted. DML and DDL are rejected. DataCanvas first caps materialization at its row limit (default 10,000), then the server retains the largest row prefix whose complete structured and formatted response fits 100,000 serialized characters. `row_count` always equals the returned rows; `truncated: true` means either cap omitted rows, and the remainder is reachable with a stable `ORDER BY` plus `LIMIT`/`OFFSET`. If one row cannot fit, `response_too_large` asks the caller to select fewer columns, aggregate, or shorten values. Requires `CANVAS_PROVIDER_TYPE=duckdb`.
+- Lists every table staged on a canvas, with row count and column schema (name + DuckDB type)
+- Requires `canvas_id` from a prior `imf_query_dataset` call that returned `staged: true`
+- Call before `imf_dataframe_query` to confirm table and column names
 
-`imf_dataframe_drop` is opt-in because it mutates the canvas. Set `IMF_ENABLE_DATAFRAME_DROP=true` to register it in `tools/list`; disabled HTTP deployments retain the exact enable hint in the HTML landing-page inventory. The SEP-1649 discovery document at `/.well-known/mcp.json` does not enumerate tool definitions. A successful removal returns `dropped: true`; an absent or previously removed name returns `dropped: false` while leaving the canvas and its other tables intact.
+---
 
-## Resource
+### `imf_dataframe_query` <sub>tool</sub>
 
-| Type | URI | Description |
-|:-----|:----|:------------|
-| Resource | `imf://database/{dataflow_id}` | Bounded discovery metadata for a single IMF SDMX dataflow — all dimensions with up to 50 codelist entries each, counts, `key_format`, name, description, and continuation metadata. |
+- One read-only SQL `SELECT` per call; a leading `WITH … SELECT` common table expression is accepted, DML and DDL are rejected
+- Results are capped first by the canvas row limit (default 10,000), then by a 100,000-character serialized response budget — `row_count` always equals the returned rows, and `truncated: true` means either cap trimmed the result
+- Page past a cap with a stable `ORDER BY` plus `LIMIT`/`OFFSET`; `response_too_large` means even one row didn't fit and asks for fewer columns or aggregation
+- Requires `CANVAS_PROVIDER_TYPE=duckdb`
 
-The resource stays bounded and points machine-readably to `imf_get_database` for continuation. To retrieve a large codelist, call `imf_get_database` with its `dimension_id`, then follow `next_offset` with `limit`/`offset`; add `codelist_filter` to page only entries whose ID or name contains a substring.
+---
 
-## Data source
+### `imf_dataframe_drop` <sub>tool</sub>
 
-Data is sourced from the [International Monetary Fund SDMX 3.0 portal](https://data.imf.org/) under the [IMF Copyright and Terms of Use](https://www.imf.org/en/about/copyright-and-terms). The IMF's terms permit redistribution of statistical data with attribution. Each data-returning tool response includes a `source` field with the required attribution: `Source: International Monetary Fund, <dataflow name>, https://data.imf.org/`.
+- Removes one named table or view from a canvas without affecting the others; requires the exact name from `imf_dataframe_describe`
+- Idempotent — a repeated or absent drop returns `dropped: false` rather than an error
+- Disabled by default; set `IMF_ENABLE_DATAFRAME_DROP=true` to register it in `tools/list`
+
+---
+
+### `imf://database/{dataflow_id}` <sub>resource</sub>
+
+- Bounded discovery metadata for one dataflow — every dimension with up to 50 codelist entries, counts, `key_format`, name, description
+- `dataflow_id` comes from `imf_list_databases`
+- Carries `continuation` metadata pointing to `imf_get_database` (with `dimension_id`/`limit`/`offset`) for a codelist beyond the preview
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
-- Declarative tool, resource, and prompt definitions — single file per primitive, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Swappable storage backends: `in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
-
-IMF SDMX-specific:
+IMF-specific:
 
 - Keyless access — no API key required; the IMF SDMX 3.0 portal is fully public
 - Type-safe SDMX 3.0 compact JSON client with dimension/codelist parsing and DSD validation
@@ -220,7 +217,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - No API key required.
 
 ### Installation
@@ -260,7 +257,7 @@ cp .env.example .env
 | `IMF_REQUEST_TIMEOUT_MS` | Per-request timeout in milliseconds. | `30000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
-| `MCP_SESSION_MODE` | HTTP session handling: `stateful`, `stateless`, or `auto` (the schema default, which resolves to stateful). This server sets it explicitly to `stateless` in `.env.example` and the Docker runtime. | `stateless` |
+| `MCP_SESSION_MODE` | HTTP session handling: `stateful`, `stateless`, or `auto` (the schema default, which resolves to stateful). This server declares `stateless` in `src/index.ts`, so a deployment that sets nothing still gets it; setting this to a meaningful value overrides the declaration. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
@@ -300,7 +297,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 
 ## Project structure
 
-| Path | Purpose |
+| Directory | Purpose |
 |:-----|:--------|
 | `src/index.ts` | `createApp()` entry point — registers tools/resources and inits services. |
 | `src/config/server-config.ts` | Server-specific env var parsing and validation with Zod. |
@@ -320,9 +317,13 @@ See [`CLAUDE.md`/`AGENTS.md`](./CLAUDE.md) for development guidelines and archit
 - Register new tools and resources via the barrels in `src/mcp-server/*/definitions/index.ts`
 - Wrap external API calls: validate raw → normalize to domain type → return output schema; never fabricate missing fields
 
+## Data source
+
+Data is sourced from the [International Monetary Fund SDMX 3.0 portal](https://data.imf.org/) under the [IMF Copyright and Terms of Use](https://www.imf.org/en/about/copyright-and-terms). The IMF's terms permit redistribution of statistical data with attribution. Each data-returning tool response includes a `source` field with the required attribution: `Source: International Monetary Fund, <dataflow name>, https://data.imf.org/`.
+
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck

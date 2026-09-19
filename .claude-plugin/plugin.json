@@ -1,20 +1,39 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "imf-mcp-server",
   "version": "0.4.1",
   "description": "Query IMF SDMX 3.0 macroeconomic data — hundreds of dataflows across 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP.",
   "author": {
-    "name": "cyanheads"
+    "name": "cyanheads",
+    "email": "casey@caseyjhand.com",
+    "url": "https://github.com/cyanheads"
   },
   "homepage": "https://github.com/cyanheads/imf-mcp-server#readme",
   "repository": "git+https://github.com/cyanheads/imf-mcp-server.git",
   "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "imf",
+    "sdmx",
+    "macroeconomics",
+    "world-economic-outlook",
+    "weo",
+    "balance-of-payments",
+    "exchange-rates",
+    "economic-data",
+    "international-monetary-fund",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "ai-agent"
+  ],
   "mcpServers": {
     "imf-mcp-server": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@cyanheads/imf-mcp-server"
-      ],
+      "args": ["-y", "@cyanheads/imf-mcp-server"],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio"
       }
