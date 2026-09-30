@@ -333,7 +333,7 @@ Each step is independently testable.
 | 3a | The same request without `lastNObservations` (conditional) | Re-fetch in full when the padding drop removed a row from the `lastNObservations` response (decision 22) |
 | 3b | `GET /data/dataflow/.../{key with one position widened to `*`}?attributes=series&measures=none` (conditional) | Recover a dimension-group attribute a `+` key suppressed upstream (decision 17) |
 | 4 | Observation decode | Map positional indices to time labels via `structures[0].dimensions.observation[0].values` |
-| 5 | Placement + final-result budget | Explicitly stage when requested, otherwise spill an oversized analytical result; size the complete MCP result envelope and rebalance only the observation preview |
+| 5 | Placement + final-result budget | Explicitly stage when requested, otherwise spill an oversized analytical result, or without DataCanvas cut it to a time-ascending prefix (decision 23); size the complete MCP result envelope and rebalance only the observation preview |
 
 Steps 1–2 are cache candidates (DSD rarely changes; dataflow list changes when IMF publishes new vintages). Step 3 is always live. Step 3b runs only for the response shape it can repair — a `+` key whose group came back empty — so every other query stays at one data request, and its failure leaves the query exactly as step 3 answered it.
 
