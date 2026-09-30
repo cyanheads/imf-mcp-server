@@ -170,6 +170,40 @@ describe('imfListDatabases', () => {
     expect(notice).toContain('non-vintage');
   });
 
+  it('empty-match notice with vintages excluded counts non-vintage dataflows and offers include_vintages', async () => {
+    const response = await runToolContract(imfListDatabases, { filter: 'xyznonexistent' });
+    const notice = (response.structuredContent as { notice?: string }).notice;
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    for (const surface of [notice, text]) {
+      expect(surface).toContain(
+        'omit filter to browse all 3 non-vintage dataflows. Set include_vintages=true to include historical snapshot entries.',
+      );
+    }
+  });
+
+  it('empty-match notice with include_vintages=true counts every dataflow and does not re-offer the flag', async () => {
+    const response = await runToolContract(imfListDatabases, {
+      filter: 'xyznonexistent',
+      include_vintages: true,
+    });
+    const notice = (response.structuredContent as { notice?: string }).notice;
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    for (const surface of [notice, text]) {
+      expect(surface).toContain('No dataflows matched filter "xyznonexistent"');
+      expect(surface).toContain(
+        'omit filter to browse all 4 dataflows, historical snapshot entries included.',
+      );
+      expect(surface).not.toContain('non-vintage');
+      expect(surface).not.toContain('Set include_vintages=true');
+    }
+  });
+
   it('does not enrich notice when filter matches results', async () => {
     const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
     const input = imfListDatabases.input.parse({ filter: 'balance' });
@@ -437,6 +471,155 @@ describe('imfListDatabases', () => {
     expect(text).toContain('103 dataflows matched');
     expect(text).toContain('1 in this page');
     expect(text).toContain('offset 50');
+  });
+
+  // -------------------------------------------------------------------------
+  // #54: filter matches every word, not one literal substring
+  // -------------------------------------------------------------------------
+
+  /** Live catalog entries in catalog order; descriptions are each entry's opening text. */
+  const OUTLOOK_CATALOG = [
+    {
+      id: 'ANEA',
+      agencyId: 'IMF.STA',
+      version: '6.0.1',
+      name: 'National Economic Accounts (NEA), Annual Data',
+      description:
+        'This dataset presents national, official estimates of annual expenditure-based Gross Domestic Product (GDP), by economy.',
+    },
+    {
+      id: 'QNEA',
+      agencyId: 'IMF.STA',
+      version: '7.0.0',
+      name: 'National Economic Accounts (NEA), Quarterly Data',
+      description:
+        'This dataset provides a snapshot of the economic activity of various countries on a quarterly basis.',
+    },
+    {
+      id: 'AFRREO',
+      agencyId: 'IMF.AFR',
+      version: '7.0.0',
+      name: 'Sub-Saharan Africa Regional Economic Outlook (AFRREO)',
+      description:
+        'Data for the REO for sub-Saharan Africa are prepared in conjunction with the semi-annual World Economic Outlook (WEO) exercises, spring and fall.',
+    },
+    {
+      id: 'MCDREO',
+      agencyId: 'IMF.MCD',
+      version: '8.0.0',
+      name: 'Middle East and Central Asia Regional Economic Outlook (MCDREO) ',
+      description:
+        'The Middle East and Central Asia Department Regional Economic Outlook (MCDREO) provides information on recent economic developments and prospects for 32 countries and territories.',
+    },
+    {
+      id: 'WHDREO',
+      agencyId: 'IMF.WHD',
+      version: '5.0.0',
+      name: 'Western Hemisphere Regional Economic Outlook (WHDREO)',
+      description:
+        'Data for the Western Hemisphere REO are prepared in conjunction and are consistent with the semi-annual World Economic Outlook (WEO) exercises.',
+    },
+    {
+      id: 'APDREO',
+      agencyId: 'IMF.APD',
+      version: '6.0.0',
+      name: 'Asia and Pacific Regional Economic Outlook (APDREO)',
+      description:
+        'Data for the REO for Asia and Pacific is prepared in conjunction with the semi-annual World Economic Outlook (WEO) exercises, spring and fall.',
+    },
+    {
+      id: 'WEO',
+      agencyId: 'IMF.RES',
+      version: '9.0.0',
+      name: 'World Economic Outlook (WEO)',
+      description:
+        'The World Economic Outlook (WEO) database is created during the biannual WEO exercise.',
+    },
+    {
+      id: 'QGDP_WCA',
+      agencyId: 'IMF.STA',
+      version: '4.0.0',
+      name: 'Quarterly Gross Domestic Product (GDP), World and Country Aggregates',
+      description:
+        'This dataset provides a snapshot of the economic activity of the world and selected country aggregates on a quarterly basis.',
+    },
+  ];
+
+  const idsFor = async (filter: string) => {
+    mockSvc.fetchDataflows.mockResolvedValue(OUTLOOK_CATALOG);
+    const ctx = createMockContext({ tenantId: 'test', errors: imfListDatabases.errors });
+    const result = await imfListDatabases.handler(imfListDatabases.input.parse({ filter }), ctx);
+    return {
+      ids: result.dataflows.map((dataflow) => dataflow.id),
+      total: result.total_count,
+      notice: getEnrichment(ctx).notice as string | undefined,
+    };
+  };
+
+  it('#54 keeps every match a phrase already had', async () => {
+    const { ids } = await idsFor('Regional Economic Outlook');
+
+    expect(ids).toEqual(['AFRREO', 'MCDREO', 'WHDREO', 'APDREO']);
+  });
+
+  it('#54 keeps the matches a filter with no whitespace or comma already had', async () => {
+    const { ids } = await idsFor('NEA');
+
+    expect(ids).toEqual(['ANEA', 'QNEA']);
+  });
+
+  it.each([
+    // MCDREO is an outlook that never mentions WEO, so it stays out.
+    ['WEO outlook', ['AFRREO', 'WHDREO', 'APDREO', 'WEO']],
+    // QGDP_WCA is quarterly and ANEA is NEA, but only QNEA is both.
+    ['QNEA quarterly', ['QNEA']],
+    ['outlook, WEO', ['AFRREO', 'WHDREO', 'APDREO', 'WEO']],
+  ])(
+    '#54 keeps a dataflow when every word of %s appears in its ID, name, or description',
+    async (filter, expected) => {
+      const { ids, total } = await idsFor(filter);
+
+      expect(ids).toEqual(expected);
+      expect(total).toBe(expected.length);
+    },
+  );
+
+  it('#54 carries a multi-word match through structuredContent and content[]', async () => {
+    mockSvc.fetchDataflows.mockResolvedValue(OUTLOOK_CATALOG);
+    const response = await runToolContract(imfListDatabases, { filter: 'QNEA quarterly' });
+    const structured = response.structuredContent as {
+      total_count: number;
+      notice?: string;
+      dataflows: Array<{ id: string }>;
+    };
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(structured.total_count).toBe(1);
+    expect(structured.dataflows.map((dataflow) => dataflow.id)).toEqual(['QNEA']);
+    expect(structured.notice).toBeUndefined();
+    expect(text).toContain('**1 dataflow matched**');
+    expect(text).toContain('### QNEA');
+    expect(text).not.toContain('### QGDP_WCA');
+  });
+
+  it('#54 needs every word — one missing word empties the match and the notice says so', async () => {
+    mockSvc.fetchDataflows.mockResolvedValue(OUTLOOK_CATALOG);
+    // "WEO" and "outlook" both match; "monthly" matches nothing.
+    const response = await runToolContract(imfListDatabases, { filter: 'WEO outlook monthly' });
+    const structured = response.structuredContent as {
+      total_count: number;
+      notice: string;
+    };
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(structured.total_count).toBe(0);
+    expect(structured.notice).toContain('"WEO outlook monthly"');
+    expect(structured.notice).toContain('fewer or shorter words');
+    expect(text).toContain('fewer or shorter words');
   });
 
   // -------------------------------------------------------------------------

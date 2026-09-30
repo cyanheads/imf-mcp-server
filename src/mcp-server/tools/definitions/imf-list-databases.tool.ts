@@ -9,6 +9,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { createFilterMatcher } from '@/mcp-server/codelist-page.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
 const VINTAGE_PATTERN = /VINTAGE/i;
@@ -54,8 +55,9 @@ export const imfListDatabases = tool('imf_list_databases', {
       .min(1)
       .optional()
       .describe(
-        'Optional name, ID, or description substring to filter results. Case-insensitive. ' +
-          'Example: "exchange rate" returns ER and related dataflows.',
+        'Optional words to filter results by, split on spaces and commas. A dataflow matches when every word ' +
+          'appears, case-insensitively, somewhere in its ID, name, or full description. ' +
+          'Example: "exchange rate" returns ER and related dataflows; "WEO outlook" returns WEO and the regional outlooks built on it.',
       ),
     include_vintages: z
       .boolean()
@@ -153,18 +155,12 @@ export const imfListDatabases = tool('imf_list_databases', {
       dataflows = dataflows.filter((df) => !VINTAGE_PATTERN.test(df.id));
     }
 
-    // Capture total before substring filter — used in empty-result notice.
+    // Capture total before the text filter — used in empty-result notice.
     const totalBeforeFilter = dataflows.length;
 
-    // Name/ID substring filter
-    const filterLower = input.filter?.toLowerCase();
-    if (filterLower) {
-      dataflows = dataflows.filter(
-        (df) =>
-          df.id.toLowerCase().includes(filterLower) ||
-          df.name.toLowerCase().includes(filterLower) ||
-          (df.description?.toLowerCase().includes(filterLower) ?? false),
-      );
+    if (input.filter) {
+      const matchesFilter = createFilterMatcher(input.filter);
+      dataflows = dataflows.filter((df) => matchesFilter([df.id, df.name, df.description]));
     }
 
     const totalCount = dataflows.length;
@@ -185,9 +181,12 @@ export const imfListDatabases = tool('imf_list_databases', {
       ...(df.description ? { description: previewDescription(df.description) } : {}),
     }));
 
-    if (filterLower && totalCount === 0) {
+    if (input.filter && totalCount === 0) {
+      const browseAll = input.include_vintages
+        ? `browse all ${totalBeforeFilter} dataflows, historical snapshot entries included.`
+        : `browse all ${totalBeforeFilter} non-vintage dataflows. Set include_vintages=true to include historical snapshot entries.`;
       ctx.enrich.notice(
-        `No dataflows matched filter "${input.filter}". Try a broader term, or omit filter to browse all ${totalBeforeFilter} non-vintage dataflows. Set include_vintages=true to include historical snapshot entries.`,
+        `No dataflows matched filter "${input.filter}". Every word must appear in the ID, name, or description — try fewer or shorter words, or omit filter to ${browseAll}`,
       );
     } else if (totalCount > 0 && input.offset >= totalCount) {
       ctx.enrich.notice(

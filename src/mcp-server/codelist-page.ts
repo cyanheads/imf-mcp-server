@@ -1,5 +1,7 @@
 /**
- * @fileoverview Shared bounded projection for IMF dimension codelists.
+ * @fileoverview Shared bounded projection for IMF dimension codelists, and the
+ * every-word text matcher behind both `codelist_filter` and the dataflow
+ * catalog's `filter`.
  * @module mcp-server/codelist-page
  */
 
@@ -21,6 +23,28 @@ export interface CodelistPage {
   unfiltered_count: number;
 }
 
+/**
+ * Build a case-insensitive predicate over an entry's searchable fields for one
+ * filter. The filter splits on whitespace and commas, and an entry matches when
+ * every token appears in at least one field — different tokens may match
+ * different fields, and every other character stays literal inside its token
+ * (`St.` keeps its dot). A filter made only of separators matches as one literal
+ * substring, and a filter with no separator is one token, a plain substring
+ * match. A field holding the whole filter literally holds every token too, so
+ * splitting never loses a literal match.
+ */
+export function createFilterMatcher(
+  filter: string,
+): (fields: readonly (string | undefined)[]) => boolean {
+  const filterLower = filter.toLowerCase();
+  const words = filterLower.split(/[\s,]+/).filter(Boolean);
+  const tokens = words.length > 0 ? words : [filterLower];
+  return (fields) => {
+    const haystacks = fields.flatMap((field) => (field ? [field.toLowerCase()] : []));
+    return tokens.every((token) => haystacks.some((haystack) => haystack.includes(token)));
+  };
+}
+
 /** Filter, then slice, one complete in-memory codelist without another upstream request. */
 export function projectCodelist(
   entries: readonly CodelistEntry[],
@@ -28,13 +52,9 @@ export function projectCodelist(
 ): CodelistPage {
   const offset = options.offset ?? 0;
   const limit = options.limit ?? CODELIST_PREVIEW_LIMIT;
-  const filterLower = options.filter?.toLowerCase();
-  const matches = filterLower
-    ? entries.filter(
-        (entry) =>
-          entry.id.toLowerCase().includes(filterLower) ||
-          entry.name.toLowerCase().includes(filterLower),
-      )
+  const matchesFilter = options.filter ? createFilterMatcher(options.filter) : undefined;
+  const matches = matchesFilter
+    ? entries.filter((entry) => matchesFilter([entry.id, entry.name]))
     : [...entries];
   const codelist = matches.slice(offset, offset + limit);
   const nextOffset = offset + codelist.length;
