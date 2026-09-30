@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.3](changelog/0.4.x/0.4.3.md) — 2026-09-30
+
+imf_query_dataset checks key codes against their codelists, adds last_n_observations for each series' latest values, and holds its response budget without DataCanvas.
+
 ## [0.4.2](changelog/0.4.x/0.4.2.md) — 2026-09-19
 
 Tool argument rejections and errors now carry a reason and recovery hint a caller can branch on, a malformed canvas_id is rejected before any canvas lookup, and the framework dependency moves to mcp-ts-core ^0.13.6.
