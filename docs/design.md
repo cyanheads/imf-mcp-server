@@ -6,19 +6,19 @@
 
 | Name | Description | Key Inputs | Annotations |
 |:-----|:------------|:-----------|:------------|
-| `imf_list_databases` | List IMF SDMX dataflows available on the portal, one page at a time. Returns id, agencyID, version, name, and a shortened description. Entry point — every query requires a dataflow id. | `filter` (optional nonblank name/ID/description substring), `include_vintages` (bool, default false), `limit` (1–200, default 50), `offset` (default 0) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `imf_get_database` | Fetch bounded codelist previews for every dimension, or opt into paged codes with published data. Resolves human terms to SDMX codes ("United States" → USA, "Constant prices" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional), `available_only` (bool, default false), `codelist_filter` (optional substring), `dimension_id` (optional exact selector), `limit` (1–200), `offset` (requires `dimension_id`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, and status, plus unit/scale/decimals per series. Large analytical result sets spill to DataCanvas; `output_mode: canvas` explicitly stages any result. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `canvas_id` (optional destination), `output_mode` (`auto` or `canvas`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
-| `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call. Shows table name, row count, and column schema. | `canvas_id` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
+| `imf_list_databases` | List IMF SDMX dataflows available on the portal, one page at a time. Returns id, agencyID, version, name, and a shortened description. Entry point — every query requires a dataflow id. | `filter` (optional nonblank words, each matched in ID, name, or description), `include_vintages` (bool, default false), `limit` (1–200, default 50), `offset` (default 0) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `imf_get_database` | Fetch bounded codelist previews for every dimension, or opt into paged codes with published data. Resolves human terms to SDMX codes ("United States" → USA, "Constant prices" → NGDP_RPCH). Mandatory before querying — SDMX keys are opaque without codelist lookups. | `dataflow_id`, `agency_id` (optional, auto-detected), `version` (optional), `available_only` (bool, default false), `codelist_filter` (optional words, each matched in code ID or name), `dimension_id` (optional exact selector), `limit` (1–200), `offset` (requires `dimension_id`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `imf_query_dataset` | Query a dataflow by dimension key (dot-separated codes, e.g. `USA.NGDP_RPCH.A`) over a time range. Returns observations with time, value, and status, plus unit/scale/decimals per series; `last_n_observations` keeps each series' last N. Values are in base units. With DataCanvas, large analytical result sets spill to it and `output_mode: canvas` explicitly stages any result; without it, an over-budget result is cut to a time-ascending prefix with `retrieval_guidance`. | `dataflow_id`, `agency_id`, `version`, `key` (dimension key), `start_period`, `end_period`, `last_n_observations` (1–10,000, per series), `canvas_id` (optional destination), `output_mode` (`auto` or `canvas`) | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: true` |
+| `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call. Shows table name, row count, and column schema. Listed only when DataCanvas is configured, like the other two dataframe tools. | `canvas_id` | `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false` |
 | `imf_dataframe_query` | Run a read-only SQL SELECT against a staged DataCanvas table. Enables multi-country comparisons, time-series aggregation, and cross-indicator joins without hand-rolled loops. | `canvas_id`, `sql` (one SELECT statement; a leading `WITH … SELECT` CTE is accepted) | `readOnlyHint: true`, `openWorldHint: false` |
-| `imf_dataframe_drop` | Remove one staged DataCanvas table or view without affecting other tables on the same canvas. Disabled by default and retained in the HTML landing-page inventory. | `canvas_id`, `table_name` from `imf_dataframe_describe` | `readOnlyHint: false`, `idempotentHint: true`, `destructiveHint: true`, `openWorldHint: false` |
+| `imf_dataframe_drop` | Remove one staged DataCanvas table or view without affecting other tables on the same canvas. Disabled by default, even with DataCanvas, and retained in the HTML landing-page inventory. | `canvas_id`, `table_name` from `imf_dataframe_describe` | `readOnlyHint: false`, `idempotentHint: true`, `destructiveHint: true`, `openWorldHint: false` |
 
 ### Tool Details
 
 #### `imf_list_databases`
 
 **Input constraints:**
-- `filter`: string — case-insensitive substring, matched against id, name, and the **untruncated** description, so a term that survives only in the full text still finds its dataflow.
+- `filter`: string — split on whitespace and commas; a dataflow matches when every word appears, case-insensitively, in its id, name, or **untruncated** description (decision 18), so a term that survives only in the full text still finds its dataflow.
 - `limit`: integer 1–200, default 50. `offset`: integer ≥ 0, default 0. Both are rejected out of range rather than clamped — a silently-capped limit reads as a complete result.
 
 **Output:**
@@ -27,7 +27,7 @@
 - `returned_count`: length of `dataflows`; `offset`: matches skipped before this page
 
 **Enrichment:**
-- `notice`: emitted when the filter matched nothing (names the filter and the unfiltered total), when `offset` sits past the end of the match set, or when matches remain beyond this page — the last names the exact next `offset`.
+- `notice`: emitted when the filter matched nothing (names the filter and the unfiltered total, and suggests fewer or shorter words), when `offset` sits past the end of the match set, or when matches remain beyond this page — the last names the exact next `offset`.
 
 **Paging and description shortening.** The catalog is the first call of every workflow, and an unfiltered one used to return all 103 non-vintage dataflows with full descriptions in both channels: 116 KB, of which descriptions were 45.6 KB (median 341 characters, maximum 1,519). That is spent before the caller has chosen anything.
 
@@ -53,9 +53,9 @@ The service applies the error boundary: a failed catalog fetch is logged with it
 #### `imf_get_database`
 
 **Input constraints:**
-- `dataflow_id`: string — value from `imf_list_databases`. No structural regex needed (codes are opaque alphanumeric, validated against the live dataflow list).
+- `dataflow_id`: string — value from `imf_list_databases`. No structural regex needed (codes are opaque alphanumeric, validated against the live dataflow list). Trimmed and matched case-insensitively, an exact spelling preferred; every downstream request and echo uses the catalog spelling (`weo` → `WEO`). The same resolution serves `imf_query_dataset` and the `imf://database/{dataflow_id}` resource (decision 20).
 - `available_only`: boolean, default false. When true, project the uncapped dataflow-wide availability constraint through the same bounded preview and selected-dimension paging path. Normal codelist mode remains unchanged when false or omitted.
-- `codelist_filter`: optional non-blank string — trimmed once, then matched as a case-insensitive substring of code ID or name before paging.
+- `codelist_filter`: optional non-blank string — trimmed once, split on whitespace and commas, and matched before paging: a code matches when every word appears, case-insensitively, in its ID or name (decision 18).
 - `dimension_id`: optional exact dimension selector. `limit` (1–200, default 50) and `offset` (integer ≥ 0, default 0) are valid only when this selector is present.
 
 **Output:**
@@ -67,7 +67,7 @@ The service applies the error boundary: a failed catalog fetch is logged with it
 - `dimensions`: array of `{ id, name, position, codelist, codelist_truncated, available_count?, unfiltered_count, matched_count, returned_count, offset, next_offset? }`. All previews are capped at 50; a selected dimension uses the requested `limit`/`offset`. In availability mode, `available_count` is the pre-filter coverage count, code labels come from the DSD with ID fallback, then `codelist_filter` and paging compose in that order. `codelist_truncated` is true whenever matching entries were omitted before or after the returned page.
 
 **Enrichment:**
-- `notice`: emitted when `codelist_filter` matched nothing in any dimension (names the filter and the unfiltered entry counts), when a dimension has no resolvable codelist, or when an offset is past the final match. Reaches both `structuredContent` and the `content[]` trailer.
+- `notice`: emitted when `codelist_filter` matched nothing in any dimension (names the filter and the unfiltered entry counts, and suggests fewer or shorter words), when a dimension has no resolvable codelist, or when an offset is past the final match. Reaches both `structuredContent` and the `content[]` trailer.
 
 **Codelist resolution.** Each dimension's codelist is resolved from the `?references=all` payload, authoritative references first:
 
@@ -103,18 +103,22 @@ errors: [
 #### `imf_query_dataset`
 
 **Input constraints:**
-- `key`: string — dot-separated dimension codes in DSD `keyPosition` order, one segment per dimension. Use `+` to combine codes at one position (e.g. `USA+GBR.NGDP_RPCH.A`) and `*` to match every code at a position (e.g. `*.NGDP_RPCH.A`). Every position needs a code or a `*`; a blank segment (`USA..A`) is rejected as `empty_key_segment`, and an omitted position is rejected as `key_dimension_mismatch`. Country codes are ISO 3-letter (USA, not US). Call `imf_get_database` first to obtain the correct `key_format` and valid codes.
+- `key`: string — dot-separated dimension codes in DSD `keyPosition` order, one segment per dimension. Use `+` to combine codes at one position (e.g. `USA+GBR.NGDP_RPCH.A`) and `*` to match every code at a position (e.g. `*.NGDP_RPCH.A`). Every position needs a code or a `*`; a blank segment (`USA..A`) is rejected as `empty_key_segment`, and an omitted position is rejected as `key_dimension_mismatch`. The key, each position, and each `+` member are trimmed, and each code resolves case-insensitively to its codelist spelling (`usa.ngdp_rpch.a` → `USA.NGDP_RPCH.A`). Before the data request, a `*` inside a `+` list is rejected as `wildcard_in_code_list`, and a code missing from its dimension's codelist as `invalid_key_code`, naming the position, the dimension, up to five nearest codes, and the dimension the code belongs to when it is another's (decision 20). `*`, empty `+` members, and positions whose codelist resolved empty are not checked. Country codes are ISO 3-letter (USA, not US). Call `imf_get_database` first to obtain the correct `key_format` and valid codes.
 - `start_period` / `end_period`: string — `YYYY` (annual), `YYYY-SN` (semi-annual), `YYYY-QN` (quarterly, e.g. `2023-Q1`), `YYYY-MM` (monthly), or a calendar-valid `YYYY-MM-DD` (daily), independent of the dataflow's own frequency. Every label the portal emits is also accepted as a bound, so an observation's `time_period` round-trips. Omit either to use the full available range. Malformed or calendar-invalid values and reversed ranges are rejected before the upstream call.
+- `last_n_observations`: integer, 1–10,000 — keeps each series' last N observations, after the period range when one is set; a series with fewer returns every one it has. "Latest" is per series: series end at different periods, and a WEO series ends in its projection years (`2031`). `''` means unset; 0, negatives, fractions, and values above 10,000 fail validation before any upstream call. 10,000 is above the longest series the portal publishes (an IRFCL daily series spanning 9,437 days). Forwarded upstream only when no period bound is set (decision 22).
 - `output_mode`: `auto | canvas` — `auto` preserves spill-only behavior. `canvas` stages the full result on a fresh or supplied `canvas_id`; supplying `canvas_id` alone never forces staging.
 
 **Output (inline, no canvas spill):**
-- `dataflow_id`, `key`, `start_period`, `end_period`
-- `observations`: array of `{ series_key: string, time_period: string, value: number | null, status: string | null }`
-- `series_attributes`: `{ unit: string | null, scale: string | null, decimals: number | null }` — the **first** series in the result
+- `dataflow_id`, `key`, `start_period`, `end_period` — `dataflow_id` and `key` in their catalog and codelist spellings, as queried
+- `last_n_observations`: number — echoed when set, and rendered in `content[]` as `**Last observations:** N per series`; absent otherwise
+- `observations`: array of `{ series_key: string, time_period: string, value: number | null, status: string | null }` — `value` in base units
+- `series_attributes`: `{ unit: string | null, scale: string | null, decimals: number | null }` — the **first** series in the result; `scale` is the power of ten the series is published in, already reflected in `value` (decision 24)
 - `series_metadata`: array of `{ series_key, unit, scale, decimals }`, present only when the query resolved to more than one series
-- `observation_count`: number
+- `observation_count`: number — counted after any `last_n_observations` selection
 - `staged`: boolean (true when the complete result is stored on DataCanvas)
 - `truncated`: boolean (true only when inline `observations` is a strict preview of `observation_count`; independent of `staged`)
+
+**Output (over budget, no DataCanvas):** as above, with `staged: false`, `truncated: true`, `observations` the longest time-ascending prefix whose whole result fits 100,000 serialized characters, and `retrieval_guidance` naming the last `time_period` returned and the ways to narrow — a narrower key, `start_period`/`end_period`, `last_n_observations`, or `CANVAS_PROVIDER_TYPE=duckdb` (decision 23).
 
 **Output (canvas spill):**
 - `canvas_id`: string — present whenever `staged`; pass to `imf_dataframe_describe` before `imf_dataframe_query`
@@ -122,6 +126,19 @@ errors: [
 - `observation_count`: number
 - `series_metadata` — as above, describing the whole staged table rather than the inline preview
 - `staged: true`; `truncated` is true only when the inline preview omits observations
+
+The staged table holds one row per returned observation, with the same rows as the inline `observations` (null padding dropped, decision 21; only each series' last N when `last_n_observations` is set, decision 22). Its columns are registered with an explicit schema rather than typed from the first 100 rows, since rows stage time-ascending and a leading run of whole numbers or of null values would otherwise type `value` as `BIGINT` (truncating every later fraction) or `VARCHAR`:
+
+| Column | Type |
+|:-------|:-----|
+| `dataflow_id` | `VARCHAR` |
+| `series_key` | `VARCHAR` |
+| `time_period` | `VARCHAR` |
+| `value` | `DOUBLE` |
+| `status` | `VARCHAR` |
+| `unit` | `VARCHAR` |
+| `scale` | `VARCHAR` |
+| `decimals` | `INTEGER` |
 
 **Error contract:**
 ```
@@ -141,6 +158,12 @@ errors: [
   { reason: 'empty_key_segment', code: ValidationError,
     when: 'A dot-separated position in key is empty or blank, which matches no series upstream',
     recovery: 'Put * at that position to match every code there, or a code from imf_get_database to pin it.' },
+  { reason: 'wildcard_in_code_list', code: ValidationError,
+    when: 'A key position combines * with other codes in a + list, where the portal ignores the * and returns only the listed codes',
+    recovery: 'Use * alone at that position to match every code there, or list the wanted codes joined with +.' },
+  { reason: 'invalid_key_code', code: ValidationError,
+    when: 'A key code is not in its dimension\'s codelist, checked before any data request',
+    recovery: 'Replace each named code with one from its dimension\'s codelist — a suggested code, or one found with imf_get_database using dimension_id and codelist_filter.' },
   { reason: 'invalid_period_format', code: ValidationError,
     when: 'start_period or end_period is not one of the recognized period formats',
     recovery: 'Use YYYY (annual), YYYY-SN (semi-annual), YYYY-QN (quarterly, e.g. 2023-Q1), YYYY-MM (monthly), or a calendar-valid YYYY-MM-DD (daily).' },
@@ -154,8 +177,8 @@ errors: [
     when: 'output_mode="canvas" was requested while DataCanvas is disabled',
     recovery: 'Enable CANVAS_PROVIDER_TYPE=duckdb or use output_mode="auto".' },
   { reason: 'response_too_large', code: SerializationError,
-    when: 'Full series metadata and the staged retrieval handle exceed the response budget before any observation preview',
-    recovery: 'Narrow the dimension key to fewer series so full series_metadata and the handle fit.' },
+    when: 'Full series_metadata, plus the retrieval handle when staging, exceeds the response budget before any observation',
+    recovery: 'Narrow the dimension key to fewer series so the full series_metadata fits in one response.' },
   { reason: 'dataflow_list_unavailable', code: ServiceUnavailable, retryable: true,
     when: 'The dataflow catalog that dataflow_id is resolved against could not be fetched',
     recovery: 'Retry in a few moments; the catalog is cached for an hour once it succeeds.' },
@@ -165,6 +188,8 @@ errors: [
 ---
 
 #### `imf_dataframe_describe`, `imf_dataframe_query`, and `imf_dataframe_drop`
+
+All three are registered only when DataCanvas is configured (`CANVAS_PROVIDER_TYPE=duckdb`). Without it, `disabledTool()` keeps them out of `tools/list` and in the HTML landing-page inventory with `CANVAS_PROVIDER_TYPE=duckdb` as the enable hint (decision 23).
 
 **Error contract (all three tools):**
 ```
@@ -204,10 +229,10 @@ errors: [
 ]
 ```
 
-The tool calls the atomic `CanvasInstance.drop(table_name)` primitive directly. A missing table or repeated drop is a successful `dropped: false` result; only the core identifier reasons map to `invalid_table_name`, and unrelated framework errors pass through unchanged. `disabledTool()` keeps the definition in the HTML landing-page inventory with `IMF_ENABLE_DATAFRAME_DROP=true` as its enable hint while omitting it from `tools/list` when the flag is false. The SEP-1649 discovery document at `/.well-known/mcp.json` intentionally carries capabilities and connection metadata without tool definitions.
+The tool calls the atomic `CanvasInstance.drop(table_name)` primitive directly. A missing table or repeated drop is a successful `dropped: false` result; only the core identifier reasons map to `invalid_table_name`, and unrelated framework errors pass through unchanged. With DataCanvas configured, `disabledTool()` keeps the definition in the HTML landing-page inventory with `IMF_ENABLE_DATAFRAME_DROP=true` as its enable hint while omitting it from `tools/list` when the flag is false; without DataCanvas, the hint names both settings still missing. The SEP-1649 discovery document at `/.well-known/mcp.json` intentionally carries capabilities and connection metadata without tool definitions.
 
 **Additional constraints on `imf_dataframe_query`:**
-- `sql`: one statement, starting with `SELECT` or `WITH`. The handler's `/^\s*(?:SELECT|WITH)\b/i` shape check runs *before* canvas acquisition so `invalid_sql` stays reachable when the canvas is disabled; it deliberately mirrors the framework gate's own `isSelectShaped` test. Statement typing is authoritative in the framework, which parses with DuckDB — `WITH … SELECT` types as `SELECT`, `WITH … INSERT` types as `INSERT` and is rejected.
+- `sql`: one statement, starting with `SELECT` or `WITH`. The handler's `/^\s*(?:SELECT|WITH)\b/i` shape check runs *before* canvas acquisition, so a malformed statement fails as `invalid_sql` before any canvas lookup; it deliberately mirrors the framework gate's own `isSelectShaped` test. Statement typing is authoritative in the framework, which parses with DuckDB — `WITH … SELECT` types as `SELECT`, `WITH … INSERT` types as `INSERT` and is rejected.
 - Output carries `truncated`. DataCanvas first caps materialization at its row limit (default 10,000); the server then retains the largest prefix whose complete `structuredContent` plus formatted `content[]` fits 100,000 serialized characters. `row_count` always equals returned `rows` and never claims a pre-cap total. `truncated` is true when either cap omitted rows, and `format()` appends deterministic `ORDER BY` plus `LIMIT`/`OFFSET` guidance in both cases. If the first row cannot fit, `response_too_large` directs the caller to project fewer columns, aggregate, or shorten values rather than dropping the row.
 
 ### Resources
@@ -228,7 +253,7 @@ None — this is a pure data server; no reusable message templates warranted.
 
 Global macroeconomic and financial statistics from the International Monetary Fund, accessed via the IMF's SDMX 3.0 portal (`api.imf.org`). Covers hundreds of dataflows including WEO projections, balance of payments, exchange rates, price indices, international liquidity, government finance, and national accounts for ~190 member countries.
 
-The server follows the **discover → describe → query** workflow: `imf_list_databases` to find a dataflow id, `imf_get_database` to resolve dimension codes, `imf_query_dataset` to fetch observations. Large analytical pulls spill automatically and smaller pulls can be staged explicitly. A staged handle is consumed through `imf_dataframe_describe` before `imf_dataframe_query`, then its table can be reclaimed through opt-in `imf_dataframe_drop`.
+The server follows the **discover → describe → query** workflow: `imf_list_databases` to find a dataflow id, `imf_get_database` to resolve dimension codes, `imf_query_dataset` to fetch observations. With DataCanvas enabled, large analytical pulls spill automatically and smaller pulls can be staged explicitly; without it, a pull over the response budget returns its earliest observations with guidance on narrowing. A staged handle is consumed through `imf_dataframe_describe` before `imf_dataframe_query`, then its table can be reclaimed through opt-in `imf_dataframe_drop`.
 
 **Audience:** Economists, macro/sovereign-risk analysts, development researchers, financial journalists, and agents answering questions like "what's country X's current-account balance?", "how do WEO projections compare across emerging markets?", or "what are US inflation trends since 2010?"
 
@@ -240,7 +265,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 - SDMX 3.0 JSON format (`application/vnd.sdmx.data+json;version=2.0` or default `application/json`)
 - Discovery: `GET /external/sdmx/3.0/structure/dataflow` → all dataflows with id, agencyID, version, name, and the DSD `structure` URN
 - Structure: `GET /external/sdmx/3.0/structure/datastructure/{agency}/{dsd_id}/{version}?references=all` → dimensions + all codelists
-- Data: `GET /external/sdmx/3.0/data/dataflow/{agency}/{flow}/{version}/{key}?startPeriod=&endPeriod=` → SDMX-JSON observations
+- Data: `GET /external/sdmx/3.0/data/dataflow/{agency}/{flow}/{version}/{key}?startPeriod=&endPeriod=&lastNObservations=` → SDMX-JSON observations
 - Key format: dot-separated dimension codes in DSD order (e.g. `USA.NGDP_RPCH.A` for WEO; `USA.CPI._T.PCH.A` for CPI)
 - Dimension codes are positional — order is defined per-DSD, not globally uniform across dataflows
 - Country codes are ISO 3-letter (USA, GBR, DEU, …), not ISO 2-letter
@@ -263,7 +288,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 
 | Env Var | Required | Description |
 |:--------|:---------|:------------|
-| `CANVAS_PROVIDER_TYPE` | No (default: `none`) | Set to `duckdb` to enable DataCanvas for large query result spill. Requires `@duckdb/node-api` peer dep. |
+| `CANVAS_PROVIDER_TYPE` | No (default: `none`) | Set to `duckdb` to enable DataCanvas for large query result spill and register the dataframe tools. Requires `@duckdb/node-api` peer dep. Unset, an over-budget query returns a time-ascending prefix of its observations. |
 | `IMF_ENABLE_DATAFRAME_DROP` | No (default: `false`) | Set to `true` to register the destructive `imf_dataframe_drop` table-cleanup tool. |
 | `IMF_BASE_URL` | No (default: `https://api.imf.org/external/sdmx/3.0`) | Override base URL for testing or proxied environments. |
 | `IMF_REQUEST_TIMEOUT_MS` | No (default: `30000`) | Per-request timeout in milliseconds. IMF SDMX 3.0 responses can be slow on large dataflows. |
@@ -277,7 +302,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 3. **`imf_list_databases`** — list + name-filter, paged with `limit`/`offset` and shortened descriptions (the full catalog does not fit a single response worth spending)
 4. **`imf_get_database`** — DSD fetch with `?references=all`; dimensions + codelists; local name→code resolution; optional dataflow-wide availability projection
 5. **`imf_query_dataset`** — key validation, data fetch, observation decode, spillover for large results
-6. **`imf_dataframe_describe` + `imf_dataframe_query` + `imf_dataframe_drop`** — canvas inspection, bounded SQL, and opt-in table cleanup (no-op when canvas disabled)
+6. **`imf_dataframe_describe` + `imf_dataframe_query` + `imf_dataframe_drop`** — canvas inspection, bounded SQL, and opt-in table cleanup (registered only when DataCanvas is configured)
 7. **`imf://database/{dataflow_id}` resource** — DSD fetch + bounded codelist discovery, stable URI
 
 Each step is independently testable.
@@ -302,9 +327,10 @@ Each step is independently testable.
 
 | # | Call | Purpose |
 |:--|:-----|:--------|
-| 1 | `GET /structure/dataflow` (cached) | Validate dataflow_id exists; get agencyID + version if not provided |
-| 2 | `GET /structure/datastructure/{agency}/{dsd}?references=all` (cached) | Get dimension order for key validation; get time-period codelist for observation decoding |
-| 3 | `GET /data/dataflow/{agency}/{flow}/{version}/{key}?startPeriod=&endPeriod=` | Fetch observations |
+| 1 | `GET /structure/dataflow` (cached) | Resolve dataflow_id case-insensitively to its catalog spelling; get agencyID + version if not provided |
+| 2 | `GET /structure/datastructure/{agency}/{dsd}?references=all` (cached) | Get dimension order and codelists for key validation — every code is resolved to its codelist spelling before step 3 (decision 20); get time-period codelist for observation decoding |
+| 3 | `GET /data/dataflow/{agency}/{flow}/{version}/{key}?startPeriod=&endPeriod=` | Fetch observations; `lastNObservations=N` instead of the bounds when `last_n_observations` is set without a period bound (decision 22) |
+| 3a | The same request without `lastNObservations` (conditional) | Re-fetch in full when the padding drop removed a row from the `lastNObservations` response (decision 22) |
 | 3b | `GET /data/dataflow/.../{key with one position widened to `*`}?attributes=series&measures=none` (conditional) | Recover a dimension-group attribute a `+` key suppressed upstream (decision 17) |
 | 4 | Observation decode | Map positional indices to time labels via `structures[0].dimensions.observation[0].values` |
 | 5 | Placement + final-result budget | Explicitly stage when requested, otherwise spill an oversized analytical result; size the complete MCP result envelope and rebalance only the observation preview |
@@ -333,7 +359,7 @@ The `api.imf.org` portal does not require registration for data queries. All dat
 
 ### 2. DataCanvas: adopted
 
-IMF macro data is inherently analytical — multi-country GDP comparisons, BOP time series, WEO cross-country projections. An agent querying 30 countries × 5 indicators × 20 years = 3,000 observations is exactly the "agent would run `GROUP BY country`" shape that earns a canvas. DataCanvas is adopted. Automatic placement measures the actual MCP success result (`structuredContent` plus rendered `content[]`, including enrichment trailers) and stages only when that result exceeds 100,000 serialized characters. Series metadata, handles, attribution, guidance, and truthful `observation_count` are fixed; the observation preview is reduced to meet the cap. If those fixed fields alone exceed the budget, the tool returns `response_too_large` and asks the caller to narrow the series key rather than silently dropping metadata.
+IMF macro data is inherently analytical — multi-country GDP comparisons, BOP time series, WEO cross-country projections. An agent querying 30 countries × 5 indicators × 20 years = 3,000 observations is exactly the "agent would run `GROUP BY country`" shape that earns a canvas. DataCanvas is adopted. Automatic placement measures the actual MCP success result (`structuredContent` plus rendered `content[]`, including enrichment trailers) and stages only when that result exceeds 100,000 serialized characters. Series metadata, handles, attribution, guidance, and truthful `observation_count` are fixed; the observation preview is reduced to meet the cap. If those fixed fields alone exceed the budget, the tool returns `response_too_large` and asks the caller to narrow the series key rather than silently dropping metadata. The canvas is opt-in, and the same budget and assembly hold without it, minus the handle (decision 23).
 
 The `canvas_id` from `imf_query_dataset` is reachable via `imf_dataframe_query` and `imf_dataframe_describe`; opt-in `imf_dataframe_drop` reclaims one completed table without deleting unrelated tables or invalidating the canvas.
 
@@ -359,7 +385,7 @@ The portal exposes 70+ `_VINTAGE` dataflows (e.g. `WEO_2025_OCT_VINTAGE`, `CPI_2
 
 `imf_query_dataset` has two output paths (inline observations vs. canvas spill) — both must be content-complete in `format()`:
 
-- **Inline path:** render `start_period`–`end_period` context, unit/scale, and observations as a markdown table. `staged: false` and `truncated: false` describe the default under-budget result.
+- **Inline path:** render `start_period`–`end_period` context, unit/scale, and observations as a markdown table. `staged: false` and `truncated: false` describe the default under-budget result; without DataCanvas an over-budget result renders `truncated: true` and its `retrieval_guidance`.
 - **Canvas path:** render the canvas handle summary — `canvas_id`, `table_name`, `observation_count`, `staged`, and `truncated` — plus instructions for follow-up (`imf_dataframe_describe` → `imf_dataframe_query`). The same instructions are carried in `structuredContent.retrieval_guidance`; when an unparsed-period `notice` also applies, both fields and both content blocks are returned together.
 
 `imf_get_database` format: render `key_format` prominently (first line), then each dimension with its codelist or availability entries and page counts. Every preview is bounded at 50; a selected `dimension_id` can use `limit`/`offset`, and `next_offset` names the continuation call. Availability mode also renders series/time coverage and per-dimension available counts. A dimension with no entries distinguishes filter miss, offset past the end, unresolved codelist, and no published coverage.
@@ -368,7 +394,7 @@ The portal exposes 70+ `_VINTAGE` dataflows (e.g. `WEO_2025_OCT_VINTAGE`, `CPI_2
 
 - Dataflow list: cache 1 hour — changes only when IMF publishes new releases
 - DSD + codelists: cache 24 hours per `(agency, dsd_id, version)` — rarely changes within a version
-- Full dataflow availability: cache 1 hour per dataflow — reused across preview and selected-dimension pages
+- Full dataflow availability: cache 1 hour per `(agency, dataflow_id, version)` — reused across preview and selected-dimension pages
 - Data observations: no cache — always live
 - MCP metadata responses: public one-hour cache hints on all six cacheable 2026-07-28 operations (`tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, `resources/read`, `server/discover`); 2025 responses are unchanged
 
@@ -404,7 +430,7 @@ Annotating rather than suppressing the sample keeps the failure immediately usef
 
 ### 12. Series attributes belong to a series, not to a query
 
-`+` and `*` keys are the tool's main analytical shape, and the series they resolve to do not share attributes: in `USA.NGDPD+NGDP_RPCH.A`, `NGDPD` carries `SCALE` `9` while `NGDP_RPCH` carries the `0` sentinel. One flat `series_attributes` record therefore describes at most one of them. Attributes are decoded per series and keyed by decoded series key, and everything downstream — the inline payload, the canvas rows, the rendered table — reads them through that key, so a row can only receive its own series' unit and scale.
+`+` and `*` keys are the tool's main analytical shape, and the series they resolve to do not share attributes: in `USA.NGDPD+NGDP_RPCH.A`, `NGDPD` carries `SCALE` `9` while `NGDP_RPCH` carries `0`. One flat `series_attributes` record therefore describes at most one of them. Attributes are decoded per series and keyed by decoded series key, and everything downstream — the inline payload, the canvas rows, the rendered table — reads them through that key, so a row can only receive its own series' unit and scale.
 
 The output stays additive rather than redefining the existing field: `series_attributes` keeps working for the single-series case that dominates, and a query resolving to more than one series carries `series_metadata` alongside it, one entry per distinct `series_key`. A caller that never issues a multi-series key sees an unchanged response, and one that does gets a list keyed to the same `series_key` its observations carry. `series_attributes` describes the first series in that case, and its `.describe()` says so — an unlabeled "one of them" is what made the field misleading in the first place.
 
@@ -414,7 +440,7 @@ The precision attribute — `DECIMALS_DISPLAYED` on an IMF-authored structure, a
 
 Clients differ in which surface they forward, so an attribute present only in `structuredContent` is invisible to half of them. The `Series:` line used to be gated on a *meaningful* scale, which meant a series with the `0` sentinel and no unit rendered nothing at all — dropping `decimals` with it, and leaving a `content[]`-only client with no precision or scale information for the most common WEO shape.
 
-The sentinel and the suppression are separable concerns. A bare `0` beside a value is genuinely misleading — it reads as an observation of zero or a multiplier of zero — but the fix for that is to name it, not to drop the line: scale `0` renders as `no scale multiplier`, and every other attribute renders beside it. `structuredContent` still carries the raw upstream code, so nothing is normalized away before the structured channel. A multi-series result renders the same facts as a per-series table instead of a single line.
+The sentinel and the suppression are separable concerns. A bare `0` beside a value is genuinely misleading — it reads as an observation of zero — but the fix for that is to name it, not to drop the line: scale `0` renders as `published in units` (decision 24), and every other attribute renders beside it. `structuredContent` still carries the raw upstream code, so nothing is normalized away before the structured channel. A multi-series result renders the same facts as a per-series table instead of a single line.
 
 The line is omitted only when the series has no attributes at all, which is the one case where there is nothing to say.
 
@@ -442,7 +468,7 @@ Naming the observed exceptions would have left the same defect on whatever was n
 
 `PRECISION` and `SDG`'s `UNIT_MULT` are the near misses, and both are excluded for the same structural reason: they attach to the observation, so they sit in a different list, and an index taken from one list against the other array is meaningless rather than merely wrong.
 
-Two dataflows change what a caller sees. `NA_MAIN` reports scale `0` and 2 decimals where it reported nulls — and so renders a `Series:` line reading `no scale multiplier | 2 decimals`, its first. `SDG` reports units such as `PER_100000_POP`. `PCPS`'s `DECIMAL_DISPLAYED` is now located but carries no value upstream, so its output is unchanged until the IMF populates it.
+Two dataflows change what a caller sees. `NA_MAIN` reports scale `0` and 2 decimals where it reported nulls — and so renders a `Series:` line reading `published in units | 2 decimals`, its first. `SDG` reports units such as `PER_100000_POP`. `PCPS`'s `DECIMAL_DISPLAYED` is now located but carries no value upstream, so its output is unchanged until the IMF populates it.
 
 The alias list order is precedence, IMF spelling first. It is unreachable today — no dataflow declares two spellings of one concept — and exists so one that later does resolves identically on every request instead of by whichever id its payload lists first.
 
@@ -458,7 +484,7 @@ Group keys are indexed once by the slots they constrain, so a concept costs one 
 
 The series bucket wins any concept both levels describe. No structure declares one at two relationships today; the order is fixed so that one which later does is described by the statement made about it alone rather than by the one made about the set it belongs to.
 
-59 dataflows change what a caller sees, `WEO` and the regional REOs among them. `USA.NGDP_RPCH.A` reports `unit: "PT"` where it reported `null`, and a query spanning indicators gives each series its own: `USA.NGDPD.A` is `USD` at scale 9 while `USA.NGDP_RPCH.A` is `PT` unscaled. On `FSICDM`, where `UNIT` is declared against SECTOR + INDICATOR + TRANSFORMATION rather than the indicator alone, the six transformations of one distribution report separately: `USA.S12CFSI.AQ14.WQ1.Q` and its sibling quartiles are `PT` while `USA.S12CFSI.AQ14.WGTK.Q`, the kurtosis, is `_Z`. The other 105 declare a dimension-group unit their payloads never populate (see Known Limitations).
+59 dataflows change what a caller sees, `WEO` and the regional REOs among them. `USA.NGDP_RPCH.A` reports `unit: "PT"` where it reported `null`, and a query spanning indicators gives each series its own: `USA.NGDPD.A` is `USD` at scale 9 while `USA.NGDP_RPCH.A` is `PT` at scale 0. On `FSICDM`, where `UNIT` is declared against SECTOR + INDICATOR + TRANSFORMATION rather than the indicator alone, the six transformations of one distribution report separately: `USA.S12CFSI.AQ14.WQ1.Q` and its sibling quartiles are `PT` while `USA.S12CFSI.AQ14.WGTK.Q`, the kurtosis, is `_Z`. The other 105 declare a dimension-group unit their payloads never populate (see Known Limitations).
 
 ### 17. A group the portal ships empty is recovered by an attributes-only request
 
@@ -482,18 +508,87 @@ It fires only for the shape it can fix, and an empty group is not by itself that
 
 Everything about the probe is bounded and optional: one GET, never retried, its own 10-second cap, and every failure path — non-200, unparseable body, timeout, a structure that will not resolve — returning what the query returned before it existed. It sits on the success path of a working query, so it may add a unit but never an error. Measured live, it adds ~0.25 s to an affected query and nothing at all to an unaffected one.
 
+### 18. Filters match every word, not one literal substring
+
+`codelist_filter` and the catalog's `filter` matched the whole filter as one literal substring, so a phrase found nothing unless the caller reproduced the portal's wording and punctuation: on `WEO`, `GDP constant prices` and `Gross domestic product, constant` both missed `Gross domestic product (GDP), Constant prices, Percent change`. Both filters split on whitespace and commas and keep an entry when every token appears, case-insensitively, in any of its searched fields — code ID and name for `codelist_filter`, id, name, and full description for `filter`. Different tokens may match different fields, and every other character stays literal inside its token. One matcher serves both tools and `available_only` mode.
+
+The rule only widens. A filter with no whitespace or comma is a single token and matches exactly as a substring did, and whatever a whole filter matched literally it still matches, since each of its tokens is a substring of it. A filter made only of commas has no tokens and matches literally.
+
+Rejected:
+- Splitting on whitespace only: `product,` keeps its comma and still misses.
+- Stripping punctuation from token edges: `St.` becomes `st`, and its `WEO` COUNTRY matches grow from 5 to 55.
+- Requiring every token to match the same field: `NGDP_RPCH percent` misses, because the code is in the ID and the word is in the name.
+- Fuzzy or ranked search: heavier, and harder to predict than an AND of tokens.
+
+### 19. Availability requests name the dataflow by agency, id, and version
+
+Both availability requests (the key-scoped and dataflow-wide probes behind `no_data`, and the uncapped constraint behind `available_only`) named the dataflow by bare id. The portal resolves a bare id as `all:<id>(latest)`, and for `GPT`, published by `IMF.SPR`, that answers HTTP 404 `No such dataflow found: Dataflow=all:GPT(latest)`, while `IMF.SPR,GPT,1.0.1` answers with an 821-series constraint. `available_only` reported the 404 as a retryable outage that could never clear, and the `no_data` diagnosis degraded to its generic message.
+
+Both builders now send the SDMX 2.1 flow reference `{agency},{flow_id},{version}`, the identity the data request already uses, taken from the catalog entry the dataflow resolved to. Each part is URI-encoded and joined with literal commas (the portal also accepts `%2C`). The `available_only` cache key carries the same three parts, so one version never serves another's coverage. Across all 222 catalog dataflows, the bare form served 221 and the qualified form served all 222, reporting the same `series_count` on every flow both forms answered; `GPT` was the only one the bare form missed.
+
+### 20. Key codes resolve against the codelist before the data request
+
+The portal matches codes case- and whitespace-sensitively and answers an unknown code with HTTP 200 and zero series. Sent as-is, `US.NGDP_RPCH.A`, `usa.ngdp_rpch.a`, and ` USA.NGDP_RPCH.A` all reached the `no_data` diagnosis, which blamed coverage ("this code has no coverage in this dataflow") for what was a spelling, and a bad later code (`USA.NGDP_RPC.A`) drew a capped list of available codes that could omit the intended one. `dataflow_id: "weo"` failed as `dataflow_not_found`.
+
+`imf_query_dataset` now trims the key, each position, and each `+` member, then resolves every code against its own dimension's codelist from the DSD it already fetched — an exact spelling first, then a case-insensitive match. The canonical key drives the data request, both availability probes, messages, and the `key` echo. A code with no match fails as `invalid_key_code` before any data request, and every failing position is reported in one error with up to five nearest codes (codes the input prefixes, in codelist order, or failing that, codes one edit away) and the dimension it belongs to when another dimension's codelist holds it (`NGDP_RPCH.USA.A`). `*`, empty `+` members, and positions whose codelist resolved empty pass unchecked, so a valid code with no series still gets the availability diagnosis. A `*` inside a `+` list fails as `wildcard_in_code_list`: the portal ignores it there, so `USA+*.NGDP_RPCH.A` returns USA alone where `*.NGDP_RPCH.A` returns 210 series. `dataflow_id` resolves the same way against the catalog in all three entry points; no two of the 222 catalog ids differ only by case.
+
+Rejected:
+- Upper-casing the key: codelists carry mixed-case codes (`BofAML` and `IfWKI` in `CL_ORGANIZATION`), so only the codelist knows a code's spelling.
+- Asking the availability constraint which codes exist: an upstream request on every query, where the codelist is already cached with the DSD.
+
+### 21. Observation status resolves inline, and a not-available status is padding
+
+`STATUS` was decoded only through its attribute's `values` list. Every dataflow checked that declares it (`CPI`, `ER`, `COFER`, `FAS`, `GFS_SOO`, and the rest) ships the definition with no `values` and carries the flag itself in the observation cell — `ER`'s `[null, null, 0, "T"]` — so every observation reported `status: null`. STATUS now resolves the way series attributes do: through `values` when the definition has them, and as the literal the cell carries otherwise.
+
+A null value with no status is calendar padding, carried for periods before a series starts, and `imf_query_dataset` drops it. Once statuses decode, null values arrive flagged too. A sweep of live payloads across the catalog found `NA` (`GFS_SOEF`, `FAS`, `FSIBSIS`), `n.a.` (`CPI`), `na` (`FSIBSIS`), `T` (`ER`), `C` (`IIPCC`), `B` and `K` (`MFS_*`), `NP`, `ND`, `N/D`, `nd`, `n.d.`, `-`, `.`, `o`, and free-text removal notes on `FAS` (`/temporarily removed …`, `… - Removed - Temp`). `NA`, `n.a.` and `na` say only that the value is not available, which the null already says, so a null value whose only status is one of them (compared case-insensitively) is dropped as padding as well. Any other status says something the null does not, and that row is kept, inline and on the canvas.
+
+Rejected:
+- Adding `ND`/`n.d.`, `NP`, `-` or `.` to the not-available set: each has another reading (not disclosed, not published, nil), and dropping a row that carries one would discard it.
+
+### 22. `last_n_observations` is forwarded only without a period bound, and re-fetched when padding bites
+
+"The latest value for every country" fetched the full history: `CPI` `*.CPI._T.YOY_PCH_PA_PT.M` is 2,931,133 bytes and 64,422 observations across 191 series, and `?lastNObservations=1` is 26,777 bytes, one observation per series. The portal honors `lastNObservations` per series, so the parameter is worth forwarding, but two of its behaviors decide when:
+
+- It ignores the period bounds (Known Limitations), taking the last N of the whole series: `USA.NGDP_RPCH.A?lastNObservations=1&endPeriod=2020` returns `2031`, which the local range filter then empties. So N is forwarded only when neither `start_period` nor `end_period` is set. With a bound, the request goes out as before, the range applies locally, and each series' last N inside it is kept — the SDMX window semantics.
+- It counts null padding toward N, and some series end in padding: `JAM.CPI._T.IX.M` ends `2026-M07` = 152.7, then a null `2026-M08`. At N=1 that series' only row is padding, the drop (decision 21) removes it, and the series vanishes. So when the drop removes any row from a forwarded response, the request is repeated without the parameter and N is selected locally. When it removes nothing, the rows are each series' last N cells, all kept, so they are already the answer. Of 83 dataflows scanned at N=1, 34,749 series in 7 dataflows end in such a row; `*.CPI._T.YOY_PCH_PA_PT.M`, `WEO`, and `QNEA` have none.
+
+Selection runs after the emptiness checks, which therefore see the same set they see without N: `no_data` and `no_data_in_range` fire for the same inputs and report the same ranges. `observation_count`, the inline preview, and the staged table all carry the selected rows, and the applied value is echoed on both channels, since a one-row-per-series result has to say it was selected.
+
+Rejected:
+- Forwarding N alongside a period bound: the portal ignores the bound, so a past window comes back empty.
+- Selecting locally only: exact, but it always downloads the full history and gives up the saving on keys whose series end in data.
+
+### 23. Without a canvas, the response budget still holds
+
+With `CANVAS_PROVIDER_TYPE` unset — the default, and the only mode the `.mcpb` bundle runs — the budget check was skipped: `WEO` `*.NGDPD+NGDP_RPCH.A` returned all 19,979 observations in a 2.6-million-character envelope, and `*.*.A` in 46 million. An over-budget result without a canvas now goes through the assembly the staged path uses, minus the handle. The whole envelope is measured (decision 2), full `series_metadata` and the true `observation_count` stay, and `observations` is the longest time-ascending prefix that fits, with `staged: false` and `truncated: true`. `retrieval_guidance` names the last `time_period` returned and each way to the rest: a narrower key, `start_period` from that period, a `start_period`/`end_period` window, `last_n_observations`, or `CANVAS_PROVIDER_TYPE=duckdb`. It names no dataframe tool. When `series_metadata` alone overflows (`*.*.A`), `response_too_large` fires as it does when staging.
+
+The dataframe tools are gated on canvas presence with `disabledTool()`. Without a canvas nothing is staged, so `imf_dataframe_describe` and `imf_dataframe_query` could only fail with `canvas_not_found`. All three leave `tools/list` and stay in the landing inventory with `CANVAS_PROVIDER_TYPE=duckdb` as the hint, and `imf_dataframe_drop` keeps its own flag on top. The gate reads `CANVAS_PROVIDER_TYPE` from the framework config at module load, because tools register before `setup()` wires the canvas instance.
+
+Rejected:
+- Whole series as the truncation unit: the commonest single-series overflow, one long monthly series, would still need a prefix, so it adds a second mode instead of replacing the first. A prefix also has a continuation the existing inputs express.
+- Measuring the larger of the two channels instead of their sum: the tool would carry two budget definitions, one per path.
+
+### 24. Scale is the power of ten a series is published in
+
+`SCALE` (`UNIT_MULT` on `NA_MAIN`) was described as a factor to apply to the values. The portal already returns `value` in base units. On every dataflow checked with a non-zero scale (`WEO`, `BOP`, `IL`, `MFS_MA`, `COFER`, `GFS_SOO`, `IMTS`), the value matches a scale-0 sibling or a known aggregate in base units: `WEO` `USA.NGDPD.A` 2024 is 29,298,025,000,000 at scale 9, and `BOP` reports the US current account at the same magnitude at scale 6. A caller following the old description was off by up to 10^9.
+
+Scale is described as the power of ten the IMF publishes the series in, and each description that reaches a caller says values are in base units: `value`, both `scale` fields, and the tool description, which is the only text a canvas row's `scale` column has. In `content[]`, `"0"` renders `published in units`, any other code N renders `published in units of 10^N`, and the observation table's value column reads `Value (base units)`. `structuredContent` and canvas rows keep the raw code.
+
+Rejected: a divisor or published-figure field. The published figure is `value / 10^scale`, one step from two fields every response carries, and a field on every series or row spends response budget on nothing new.
+
 ---
 
 ## Known Limitations
 
 - **No `IFS` monolithic database.** The legacy IFS (exchange rates, reserves, money, prices, interest rates in one cube) no longer exists on `api.imf.org`. Equivalent data exists in component databases: `ER`, `IL`, `CPI`, `MFS_*`. Agents migrating from legacy IMF client code will need to update their database codes.
-- **Empty series on bad keys.** A dimension key with unknown codes returns HTTP 200 with an empty dataset (`series` absent from the dataset) rather than a 4xx error. The service layer must detect this and surface it as a `no_data` error carrying availability context. An empty key segment behaves the same way upstream, so it is rejected locally as `empty_key_segment` rather than sent and misreported.
+- **Empty series on bad keys.** A dimension key with unknown codes returns HTTP 200 with an empty dataset (`series` absent from the dataset) rather than a 4xx error, and matching is case- and whitespace-sensitive. Codes are therefore resolved against the DSD codelists before the request (decision 20): an unknown code fails as `invalid_key_code`, a `*` inside a `+` list as `wildcard_in_code_list`, and an empty key segment as `empty_key_segment`, rather than being sent and misreported. A code at a position whose codelist resolved empty is sent unchecked, so an unknown one there still comes back as `no_data` with availability context.
 - **Shared DSDs list every flow that references them.** A `?references=all` DSD payload carries each dataflow sharing the structure, in an order the portal does not hold stable — `DSD_GFS` has returned different flows first across requests. Nothing on the payload marks which flow was asked for, so a flow's own identity (`name`, `version`, `agencyId`, `description`) is taken from the dataflow catalog entry, never from the structure payload's flow list.
 - **WEO forecast vs. historical.** WEO observations mix historical actuals and projections in a single series. The API does not flag which observations are projections vs. actuals; the `DERIVATION_TYPE` observation attribute carries this when present.
 - **SDMX 3.0 rate limits.** IMF has not published explicit rate limits for the SDMX 3.0 portal. Live testing showed no rate limiting on sequential requests, but large multi-country queries can be slow (2–10 seconds). Build with a 30-second timeout and 3-attempt retry with exponential backoff.
 - **Some dataflows declare a unit and ship no value for it.** Both attachment levels are decoded (decision 16), but a structure can declare `UNIT`, leave its `values` empty and omit `dimensionGroupAttributes` altogether — `CPI` does this for every key shape, as do `QNEA`, `MFS_*`, `IRFCL` and a long tail, and `AEA` does the same for its series attribute. `unit` is `null` there because the portal carries nothing to report, not because the decode misses it. 59 of the 164 flows that declare a dimension-group unit actually populate it.
 - **A `+` key suppresses dimension-group attributes upstream; the values are recovered by a second request.** When a key combines codes with `+` on the very dimension a group is declared against and no position uses `*`, the portal ships that group's definition with empty `values` — `WEO`'s `USA.NGDP_RPCH+NGDPD.A`, which also omits `dataSets[0].dimensionGroupAttributes` altogether, and `PPI`'s `USA.PPI.POP_PCH_PT+IX.A`, which keeps the block and files only other groups' rows in it. A `+` on any other dimension is unaffected (`USA+GBR.NGDP_RPCH.A` resolves normally), and so is a key with no `+` at all. The response cannot be repaired after the fact, so a probe request recovers the values (decision 17) and both key shapes report the same unit. The dataflows that declare a unit and publish none return the identical empty group for every key, so the probe is gated on the `+` as well and never fires for them.
 - **`startPeriod` and `endPeriod` are ignored by the portal.** They are sent, and the response carries every observation the key has — `USA.NGDP_RPCH.A?startPeriod=2023&endPeriod=2023` returns all 52. The range filter is applied locally as a result, and a period bound cannot be used to make an upstream request smaller.
+- **`lastNObservations` counts null padding and ignores the period bounds.** `JPN.CPI._T.IX.M?lastNObservations=865` returns 5 padding rows before its 860 real ones, and a series ending in padding (`JAM.CPI._T.IX.M`) answers N=1 with its padding row alone. Combined with `endPeriod`, it still returns the last N of the whole series. `last_n_observations` therefore forwards it only without a period bound and re-fetches in full when the response carried padding (decision 22).
 
 ---
 
@@ -514,6 +609,8 @@ No authentication required. No API key header needed.
 | List all dataflows | `GET /structure/dataflow` | `/structure/dataflow` |
 | Get datastructure + codelists | `GET /structure/datastructure/{agency}/{dsd_id}/{version}?references=all` | `/structure/datastructure/IMF.RES/DSD_WEO/9.0.0?references=all` |
 | Data query | `GET /data/dataflow/{agency}/{flow_id}/{version}/{key}?startPeriod=&endPeriod=` | `/data/dataflow/IMF.RES/WEO/9.0.0/USA.NGDP_RPCH.A?startPeriod=2018&endPeriod=2026` |
+| Data query, each series' last N | `GET /data/dataflow/{agency}/{flow_id}/{version}/{key}?lastNObservations={n}` | `/data/dataflow/IMF.STA/CPI/5.0.0/*.CPI._T.YOY_PCH_PA_PT.M?lastNObservations=1` |
+| Availability constraint (SDMX 2.1 base) | `GET /availableconstraint/{agency},{flow_id},{version}/{key}` — empty `{key}` for the dataflow-wide form (decision 19) | `/availableconstraint/IMF.SPR,GPT,1.0.1/` |
 
 ### Key Database Reference
 
@@ -538,6 +635,8 @@ No authentication required. No API key header needed.
 - Codes are dot-separated, one per dimension, in DSD `keyPosition` order — every position present, none blank
 - `*` wildcards a position (`USA.CPI._T.*.M` → 6 series where `USA.CPI._T.IX.M` → 1); `+` combines codes at one position (`USA+GBR.NGDP_RPCH.A`)
 - An empty segment is **not** a wildcard: `USA.CPI._T..M` returns HTTP 200 with zero series upstream
+- `*` inside a `+` list is ignored: `USA+*.NGDP_RPCH.A` returns USA alone (1 series, where `*.NGDP_RPCH.A` returns 210)
+- Codes are case- and whitespace-sensitive upstream: `usa`, ` USA`, and `US` each return HTTP 200 with zero series. The server resolves codes against the codelist before sending (decision 20)
 - Country codes are **ISO 3-letter** (USA, GBR, DEU, JPN, CHN, …)
 - Frequency codes with data anywhere in the catalog: `A` = annual (`2023`), `S` = semi-annual (`2023-S1`), `Q` = quarterly (`2023-Q1`), `M` = monthly (`2023-M01`), `D` = daily (`2023-01-05`). `CL_FREQ` enumerates more (`W`, `H`, `B`, …); no dataflow publishes them
 
@@ -576,7 +675,7 @@ No authentication required. No API key header needed.
 }
 ```
 
-**Decoding observations:** Series key `"0:0:0"` = indices into each series dimension's `values` array. Observation key `"0"` = index into `structures[0].dimensions.observation[0].values` → time label. Observation value `["-0.257"]` = `[OBS_VALUE, ...attribute_values]` (attribute order from `structures[0].attributes.observation`).
+**Decoding observations:** Series key `"0:0:0"` = indices into each series dimension's `values` array. Observation key `"0"` = index into `structures[0].dimensions.observation[0].values` → time label. Observation value `["-0.257"]` = `[OBS_VALUE, ...attribute_values]` (attribute order from `structures[0].attributes.observation`). An attribute cell is an index into its definition's `values` when the definition has them (a JSON number, as `DERIVATION_TYPE`'s `0`) and the literal itself when it does not; `STATUS` ships uncoded, so `ER`'s `[null, null, 0, "T"]` carries status `T` (decision 21). Arrays can stop short of the last attribute, which then reads as absent.
 
 **Decoding series attributes:** a series' `attributes` array is positional against `structures[0].attributes.series`, and each entry is an *index* into that definition's `values` — not the value. `SCALE` `[{ id: "9" }, { id: "0" }]` with an entry of `0` means scale 9, and `DECIMALS_DISPLAYED` `[{ id: "3" }]` with an entry of `0` means three decimals. An attribute definition that ships no `values` (e.g. `COUNTRY_UPDATE_DATE`) carries its literal inline instead, so the decode resolves through `values` when present and falls back to the raw entry when not. Every series in a multi-series response points into the same definition list at different indices — which is why the attributes are per series.
 
