@@ -3,12 +3,13 @@
  * @module mcp-server/tools/definitions/imf-dataframe-describe.tool
  */
 
-import { tool, z } from '@cyanheads/mcp-ts-core';
+import { disabledTool, tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { isCanvasConfigured } from '@/config/server-config.js';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 
-export const imfDataframeDescribe = tool('imf_dataframe_describe', {
+const imfDataframeDescribeDefinition = tool('imf_dataframe_describe', {
   description:
     'List DataCanvas tables and columns staged by a prior imf_query_dataset call. ' +
     "Returns each table's name, row count, and column schema (name + DuckDB type). " +
@@ -66,7 +67,6 @@ export const imfDataframeDescribe = tool('imf_dataframe_describe', {
       throw ctx.fail(
         'canvas_not_found',
         'DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb.',
-        ctx.recoveryFor('canvas_not_found'),
       );
     }
 
@@ -76,7 +76,6 @@ export const imfDataframeDescribe = tool('imf_dataframe_describe', {
     } catch {
       throw ctx.fail('canvas_not_found', `Canvas '${input.canvas_id}' not found or expired`, {
         canvasId: input.canvas_id,
-        ...ctx.recoveryFor('canvas_not_found'),
       });
     }
 
@@ -113,3 +112,11 @@ export const imfDataframeDescribe = tool('imf_dataframe_describe', {
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });
+
+/** Nothing is ever staged without a canvas, so the tool is listed only with one. */
+export const imfDataframeDescribe = isCanvasConfigured()
+  ? imfDataframeDescribeDefinition
+  : disabledTool(imfDataframeDescribeDefinition, {
+      reason: 'DataCanvas is not configured in this deployment.',
+      hint: 'CANVAS_PROVIDER_TYPE=duckdb',
+    });

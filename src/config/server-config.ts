@@ -4,7 +4,7 @@
  */
 
 import { z } from '@cyanheads/mcp-ts-core';
-import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
+import { config, parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 
 const ServerConfigSchema = z.object({
   baseUrl: z
@@ -31,4 +31,13 @@ export function getServerConfig(): z.infer<typeof ServerConfigSchema> {
     enableDataframeDrop: 'IMF_ENABLE_DATAFRAME_DROP',
   });
   return _config;
+}
+
+/**
+ * Whether this deployment configures DataCanvas (`CANVAS_PROVIDER_TYPE`). Read
+ * from the framework config rather than the wired instance, because the
+ * dataframe tools are gated at module load, before `setup()` runs.
+ */
+export function isCanvasConfigured(): boolean {
+  return config.canvas.providerType !== 'none';
 }

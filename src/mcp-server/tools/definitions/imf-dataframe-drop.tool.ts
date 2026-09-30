@@ -6,7 +6,7 @@
 import { disabledTool, tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getServerConfig } from '@/config/server-config.js';
+import { getServerConfig, isCanvasConfigured } from '@/config/server-config.js';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 
 const INVALID_IDENTIFIER_REASONS = new Set([
@@ -63,7 +63,6 @@ const imfDataframeDropDefinition = tool('imf_dataframe_drop', {
       throw ctx.fail(
         'canvas_not_found',
         'DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb.',
-        ctx.recoveryFor('canvas_not_found'),
       );
     }
 
@@ -76,7 +75,6 @@ const imfDataframeDropDefinition = tool('imf_dataframe_drop', {
       }
       throw ctx.fail('canvas_not_found', `Canvas '${input.canvas_id}' not found or expired`, {
         canvasId: input.canvas_id,
-        ...ctx.recoveryFor('canvas_not_found'),
       });
     }
 
@@ -89,13 +87,11 @@ const imfDataframeDropDefinition = tool('imf_dataframe_drop', {
       if (reason === 'canvas_not_found') {
         throw ctx.fail('canvas_not_found', `Canvas '${input.canvas_id}' not found or expired`, {
           canvasId: input.canvas_id,
-          ...ctx.recoveryFor('canvas_not_found'),
         });
       }
       if (typeof reason !== 'string' || !INVALID_IDENTIFIER_REASONS.has(reason)) throw error;
       throw ctx.fail('invalid_table_name', error.message, {
         tableName: input.table_name,
-        ...ctx.recoveryFor('invalid_table_name'),
       });
     }
 
@@ -120,9 +116,25 @@ const imfDataframeDropDefinition = tool('imf_dataframe_drop', {
   ],
 });
 
-export const imfDataframeDrop = getServerConfig().enableDataframeDrop
-  ? imfDataframeDropDefinition
-  : disabledTool(imfDataframeDropDefinition, {
-      reason: 'Dataframe table cleanup is disabled in this deployment.',
-      hint: 'IMF_ENABLE_DATAFRAME_DROP=true',
+/**
+ * Listed only when both gates are open: a canvas to hold tables, and the opt-in
+ * flag for this destructive cleanup. Without a canvas the hint names every
+ * setting still missing, so enabling the canvas alone is not a dead end.
+ */
+function gateDrop() {
+  const { enableDataframeDrop } = getServerConfig();
+  if (!isCanvasConfigured()) {
+    return disabledTool(imfDataframeDropDefinition, {
+      reason: 'DataCanvas is not configured in this deployment.',
+      hint: `CANVAS_PROVIDER_TYPE=duckdb${enableDataframeDrop ? '' : ' IMF_ENABLE_DATAFRAME_DROP=true'}`,
     });
+  }
+  return enableDataframeDrop
+    ? imfDataframeDropDefinition
+    : disabledTool(imfDataframeDropDefinition, {
+        reason: 'Dataframe table cleanup is disabled in this deployment.',
+        hint: 'IMF_ENABLE_DATAFRAME_DROP=true',
+      });
+}
+
+export const imfDataframeDrop = gateDrop();

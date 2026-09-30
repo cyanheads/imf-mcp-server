@@ -3,9 +3,10 @@
  * @module mcp-server/tools/definitions/imf-dataframe-query.tool
  */
 
-import { tool, z } from '@cyanheads/mcp-ts-core';
+import { disabledTool, tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { isCanvasConfigured } from '@/config/server-config.js';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 
 /**
@@ -108,7 +109,7 @@ const CANVAS_REASON_MAP: Record<string, ContractReason> = {
   system_catalog_access: 'sql_not_permitted',
 };
 
-export const imfDataframeQuery = tool('imf_dataframe_query', {
+const imfDataframeQueryDefinition = tool('imf_dataframe_query', {
   description:
     'Run a read-only SQL SELECT against a DataCanvas table staged by imf_query_dataset. ' +
     'Supports multi-country comparisons, time-series aggregation, and cross-indicator joins. ' +
@@ -204,7 +205,6 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
       throw ctx.fail(
         'invalid_sql',
         'SQL must be a SELECT statement, optionally opening with a WITH … SELECT common table expression. DML and DDL are not permitted.',
-        ctx.recoveryFor('invalid_sql'),
       );
     }
 
@@ -213,7 +213,6 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
       throw ctx.fail(
         'canvas_not_found',
         'DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb.',
-        ctx.recoveryFor('canvas_not_found'),
       );
     }
 
@@ -223,7 +222,6 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
     } catch {
       throw ctx.fail('canvas_not_found', `Canvas '${input.canvas_id}' not found or expired`, {
         canvasId: input.canvas_id,
-        ...ctx.recoveryFor('canvas_not_found'),
       });
     }
 
@@ -249,17 +247,14 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
           {
             canvasId: input.canvas_id,
             ...(typeof tableName === 'string' ? { tableName } : {}),
-            ...ctx.recoveryFor('missing_table'),
           },
         );
       }
 
       // The layer's own message names the offending statement type, function, or
-      // operator and is already sanitized upstream — keep it, add a usable hint.
-      throw ctx.fail(mapped, err.message, {
-        canvasId: input.canvas_id,
-        ...ctx.recoveryFor(mapped),
-      });
+      // operator and is already sanitized upstream — keep it; the framework adds
+      // this tool's declared hint for the mapped reason.
+      throw ctx.fail(mapped, err.message, { canvasId: input.canvas_id });
     }
 
     const response = fitResponseEnvelope(result.rows, result.truncated === true);
@@ -267,7 +262,6 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
       throw ctx.fail(
         'response_too_large',
         'The first query row exceeds the 100,000-character response budget.',
-        ctx.recoveryFor('response_too_large'),
       );
     }
     ctx.log.info('Canvas query executed', {
@@ -281,3 +275,11 @@ export const imfDataframeQuery = tool('imf_dataframe_query', {
 
   format: formatDataframeQueryResult,
 });
+
+/** Nothing is ever staged without a canvas, so the tool is listed only with one. */
+export const imfDataframeQuery = isCanvasConfigured()
+  ? imfDataframeQueryDefinition
+  : disabledTool(imfDataframeQueryDefinition, {
+      reason: 'DataCanvas is not configured in this deployment.',
+      hint: 'CANVAS_PROVIDER_TYPE=duckdb',
+    });

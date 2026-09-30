@@ -12,6 +12,7 @@ import {
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { contractError } from '../helpers/errors.js';
 
 vi.mock('@/services/canvas/canvas-accessor.js', () => ({
   getCanvas: vi.fn(),
@@ -119,12 +120,13 @@ describe('imfDataframeDrop', () => {
   it.each(['', 'bad-name', 'select'])(
     'maps invalid table identifier %j to invalid_table_name',
     async (tableName) => {
-      const input = imfDataframeDrop.input.parse({
-        canvas_id: instance.canvasId,
-        table_name: tableName,
-      });
+      const call = await runToolContract(
+        imfDataframeDrop,
+        { canvas_id: instance.canvasId, table_name: tableName },
+        { context: { tenantId: 'test' } },
+      );
 
-      await expect(imfDataframeDrop.handler(input, ctx)).rejects.toMatchObject({
+      expect(contractError(call)).toMatchObject({
         code: JsonRpcErrorCode.ValidationError,
         data: {
           reason: 'invalid_table_name',
@@ -210,12 +212,13 @@ describe('imfDataframeDrop', () => {
         drop: vi.fn().mockRejectedValue(expired),
       }),
     });
-    const input = imfDataframeDrop.input.parse({
-      canvas_id: instance.canvasId,
-      table_name: 'target_table',
-    });
+    const call = await runToolContract(
+      imfDataframeDrop,
+      { canvas_id: instance.canvasId, table_name: 'target_table' },
+      { context: { tenantId: 'test' } },
+    );
 
-    await expect(imfDataframeDrop.handler(input, ctx)).rejects.toMatchObject({
+    expect(contractError(call)).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: {
         reason: 'canvas_not_found',

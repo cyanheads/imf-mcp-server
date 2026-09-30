@@ -6,7 +6,7 @@
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { captureMcpError } from '../helpers/errors.js';
+import { captureMcpError, contractError } from '../helpers/errors.js';
 
 vi.mock('@/services/canvas/canvas-accessor.js', () => ({
   getCanvas: vi.fn(),
@@ -315,13 +315,14 @@ describe('imfDataframeQuery', () => {
   it('#38 rejects a single row that cannot fit with actionable recovery', async () => {
     const rows = [{ payload: 'x'.repeat(49_912), n: 0 }];
     mockCanvasQuery({ resolve: { rows, rowCount: 1, truncated: false, columns: [] } });
-    const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeQuery.errors });
     const input = imfDataframeQuery.input.parse({
       canvas_id: 'canvas-abc',
       sql: 'SELECT payload, n FROM spilled_abc123',
     });
 
-    const error = await captureMcpError(() => imfDataframeQuery.handler(input, ctx));
+    const error = contractError(
+      await runToolContract(imfDataframeQuery, input, { context: { tenantId: 'test' } }),
+    );
 
     expect(error.code).toBe(JsonRpcErrorCode.SerializationError);
     expect(error.data?.reason).toBe('response_too_large');
@@ -364,21 +365,23 @@ describe('imfDataframeQuery', () => {
         },
       ),
     });
-    const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeQuery.errors });
     const input = imfDataframeQuery.input.parse({
       canvas_id: 'canvas-abc',
       sql: 'SELECT * FROM spilled_gone',
     });
 
-    const err = await captureMcpError(() => imfDataframeQuery.handler(input, ctx));
+    const call = await runToolContract(imfDataframeQuery, input, {
+      context: { tenantId: 'test' },
+    });
+    const err = contractError(call);
 
     // Distinct from canvas_not_found — the canvas exists, the table does not.
     expect(err.code).toBe(JsonRpcErrorCode.NotFound);
     expect(err.data?.reason).toBe('missing_table');
     expect(err.data?.tableName).toBe('spilled_gone');
 
-    // Nothing the caller reads may name a framework method it cannot call.
-    const wire = JSON.stringify({ message: err.message, data: err.data });
+    // Nothing the caller reads, on either surface, may name a framework method it cannot call.
+    const wire = JSON.stringify(call);
     expect(wire).not.toContain('registerTable');
     expect(wire).not.toContain('describe()');
     expect(wire).toContain('imf_dataframe_describe');
@@ -447,13 +450,14 @@ describe('imfDataframeQuery', () => {
         { reason: 'invalid_sql', statementType: 'UNKNOWN', binderMessage: 'Binder Error' },
       ),
     });
-    const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeQuery.errors });
     const input = imfDataframeQuery.input.parse({
       canvas_id: 'canvas-abc',
       sql: 'SELECT nope FROM spilled_abc123',
     });
 
-    const err = await captureMcpError(() => imfDataframeQuery.handler(input, ctx));
+    const err = contractError(
+      await runToolContract(imfDataframeQuery, input, { context: { tenantId: 'test' } }),
+    );
 
     expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(err.data?.reason).toBe('invalid_sql');
@@ -506,13 +510,15 @@ describe('imfDataframeQuery', () => {
           { reason },
         ),
       });
-      const ctx = createMockContext({ tenantId: 'test', errors: imfDataframeQuery.errors });
       const input = imfDataframeQuery.input.parse({
         canvas_id: 'canvas-abc',
         sql: 'SELECT * FROM information_schema.tables',
       });
 
-      await expect(imfDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
+      const call = await runToolContract(imfDataframeQuery, input, {
+        context: { tenantId: 'test' },
+      });
+      expect(contractError(call)).toMatchObject({
         code: JsonRpcErrorCode.ValidationError,
         data: {
           reason: 'sql_not_permitted',
