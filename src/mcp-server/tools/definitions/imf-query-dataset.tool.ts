@@ -658,7 +658,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
               .describe(
                 'Observation status flag exactly as the dataflow publishes it, e.g. T, B, C, or NA; ' +
                   'null when the observation carries none. The flags are not a shared vocabulary across dataflows. ' +
-                  'A null value whose only status is the not-available marker NA or n.a. (any letter case) is omitted as padding; ' +
+                  'A null value with no status, or whose only status is the not-available marker NA or n.a. (any letter case), is omitted as padding; ' +
                   'a null value with any other status is returned.',
               ),
           })
@@ -882,7 +882,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .string()
       .optional()
       .describe(
-        'Populated when a period bound was set but some observations carry a time_period label the range filter does not recognize. Composes with staged retrieval_guidance when both apply.',
+        'Populated when a period bound was set but some observations carry a time_period label the range filter does not recognize. Composes with retrieval_guidance, staged or not, when both apply.',
       ),
   },
 
