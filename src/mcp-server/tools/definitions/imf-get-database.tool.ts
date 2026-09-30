@@ -25,7 +25,7 @@ export const imfGetDatabase = tool('imf_get_database', {
     '"Constant prices" → NGDP_RPCH). ' +
     'Required before imf_query_dataset — SDMX keys are opaque without codelist lookups. ' +
     `Each codelist is capped at the first ${CODELIST_PREVIEW_LIMIT} entries by default, including previews filtered by codelist_filter. ` +
-    'Set dimension_id to retrieve one codelist with bounded limit/offset paging after the optional substring filter. ' +
+    'Set dimension_id to retrieve one codelist with bounded limit/offset paging after the optional codelist_filter, which keeps codes whose ID or name contains every word given. ' +
     'Set available_only=true to page codes the dataflow actually publishes, with series and time coverage metadata; availability filtering happens before codelist_filter and paging. ' +
     'The imf://database/{dataflow_id} resource provides the same bounded discovery summary. ' +
     'Country codes are ISO 3-letter (USA, GBR, DEU), not ISO 2-letter (US, GB, DE). ' +
@@ -41,9 +41,7 @@ export const imfGetDatabase = tool('imf_get_database', {
     .object({
       dataflow_id: z
         .string()
-        .describe(
-          'Dataflow identifier from imf_list_databases, e.g. WEO, BOP, CPI. ' + 'Case-sensitive.',
-        ),
+        .describe('Dataflow identifier from imf_list_databases, e.g. WEO, BOP, CPI.'),
       agency_id: z
         .string()
         .optional()
@@ -63,9 +61,10 @@ export const imfGetDatabase = tool('imf_get_database', {
         .min(1)
         .optional()
         .describe(
-          "Optional case-insensitive substring to search within each dimension's codelist (code ID and name). " +
+          "Optional words to search for in each dimension's codelist, split on spaces and commas. A code matches " +
+            'when every word appears, case-insensitively, in its code ID or name; different words may match different fields. ' +
             `Filtering runs before the ${CODELIST_PREVIEW_LIMIT}-entry preview or selected-dimension page. ` +
-            'Example: "CPI" or "Constant prices" surfaces matching WEO indicator codes.',
+            'Example: "CPI", "GDP constant prices", or "NGDP_RPCH percent" surfaces matching WEO indicator codes.',
         ),
       available_only: z
         .boolean()
@@ -297,14 +296,13 @@ export const imfGetDatabase = tool('imf_get_database', {
     if (!dataflow) {
       throw ctx.fail('dataflow_not_found', `Dataflow '${input.dataflow_id}' not found`, {
         dataflowId: input.dataflow_id,
-        ...ctx.recoveryFor('dataflow_not_found'),
       });
     }
 
     let structure: Awaited<ReturnType<typeof svc.fetchDataflowStructure>>;
     try {
       structure = await svc.fetchDataflowStructure(
-        input.dataflow_id,
+        dataflow.id,
         input.agency_id ?? dataflow.agencyId,
         input.version ?? dataflow.version,
         ctx,
@@ -313,13 +311,13 @@ export const imfGetDatabase = tool('imf_get_database', {
       if (err instanceof McpError && err.data?.reason === 'dataflow_list_unavailable') throw err;
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('not found')) {
-        throw ctx.fail('dataflow_not_found', msg, ctx.recoveryFor('dataflow_not_found'));
+        throw ctx.fail('dataflow_not_found', msg);
       }
-      throw ctx.fail('structure_unavailable', msg, ctx.recoveryFor('structure_unavailable'));
+      throw ctx.fail('structure_unavailable', msg);
     }
 
     ctx.log.info('Dataflow structure fetched', {
-      dataflowId: input.dataflow_id,
+      dataflowId: dataflow.id,
       dimensions: structure.dimensions.length,
     });
 
@@ -344,13 +342,12 @@ export const imfGetDatabase = tool('imf_get_database', {
     let availability: Awaited<ReturnType<typeof svc.fetchDataflowAvailability>> | undefined;
     if (input.available_only) {
       try {
-        availability = await svc.fetchDataflowAvailability(input.dataflow_id, ctx, ctx.signal);
+        availability = await svc.fetchDataflowAvailability(dataflow, ctx, ctx.signal);
       } catch (err: unknown) {
         if (err instanceof McpError && err.data?.reason === 'availability_unavailable') throw err;
         throw ctx.fail(
           'availability_unavailable',
-          `Availability coverage is unavailable for dataflow '${input.dataflow_id}'`,
-          ctx.recoveryFor('availability_unavailable'),
+          `Availability coverage is unavailable for dataflow '${dataflow.id}'`,
         );
       }
     }
@@ -393,7 +390,7 @@ export const imfGetDatabase = tool('imf_get_database', {
       ctx.enrich.notice(
         `No codes matched codelist_filter "${input.codelist_filter}" in any dimension. ` +
           `Unfiltered entry counts: ${counts}. ` +
-          `Try a shorter or broader substring, or omit codelist_filter to browse the first ${CODELIST_PREVIEW_LIMIT} entries per dimension.`,
+          `Every word must appear in a code's ID or name — try fewer or shorter words, or omit codelist_filter to browse the first ${CODELIST_PREVIEW_LIMIT} entries per dimension.`,
       );
     } else {
       const unresolved = availability

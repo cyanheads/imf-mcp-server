@@ -19,6 +19,9 @@ export interface Dataflow {
   version: string;
 }
 
+/** The catalog identity that names one dataflow version: agency, id, and version. */
+export type DataflowRef = Pick<Dataflow, 'agencyId' | 'id' | 'version'>;
+
 /** A single codelist entry: the machine code and human-readable name. */
 export interface CodelistEntry {
   id: string;
@@ -67,6 +70,11 @@ export interface Observation {
 /** Attributes carried per-series (unit, scale, decimals). */
 export interface SeriesAttributes {
   decimals: number | null;
+  /**
+   * Power of ten the IMF publishes the series in, as the upstream code (`"9"`
+   * billions, `"0"` units). Observation values already arrive in base units, so
+   * it is never applied to them.
+   */
   scale: string | null;
   unit: string | null;
 }
@@ -123,7 +131,11 @@ export interface SdmxDataResponse {
 export interface SdmxSeries {
   /** Positional against `SdmxStructure.attributes.series`; coded cells arrive as JSON numbers. */
   attributes?: Array<string | number | null>;
-  observations?: Record<string, Array<string | null>>;
+  /**
+   * The value cell first, then one cell per `SdmxStructure.attributes.observation`
+   * entry; coded attribute cells arrive as JSON numbers (`["7.45", null, 0, "T"]`).
+   */
+  observations?: Record<string, Array<string | number | null>>;
 }
 
 export interface SdmxStructure {

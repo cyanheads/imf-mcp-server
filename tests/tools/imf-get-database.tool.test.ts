@@ -242,6 +242,47 @@ describe('imfGetDatabase', () => {
     expect(text).toContain('2 available');
   });
 
+  it('#55 requests coverage by the resolved agency, id, and version in both channels', async () => {
+    // GPT is published by IMF.SPR; its availability request 404s by bare id.
+    const gpt = {
+      agencyId: 'IMF.SPR',
+      id: 'GPT',
+      version: '1.0.1',
+      name: 'IMF Global Policy Tracker',
+    };
+    mockSvc.findDataflow.mockResolvedValue(gpt);
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dataflowId: 'GPT',
+      agencyId: 'IMF.SPR',
+      version: '1.0.1',
+      name: gpt.name,
+    });
+
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'GPT',
+      available_only: true,
+    });
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(mockSvc.fetchDataflowAvailability).toHaveBeenCalledOnce();
+    expect(mockSvc.fetchDataflowAvailability.mock.calls[0]?.[0]).toMatchObject({
+      agencyId: 'IMF.SPR',
+      id: 'GPT',
+      version: '1.0.1',
+    });
+    expect(response.structuredContent).toMatchObject({
+      dataflow_id: 'GPT',
+      agency_id: 'IMF.SPR',
+      available_only: true,
+      series_count: 8200,
+    });
+    expect(text).toContain('**Agency:** IMF.SPR');
+    expect(text).toContain('8,200 series');
+  });
+
   it('#47 includes constraint-absent dimensions as empty coverage', async () => {
     mockSvc.fetchDataflowAvailability.mockResolvedValue({
       ...MOCK_AVAILABILITY,
@@ -1213,5 +1254,273 @@ describe('imfGetDatabase', () => {
 
     expect(err.data?.reason).toBe('dataflow_list_unavailable');
     expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('Retry') });
+  });
+
+  // -------------------------------------------------------------------------
+  // #54: codelist_filter matches every word, not one literal substring
+  // -------------------------------------------------------------------------
+
+  /** A slice of the live WEO INDICATOR codelist, labels verbatim, in codelist order. */
+  const WEO_INDICATORS = [
+    { id: 'NGDP_RPCHMK', name: 'Gross domestic product (GDP), Constant prices, Percent' },
+    { id: 'NGDP_RPCH', name: 'Gross domestic product (GDP), Constant prices, Percent change' },
+    { id: 'NGDP_R', name: 'Gross domestic product (GDP), Constant prices, Domestic currency' },
+    {
+      id: 'NGDPRPC',
+      name: 'Gross domestic product (GDP), Constant prices, Per capita, Domestic currency',
+    },
+    {
+      id: 'NGDPRPPPPC',
+      name: 'Gross domestic product (GDP), Constant prices, Per capita, purchasing power parity (PPP) international dollar, ICP benchmark 2021',
+    },
+    { id: 'NGDPD', name: 'Gross domestic product (GDP), Current prices, US dollar' },
+    { id: 'NGDP_D', name: 'Gross domestic product (GDP), Price deflator, Index' },
+    { id: 'NGDP', name: 'Gross domestic product (GDP), Current prices, Domestic currency' },
+    { id: 'LUR', name: 'Unemployment rate' },
+    { id: 'GGXWDG_NGDP', name: 'Gross debt, General government, Percent of GDP' },
+    { id: 'PCPI', name: 'All Items, Consumer price index (CPI), Period average' },
+    { id: 'PCPIE', name: 'All Items, Consumer price index (CPI), End-of-period (EoP)' },
+    {
+      id: 'PCPIPCH',
+      name: 'All Items, Consumer price index (CPI), Period average, percent change',
+    },
+    {
+      id: 'PCPIEPCH',
+      name: 'All Items, Consumer price index (CPI), End-of-period (EoP), percent change',
+    },
+  ];
+
+  /**
+   * A slice of the live WEO COUNTRY codelist: the five "St." entries, plus names
+   * that hold "st" without the dot — the ones a punctuation-stripping matcher
+   * would wrongly pull in.
+   */
+  const WEO_COUNTRIES = [
+    { id: 'USA', name: 'United States' },
+    { id: 'AUT', name: 'Austria' },
+    { id: 'CRI', name: 'Costa Rica' },
+    { id: 'EST', name: 'Estonia, Republic of' },
+    { id: 'SHN', name: 'St. Helena' },
+    { id: 'KNA', name: 'St. Kitts and Nevis' },
+    { id: 'LCA', name: 'St. Lucia' },
+    { id: 'SPM', name: 'St. Pierre and Miquelon' },
+    { id: 'VCT', name: 'St. Vincent and the Grenadines' },
+  ];
+
+  const CONSTANT_PRICES_CODES = ['NGDP_RPCHMK', 'NGDP_RPCH', 'NGDP_R', 'NGDPRPC', 'NGDPRPPPPC'];
+
+  const WEO_LIKE_STRUCTURE = {
+    ...MOCK_STRUCTURE,
+    dimensions: [
+      { id: 'COUNTRY', name: 'Country', position: 0, codelist: WEO_COUNTRIES },
+      { id: 'INDICATOR', name: 'Indicator', position: 1, codelist: WEO_INDICATORS },
+      { id: 'FREQUENCY', name: 'Frequency', position: 2, codelist: [{ id: 'A', name: 'Annual' }] },
+    ],
+  };
+
+  /** Matched code IDs per dimension for one codelist_filter, through the handler. */
+  const matchedIds = async (codelistFilter: string, extra: Record<string, unknown> = {}) => {
+    mockSvc.fetchDataflowStructure.mockResolvedValue(WEO_LIKE_STRUCTURE);
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const result = await imfGetDatabase.handler(
+      imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: codelistFilter, ...extra }),
+      ctx,
+    );
+    return {
+      ids: Object.fromEntries(
+        result.dimensions.map((dimension) => [
+          dimension.id,
+          dimension.codelist.map((code) => code.id),
+        ]),
+      ),
+      result,
+      notice: getEnrichment(ctx).notice as string | undefined,
+    };
+  };
+
+  it.each([
+    ['Constant prices', { COUNTRY: [], INDICATOR: CONSTANT_PRICES_CODES, FREQUENCY: [] }],
+    ['CPI', { COUNTRY: [], INDICATOR: ['PCPI', 'PCPIE', 'PCPIPCH', 'PCPIEPCH'], FREQUENCY: [] }],
+    ['NGDP_RPCH', { COUNTRY: [], INDICATOR: ['NGDP_RPCHMK', 'NGDP_RPCH'], FREQUENCY: [] }],
+    ['St.', { COUNTRY: ['SHN', 'KNA', 'LCA', 'SPM', 'VCT'], INDICATOR: [], FREQUENCY: [] }],
+  ])('#54 returns exactly the matches a filter already had: %s', async (filter, expected) => {
+    const { ids } = await matchedIds(filter);
+
+    expect(ids).toEqual(expected);
+  });
+
+  it('#54 matches a filter made only of commas literally', async () => {
+    const { ids } = await matchedIds(',');
+
+    // Every label carrying a comma, and nothing else — LUR, Annual, and the
+    // comma-free country names drop out exactly as they do today.
+    expect(ids).toEqual({
+      COUNTRY: ['EST'],
+      INDICATOR: WEO_INDICATORS.filter((code) => code.id !== 'LUR').map((code) => code.id),
+      FREQUENCY: [],
+    });
+  });
+
+  it.each([
+    ['GDP constant prices', CONSTANT_PRICES_CODES],
+    ['Gross domestic product, constant', CONSTANT_PRICES_CODES],
+    ['prices constant GDP', CONSTANT_PRICES_CODES],
+    // The code sits in the ID and the word in the name — tokens may match different fields.
+    ['NGDP_RPCH percent', ['NGDP_RPCHMK', 'NGDP_RPCH']],
+  ])(
+    '#54 keeps a code when every word of %s appears in its ID or name',
+    async (filter, expected) => {
+      const { ids } = await matchedIds(filter);
+
+      expect(ids).toEqual({ COUNTRY: [], INDICATOR: expected, FREQUENCY: [] });
+    },
+  );
+
+  it('#54 carries a multi-word match through structuredContent and content[]', async () => {
+    mockSvc.fetchDataflowStructure.mockResolvedValue(WEO_LIKE_STRUCTURE);
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      codelist_filter: '  GDP constant prices  ',
+    });
+    const structured = response.structuredContent as {
+      codelist_filter: string;
+      notice?: string;
+      dimensions: Array<{ id: string; matched_count: number; codelist: Array<{ id: string }> }>;
+    };
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(structured.codelist_filter).toBe('GDP constant prices');
+    expect(structured.notice).toBeUndefined();
+    const indicator = structured.dimensions.find((dimension) => dimension.id === 'INDICATOR');
+    expect(indicator?.matched_count).toBe(5);
+    expect(indicator?.codelist.map((code) => code.id)).toEqual(CONSTANT_PRICES_CODES);
+    expect(text).toContain('**Codelist filter:** `GDP constant prices`');
+    for (const id of CONSTANT_PRICES_CODES) expect(text).toContain(`\`${id}\``);
+    expect(text).not.toContain('`NGDPD`');
+  });
+
+  it('#54 filters availability coverage with the same every-word rule', async () => {
+    mockSvc.fetchDataflowAvailability.mockResolvedValue({
+      ...MOCK_AVAILABILITY,
+      available_codes: {
+        COUNTRY: ['USA', 'LCA'],
+        INDICATOR: ['NGDP_RPCH', 'NGDP_R', 'NGDPD', 'LUR'],
+        FREQUENCY: ['A'],
+      },
+    });
+
+    const { ids, result } = await matchedIds('GDP constant prices', { available_only: true });
+
+    expect(ids).toEqual({ COUNTRY: [], INDICATOR: ['NGDP_RPCH', 'NGDP_R'], FREQUENCY: [] });
+    expect(result.dimensions.find((dimension) => dimension.id === 'INDICATOR')).toMatchObject({
+      available_count: 4,
+      unfiltered_count: 4,
+      matched_count: 2,
+    });
+  });
+
+  it('#54 counts and pages a multi-word match after filtering', async () => {
+    const page = (offset: number) =>
+      matchedIds('GDP constant prices', { dimension_id: 'INDICATOR', limit: 2, offset });
+
+    const first = await page(0);
+    const middle = await page(2);
+    const final = await page(4);
+    const pastEnd = await page(6);
+
+    expect(first.result.dimensions[0]).toMatchObject({
+      unfiltered_count: WEO_INDICATORS.length,
+      matched_count: 5,
+      returned_count: 2,
+      codelist_truncated: true,
+      next_offset: 2,
+    });
+    expect(middle.result.dimensions[0]).toMatchObject({ returned_count: 2, next_offset: 4 });
+    expect(final.result.dimensions[0]).toMatchObject({ returned_count: 1, offset: 4 });
+    expect(final.result.dimensions[0]).not.toHaveProperty('next_offset');
+    expect([
+      ...first.result.dimensions[0]!.codelist,
+      ...middle.result.dimensions[0]!.codelist,
+      ...final.result.dimensions[0]!.codelist,
+    ]).toEqual(WEO_INDICATORS.filter((code) => CONSTANT_PRICES_CODES.includes(code.id)));
+    expect(pastEnd.result.dimensions[0]).toMatchObject({ returned_count: 0, matched_count: 5 });
+    expect(pastEnd.notice).toContain('past the end');
+  });
+
+  it('#54 needs every word — one missing word empties the match and the notice says so', async () => {
+    mockSvc.fetchDataflowStructure.mockResolvedValue(WEO_LIKE_STRUCTURE);
+    // "constant" and "prices" both match; "quarterly" matches nothing.
+    const response = await runToolContract(imfGetDatabase, {
+      dataflow_id: 'WEO',
+      codelist_filter: 'constant prices quarterly',
+    });
+    const structured = response.structuredContent as {
+      notice: string;
+      dimensions: Array<{ matched_count: number }>;
+    };
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(structured.dimensions.every((dimension) => dimension.matched_count === 0)).toBe(true);
+    expect(structured.notice).toContain('"constant prices quarterly"');
+    expect(structured.notice).toContain('fewer or shorter words');
+    expect(structured.notice).not.toContain('substring');
+    expect(text).toContain('fewer or shorter words');
+  });
+
+  // -------------------------------------------------------------------------
+  // #52: dataflow_id resolves case-insensitively to the catalog spelling
+  // -------------------------------------------------------------------------
+
+  /** Echoes the id it was asked for, as the pre-#52 service did with its argument. */
+  const structureEchoingArgument = (dataflowId: string) =>
+    Promise.resolve({ ...MOCK_STRUCTURE, dataflowId });
+
+  it('#52 resolves a lowercase dataflow_id and uses the catalog spelling downstream and in the echo', async () => {
+    mockSvc.fetchDataflowStructure.mockImplementation(structureEchoingArgument);
+
+    const response = await runToolContract(imfGetDatabase, { dataflow_id: 'weo' });
+    const text = (response.content as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n');
+
+    expect(mockSvc.findDataflow).toHaveBeenCalledWith(
+      'weo',
+      undefined,
+      undefined,
+      expect.anything(),
+    );
+    expect(mockSvc.fetchDataflowStructure).toHaveBeenCalledWith(
+      'WEO',
+      'IMF.RES',
+      '9.0.0',
+      expect.anything(),
+    );
+    expect((response.structuredContent as { dataflow_id: string }).dataflow_id).toBe('WEO');
+    expect(text).toContain('**Dataflow:** WEO |');
+    expect(text).not.toContain('weo');
+  });
+
+  it('#52 names the catalog spelling when availability fails for a lowercase dataflow_id', async () => {
+    mockSvc.fetchDataflowStructure.mockImplementation(structureEchoingArgument);
+    mockSvc.fetchDataflowAvailability.mockRejectedValue(new Error('malformed coverage'));
+
+    const err = await captureMcpError(() =>
+      imfGetDatabase.handler(
+        imfGetDatabase.input.parse({ dataflow_id: 'weo', available_only: true }),
+        createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors }),
+      ),
+    );
+
+    expect(err.data?.reason).toBe('availability_unavailable');
+    expect(err.message).toBe("Availability coverage is unavailable for dataflow 'WEO'");
+    expect(mockSvc.fetchDataflowAvailability.mock.calls[0]?.[0]).toEqual(MOCK_DATAFLOW);
+  });
+
+  it('#52 dataflow_id describes no case sensitivity', () => {
+    expect(imfGetDatabase.input.shape.dataflow_id.description).not.toContain('Case-sensitive');
   });
 });

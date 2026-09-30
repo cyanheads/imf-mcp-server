@@ -27,6 +27,7 @@ import type {
   CodelistEntry,
   Dataflow,
   DataflowAvailabilityResult,
+  DataflowRef,
   DataflowStructure,
   DataQueryResult,
   Dimension,
@@ -493,7 +494,11 @@ export class ImfSdmxService {
     return dataflows;
   }
 
-  /** Find a dataflow by id, optionally constraining by agencyId/version. */
+  /**
+   * Find a dataflow by id, optionally constraining by agencyId/version. The id is
+   * trimmed and matched case-insensitively (the portal itself is case-sensitive),
+   * with an exact spelling preferred; callers use the returned `id` downstream.
+   */
   async findDataflow(
     dataflowId: string,
     agencyId: string | undefined,
@@ -501,11 +506,15 @@ export class ImfSdmxService {
     ctx: Context,
   ): Promise<Dataflow | undefined> {
     const all = await this.fetchDataflows(ctx);
-    return all.find(
+    const wanted = dataflowId.trim();
+    const inScope = all.filter(
       (df) =>
-        df.id === dataflowId &&
         (agencyId == null || df.agencyId === agencyId) &&
         (version == null || df.version === version),
+    );
+    return (
+      inScope.find((df) => df.id === wanted) ??
+      inScope.find((df) => df.id.toLowerCase() === wanted.toLowerCase())
     );
   }
 
@@ -591,8 +600,10 @@ export class ImfSdmxService {
       ? parseArtefactUrn(dataflow.structure, 'DataStructure')
       : undefined;
 
+    // The catalog spelling, not the argument — findDataflow matched it case-insensitively.
+    const { id } = dataflow;
     const fallback = () =>
-      this.fetchDataflowStructureFallback(dataflowId, dataflow.agencyId, dataflow.version, ctx);
+      this.fetchDataflowStructureFallback(id, dataflow.agencyId, dataflow.version, ctx);
 
     let structure: DataflowStructure | undefined;
     try {
@@ -604,16 +615,16 @@ export class ImfSdmxService {
     } catch {
       // Both primary and fallback DSD fetch failed; throw a controlled message
       // (the raw McpError would carry the upstream URL path in its message).
-      throw serviceUnavailable(`Structure unavailable for dataflow '${dataflowId}'`, {
+      throw serviceUnavailable(`Structure unavailable for dataflow '${id}'`, {
         reason: 'structure_unavailable',
-        dataflowId,
+        dataflowId: id,
       });
     }
 
     if (!structure) {
-      throw serviceUnavailable(`Structure unavailable for dataflow '${dataflowId}'`, {
+      throw serviceUnavailable(`Structure unavailable for dataflow '${id}'`, {
         reason: 'structure_unavailable',
-        dataflowId,
+        dataflowId: id,
       });
     }
 
@@ -626,7 +637,7 @@ export class ImfSdmxService {
     const mergedDescription = dataflow.description ?? structure.description;
     return {
       ...structure,
-      dataflowId,
+      dataflowId: id,
       agencyId: dataflow.agencyId,
       version: dataflow.version,
       name: dataflow.name,
@@ -677,7 +688,11 @@ export class ImfSdmxService {
   // Data query
   // ---------------------------------------------------------------------------
 
-  /** Fetch observations for a dataflow key over a time range. No cache — always live. */
+  /**
+   * Fetch observations for a dataflow key over a time range. No cache — always live.
+   * `lastNObservations` asks the portal for each series' last N cells, null
+   * padding included; it rides the data request only, never the group probe.
+   */
   async fetchData(
     agencyId: string,
     dataflowId: string,
@@ -687,10 +702,14 @@ export class ImfSdmxService {
     endPeriod: string | undefined,
     ctx: Context,
     signal?: AbortSignal,
+    lastNObservations?: number,
   ): Promise<DataQueryResult> {
     const queryParams = new URLSearchParams();
     if (startPeriod) queryParams.set('startPeriod', startPeriod);
     if (endPeriod) queryParams.set('endPeriod', endPeriod);
+    if (lastNObservations !== undefined) {
+      queryParams.set('lastNObservations', String(lastNObservations));
+    }
     const qsStr = queryParams.toString();
     const qs = qsStr ? `?${qsStr}` : '';
 
@@ -878,9 +897,24 @@ export class ImfSdmxService {
   // ---------------------------------------------------------------------------
 
   /**
+   * SDMX 2.1 availableconstraint URL for one dataflow, with the 2.1 base derived
+   * from the configured 3.0 one (`…/sdmx/3.0` → `…/sdmx/2.1`). The flow is named
+   * by its full `agency,id,version` reference, the identity the data request
+   * already uses: the portal resolves a bare id as `all:<id>(latest)`, and for a
+   * flow such as IMF.SPR's GPT that answers 404 rather than a constraint. `key` is
+   * the path segment after the flow — empty for the dataflow-wide form.
+   */
+  private availabilityUrl(dataflow: DataflowRef, key: string): string {
+    const base21 = this.baseUrl.replace(/\/sdmx\/3\.0\/?$/, '/sdmx/2.1');
+    const flowRef = [dataflow.agencyId, dataflow.id, dataflow.version]
+      .map((part) => encodeURIComponent(part))
+      .join(',');
+    return `${base21}/availableconstraint/${flowRef}/${key}`;
+  }
+
+  /**
    * Query the SDMX 2.1 availableconstraint endpoint for a dataflow + first-dimension code.
    * Returns parsed availability info (series_count, per-dimension codes, time range).
-   * The 2.1 endpoint path is derived from the configured 3.0 base URL.
    *
    * Pass an empty `firstDimensionCode` for the dataflow-wide constraint. That form
    * is the only one that separates a dataflow publishing nothing from a single
@@ -891,16 +925,15 @@ export class ImfSdmxService {
    * Never throws — returns null on any failure so callers can degrade gracefully.
    */
   async fetchAvailabilityConstraint(
-    dataflowId: string,
+    dataflow: DataflowRef,
     firstDimensionCode: string,
     ctx: Context,
     signal?: AbortSignal,
   ): Promise<AvailabilityResult | null> {
-    // Derive the SDMX 2.1 base URL from the configured 3.0 URL.
-    // e.g. https://api.imf.org/external/sdmx/3.0 → https://api.imf.org/external/sdmx/2.1
-    const base21 = this.baseUrl.replace(/\/sdmx\/3\.0\/?$/, '/sdmx/2.1');
-    const key = firstDimensionCode ? `${encodeURIComponent(firstDimensionCode)}..` : '';
-    const url = `${base21}/availableconstraint/${encodeURIComponent(dataflowId)}/${key}`;
+    const url = this.availabilityUrl(
+      dataflow,
+      firstDimensionCode ? `${encodeURIComponent(firstDimensionCode)}..` : '',
+    );
 
     const effectiveSignal = signal ?? ctx.signal;
 
@@ -930,19 +963,19 @@ export class ImfSdmxService {
    * be established rather than degrading to a codelist response.
    */
   async fetchDataflowAvailability(
-    dataflowId: string,
+    dataflow: DataflowRef,
     ctx: Context,
     signal?: AbortSignal,
   ): Promise<DataflowAvailabilityResult> {
-    const cacheKey = `imf/availability/dataflow/${dataflowId}`;
+    const { agencyId, id: dataflowId, version } = dataflow;
+    const cacheKey = `imf/availability/dataflow/${agencyId}/${dataflowId}/${version}`;
     const cached = await ctx.state.get<DataflowAvailabilityResult>(cacheKey);
     if (cached) {
-      ctx.log.debug('Dataflow availability served from cache', { dataflowId });
+      ctx.log.debug('Dataflow availability served from cache', { agencyId, dataflowId, version });
       return cached;
     }
 
-    const base21 = this.baseUrl.replace(/\/sdmx\/3\.0\/?$/, '/sdmx/2.1');
-    const url = `${base21}/availableconstraint/${encodeURIComponent(dataflowId)}/`;
+    const url = this.availabilityUrl(dataflow, '');
     const effectiveSignal = signal ?? ctx.signal;
 
     try {
@@ -960,7 +993,7 @@ export class ImfSdmxService {
       ctx.log.error(
         'Dataflow availability fetch failed',
         err instanceof Error ? err : new Error(String(err)),
-        { dataflowId },
+        { agencyId, dataflowId, version },
       );
       throw serviceUnavailable(
         `Availability coverage is unavailable for dataflow '${dataflowId}'`,
@@ -1285,6 +1318,7 @@ export class ImfSdmxService {
 
     // Find STATUS attribute index in observation attributes
     const statusObsIdx = obsAttrs.findIndex((a) => a.id === 'STATUS');
+    const statusCodes = obsAttrs[statusObsIdx]?.values;
 
     // Find attribute indices in series attributes, across every id the portal
     // spells each attribute with (see SERIES_ATTRIBUTE_ALIASES).
@@ -1422,17 +1456,20 @@ export class ImfSdmxService {
         // IMF SDMX 3.0 uses `value` field for time periods; fallback to `id` for legacy compat.
         const timePeriod = timeValues[timeIdx]?.value ?? timeValues[timeIdx]?.id ?? obsIdx;
         const rawValue = obsValues?.[0];
-        const value = rawValue != null && rawValue !== '' ? parseFloat(rawValue) : null;
+        const value = rawValue != null && rawValue !== '' ? parseFloat(String(rawValue)) : null;
 
-        let status: string | null = null;
-        if (statusObsIdx >= 0 && obsValues && obsValues[statusObsIdx + 1] != null) {
-          const statusCode = obsValues[statusObsIdx + 1];
-          const statusAttr = obsAttrs[statusObsIdx];
-          if (statusCode != null && statusAttr?.values) {
-            const idx2 = parseInt(statusCode, 10);
-            status = statusAttr.values[idx2]?.id ?? statusCode;
-          }
-        }
+        /**
+         * STATUS resolves the way series attributes do: through the definition's
+         * `values` when it has them, and as the literal the cell carries when it
+         * does not. Every dataflow checked that declares STATUS ships it uncoded
+         * (`[null, null, 0, "T"]`), so reading only the coded form reported
+         * `null` for every flag. A coded cell arrives as a JSON number.
+         */
+        const statusCell = statusObsIdx >= 0 ? obsValues?.[statusObsIdx + 1] : undefined;
+        const status =
+          statusCell == null
+            ? null
+            : (statusCodes?.[Number.parseInt(String(statusCell), 10)]?.id ?? String(statusCell));
 
         observations.push({ series_key: decodedSeriesKey, time_period: timePeriod, value, status });
       }

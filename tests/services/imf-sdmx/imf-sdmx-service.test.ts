@@ -13,11 +13,13 @@
  * shared DSD does not hand one flow another flow's description), #32 (unit,
  * scale, and precision decode the same whichever of the portal's ids name them),
  * #33 (an attribute declared against a subset of the series key resolves from
- * the dimension group covering each series), and #34 (a group the portal empties
+ * the dimension group covering each series), #34 (a group the portal empties
  * because the key combines codes with `+` on a dimension it is declared against
  * is recovered by one bounded attributes-only request under a wildcard key —
  * and every other key shape, including the many dataflows that declare a unit
- * and publish none, still costs exactly one request).
+ * and publish none, still costs exactly one request), and #57 (an observation's
+ * STATUS resolves through its `values` when coded and as the inline literal
+ * when not).
  *
  * Fixtures are modeled on the live api.imf.org SDMX 3.0 response shapes: dataflow
  * `structure` is a URN string; `localRepresentation.enumeration` is a Codelist URN
@@ -1076,6 +1078,64 @@ describe('ImfSdmxService.fetchDataflowStructure', () => {
     expect(s.description).toBeUndefined();
     expect(s.name).toBe('Balance of Payments, Quarterly (BOPQ)');
   });
+
+  // -- #52: dataflow ids resolve trimmed and case-insensitively ------------------
+
+  it('#52 findDataflow resolves a lowercase, padded id to the catalog entry', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const found = await svc.findDataflow('  iip ', undefined, undefined, ctx);
+
+    expect(found).toMatchObject({ id: 'IIP', agencyId: 'IMF.STA', version: '13.0.0' });
+    // Agency and version constraints still apply to the case-insensitive match.
+    expect(await svc.findDataflow('iip', 'IMF.STA', '13.0.0', ctx)).toMatchObject({ id: 'IIP' });
+    expect(await svc.findDataflow('iip', 'IMF.RES', undefined, ctx)).toBeUndefined();
+    expect(await svc.findDataflow('iipx', undefined, undefined, ctx)).toBeUndefined();
+  });
+
+  it('#52 findDataflow prefers the exact spelling when ids differ only by case', async () => {
+    fetchWithTimeout.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.endsWith('/structure/dataflow')
+          ? mkResp(200, {
+              data: {
+                dataflows: [
+                  { id: 'Ab', agencyID: 'IMF.STA', version: '1.0.0', names: { en: 'Mixed' } },
+                  { id: 'AB', agencyID: 'IMF.STA', version: '1.0.0', names: { en: 'Upper' } },
+                ],
+              },
+            })
+          : route(url),
+      ),
+    );
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    expect((await svc.findDataflow('AB', undefined, undefined, ctx))?.name).toBe('Upper');
+    expect((await svc.findDataflow('Ab', undefined, undefined, ctx))?.name).toBe('Mixed');
+  });
+
+  it('#52 fetchDataflowStructure returns the catalog spelling, not the argument', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const s = await svc.fetchDataflowStructure('iip', undefined, undefined, ctx);
+
+    expect(s.dataflowId).toBe('IIP');
+    expect(s.name).toBe('International Investment Position (IIP)');
+    expect(findDim(s, 'INDICATOR')?.codelist).toHaveLength(979);
+  });
+
+  it('#52 the no-URN fallback requests the catalog spelling of a lowercase id', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const s = await svc.fetchDataflowStructure('nourn', undefined, undefined, ctx);
+
+    expect(s.dataflowId).toBe('NOURN');
+    expect(s.dsdId).toBe('DSD_BOP');
+    const fallbackUrls = fetchWithTimeout.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => /\/structure\/dataflow\/[^/]+\//.test(url));
+    expect(fallbackUrls).toEqual([expect.stringContaining('/structure/dataflow/IMF.STA/NOURN/')]);
+  });
 });
 
 // --- #26: availability constraint parsing ----------------------------------------
@@ -1109,6 +1169,9 @@ const TWO_HUNDRED_TEN_COUNTRIES = Array.from(
 /** A dimension right at the cap still lists in full. */
 const TWENTY_CODES = Array.from({ length: 20 }, (_, i) => `X${String(i).padStart(2, '0')}`);
 
+/** The catalog identity the availability methods take; these cases only vary the id. */
+const flow = (id: string) => ({ agencyId: 'IMF.STA', id, version: '1.0.0' });
+
 describe('ImfSdmxService.fetchAvailabilityConstraint (#26)', () => {
   let svc: ImfSdmxService;
 
@@ -1136,7 +1199,7 @@ describe('ImfSdmxService.fetchAvailabilityConstraint (#26)', () => {
     constrain({ COUNTRY: TWO_HUNDRED_TEN_COUNTRIES, FREQUENCY: ['A'] });
     const ctx = createMockContext({ tenantId: 'test' });
 
-    const result = await svc.fetchAvailabilityConstraint('WEO', 'USA', ctx);
+    const result = await svc.fetchAvailabilityConstraint(flow('WEO'), 'USA', ctx);
 
     // count is what the constraint reported; codes is the leading slice of it.
     expect(result?.available_codes.COUNTRY?.count).toBe(210);
@@ -1148,7 +1211,7 @@ describe('ImfSdmxService.fetchAvailabilityConstraint (#26)', () => {
     constrain({ FREQUENCY: ['A', 'M', 'Q'], INDICATOR: TWENTY_CODES });
     const ctx = createMockContext({ tenantId: 'test' });
 
-    const result = await svc.fetchAvailabilityConstraint('CPI', 'USA', ctx);
+    const result = await svc.fetchAvailabilityConstraint(flow('CPI'), 'USA', ctx);
 
     expect(result?.available_codes.FREQUENCY).toEqual({ count: 3, codes: ['A', 'M', 'Q'] });
     // Exactly at the cap — codes.length === count, so it renders unannotated.
@@ -1160,7 +1223,7 @@ describe('ImfSdmxService.fetchAvailabilityConstraint (#26)', () => {
     constrain({ INDICATOR: [...TWENTY_CODES, 'X20'] });
     const ctx = createMockContext({ tenantId: 'test' });
 
-    const result = await svc.fetchAvailabilityConstraint('CPI', 'USA', ctx);
+    const result = await svc.fetchAvailabilityConstraint(flow('CPI'), 'USA', ctx);
 
     expect(result?.available_codes.INDICATOR?.count).toBe(21);
     expect(result?.available_codes.INDICATOR?.codes).toHaveLength(20);
@@ -1170,7 +1233,7 @@ describe('ImfSdmxService.fetchAvailabilityConstraint (#26)', () => {
     constrain({ FREQUENCY: ['A'] }, 0);
     const ctx = createMockContext({ tenantId: 'test' });
 
-    const result = await svc.fetchAvailabilityConstraint('EER', 'TUR', ctx);
+    const result = await svc.fetchAvailabilityConstraint(flow('EER'), 'TUR', ctx);
 
     expect(result?.series_count).toBe(0);
     expect(result?.time_period_start).toBe('1980-01-01');
@@ -1181,7 +1244,23 @@ describe('ImfSdmxService.fetchAvailabilityConstraint (#26)', () => {
     fetchWithTimeout.mockRejectedValue(new Error('upstream down'));
     const ctx = createMockContext({ tenantId: 'test' });
 
-    await expect(svc.fetchAvailabilityConstraint('WEO', 'USA', ctx)).resolves.toBeNull();
+    await expect(svc.fetchAvailabilityConstraint(flow('WEO'), 'USA', ctx)).resolves.toBeNull();
+  });
+
+  it('keeps the SDMX 2.1 base and the key-scoped and dataflow-wide path suffixes', async () => {
+    constrain({ FREQUENCY: ['A'] });
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    await svc.fetchAvailabilityConstraint(flow('WEO'), 'USA', ctx);
+    await svc.fetchAvailabilityConstraint(flow('WEO'), '', ctx);
+
+    const [keyed, dataflowWide] = fetchWithTimeout.mock.calls.map((call) => call[0] as string);
+    expect(keyed).toMatch(
+      /^https:\/\/api\.imf\.org\/external\/sdmx\/2\.1\/availableconstraint\/[^/]+\/USA\.\.$/,
+    );
+    expect(dataflowWide).toMatch(
+      /^https:\/\/api\.imf\.org\/external\/sdmx\/2\.1\/availableconstraint\/[^/]+\/$/,
+    );
   });
 });
 
@@ -1215,7 +1294,7 @@ describe('ImfSdmxService.fetchDataflowAvailability (#47)', () => {
     });
     const ctx = createMockContext({ tenantId: 'test' });
 
-    const result = await svc.fetchDataflowAvailability('WEO', ctx);
+    const result = await svc.fetchDataflowAvailability(flow('WEO'), ctx);
 
     expect(result).toEqual({
       series_count: 8200,
@@ -1271,7 +1350,7 @@ describe('ImfSdmxService.fetchDataflowAvailability (#47)', () => {
     arrange();
     const ctx = createMockContext({ tenantId: 'test' });
 
-    await expect(svc.fetchDataflowAvailability('WEO', ctx)).rejects.toMatchObject({
+    await expect(svc.fetchDataflowAvailability(flow('WEO'), ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
       data: { reason: 'availability_unavailable' },
     });
@@ -1285,9 +1364,9 @@ describe('ImfSdmxService.fetchDataflowAvailability (#47)', () => {
     });
     const ctx = createMockContext({ tenantId: 'test' });
 
-    const firstResult = await svc.fetchDataflowAvailability('WEO', ctx);
+    const firstResult = await svc.fetchDataflowAvailability(flow('WEO'), ctx);
     const firstPage = firstResult.available_codes.COUNTRY?.slice(0, 100);
-    const secondResult = await svc.fetchDataflowAvailability('WEO', ctx);
+    const secondResult = await svc.fetchDataflowAvailability(flow('WEO'), ctx);
     const secondPage = secondResult.available_codes.COUNTRY?.slice(100, 200);
 
     expect(firstPage).toHaveLength(100);
@@ -1299,7 +1378,7 @@ describe('ImfSdmxService.fetchDataflowAvailability (#47)', () => {
   it('retries after a failed request rather than caching the failure', async () => {
     const failedCtx = createMockContext({ tenantId: 'retry' });
     fetchWithTimeout.mockRejectedValueOnce(new Error('temporary failure'));
-    await expect(svc.fetchDataflowAvailability('CPI', failedCtx)).rejects.toMatchObject({
+    await expect(svc.fetchDataflowAvailability(flow('CPI'), failedCtx)).rejects.toMatchObject({
       data: { reason: 'availability_unavailable' },
     });
     fetchWithTimeout.mockResolvedValueOnce({
@@ -1308,10 +1387,73 @@ describe('ImfSdmxService.fetchDataflowAvailability (#47)', () => {
       text: () => Promise.resolve(availabilityXml(1, { FREQUENCY: ['M'] })),
     });
 
-    await expect(svc.fetchDataflowAvailability('CPI', failedCtx)).resolves.toMatchObject({
+    await expect(svc.fetchDataflowAvailability(flow('CPI'), failedCtx)).resolves.toMatchObject({
       series_count: 1,
       available_codes: { FREQUENCY: ['M'] },
     });
+  });
+});
+
+describe('ImfSdmxService availability requests name the dataflow by agency, id, and version (#55)', () => {
+  /**
+   * GPT is published by IMF.SPR. The portal resolves a bare `GPT` as
+   * `all:GPT(latest)` and answers 404; only `IMF.SPR,GPT,1.0.1` names it.
+   */
+  const GPT = { agencyId: 'IMF.SPR', id: 'GPT', version: '1.0.1' };
+  const AVAILABILITY_BASE = 'https://api.imf.org/external/sdmx/2.1/availableconstraint';
+  let svc: ImfSdmxService;
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    fetchWithTimeout.mockImplementation(() =>
+      Promise.resolve({
+        status: 200,
+        ok: true,
+        text: () => Promise.resolve(availabilityXml(821, { COUNTRY: ['USA'], FREQ: ['A'] })),
+      }),
+    );
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+  });
+
+  const requestedUrls = () => fetchWithTimeout.mock.calls.map((call) => call[0] as string);
+
+  it('qualifies the key-scoped and dataflow-wide constraint paths', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    await svc.fetchAvailabilityConstraint(GPT, 'USA', ctx);
+    await svc.fetchAvailabilityConstraint(GPT, '', ctx);
+
+    expect(requestedUrls()).toEqual([
+      `${AVAILABILITY_BASE}/IMF.SPR,GPT,1.0.1/USA..`,
+      `${AVAILABILITY_BASE}/IMF.SPR,GPT,1.0.1/`,
+    ]);
+  });
+
+  it('qualifies the uncapped dataflow availability path', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const result = await svc.fetchDataflowAvailability(GPT, ctx);
+
+    expect(requestedUrls()).toEqual([`${AVAILABILITY_BASE}/IMF.SPR,GPT,1.0.1/`]);
+    expect(result.series_count).toBe(821);
+  });
+
+  it('caches coverage per agency, id, and version, so another version is fetched fresh', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    await svc.fetchDataflowAvailability(GPT, ctx);
+    await svc.fetchDataflowAvailability(GPT, ctx);
+    await svc.fetchDataflowAvailability({ ...GPT, version: '2.0.0' }, ctx);
+
+    expect(requestedUrls()).toEqual([
+      `${AVAILABILITY_BASE}/IMF.SPR,GPT,1.0.1/`,
+      `${AVAILABILITY_BASE}/IMF.SPR,GPT,2.0.0/`,
+    ]);
   });
 });
 
@@ -2748,5 +2890,253 @@ describe('ImfSdmxService.fetchData suppressed dimension groups (#34)', () => {
     const result = await query('USA.NGDP_RPCH+NGDPD.A');
 
     expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBe('XDC');
+  });
+});
+
+// --- #57: observation STATUS, coded or carried inline ---------------------------
+
+/**
+ * An `ER`-shaped monthly payload over two series (`HTI` and `DOM`). `STATUS` is
+ * the third observation attribute, so its cell is the fourth entry of each
+ * observation array: `[OBS_VALUE, PRECISION, DERIVATION_TYPE, STATUS]`, with
+ * `DERIVATION_TYPE` coded (a JSON number indexing its `values`). Every dataflow
+ * that declares `STATUS` live ships it with no `values` and carries the flag
+ * itself in the cell (`[null, null, 0, "T"]`); a coded definition carries an
+ * index into `values` instead. Observation arrays are not fixed-length — one that
+ * stops before the `STATUS` position carries no status.
+ */
+const statusFixture = (
+  statusDef: SdmxAttributeDef,
+  observations: Record<string, Record<string, Array<string | number | null>>>,
+) => ({
+  data: {
+    dataSets: [
+      {
+        series: Object.fromEntries(
+          Object.entries(observations).map(([seriesKey, obs]) => [
+            seriesKey,
+            { attributes: [], observations: obs },
+          ]),
+        ),
+      },
+    ],
+    structures: [
+      {
+        attributes: {
+          series: [],
+          observation: [
+            { id: 'PRECISION' },
+            { id: 'DERIVATION_TYPE', values: [{ id: 'R' }] },
+            statusDef,
+          ],
+        },
+        dimensions: {
+          series: [
+            { id: 'COUNTRY', values: [{ id: 'HTI' }, { id: 'DOM' }] },
+            { id: 'INDICATOR', values: [{ id: 'XDC_USD' }] },
+            { id: 'TYPE_OF_TRANSFORMATION', values: [{ id: 'PA_RT' }] },
+            { id: 'FREQUENCY', values: [{ id: 'M' }] },
+          ],
+          observation: [
+            {
+              id: 'TIME_PERIOD',
+              values: [{ value: '1991-M08' }, { value: '1991-M09' }, { value: '1991-M10' }],
+            },
+          ],
+        },
+      },
+    ],
+  },
+});
+
+describe('ImfSdmxService.fetchData observation status (#57)', () => {
+  let svc: ImfSdmxService;
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+  });
+
+  const serveAndQuery = async (payload: unknown) => {
+    fetchWithTimeout.mockImplementation(() =>
+      Promise.resolve({
+        status: 200,
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify(payload)),
+      }),
+    );
+    const result = await svc.fetchData(
+      'IMF.STA',
+      'ER',
+      '4.0.1',
+      '*.XDC_USD.PA_RT.M',
+      undefined,
+      undefined,
+      createMockContext({ tenantId: 'test' }),
+    );
+    return result.observations.map(({ series_key, time_period, value, status }) => ({
+      series_key,
+      time_period,
+      value,
+      status,
+    }));
+  };
+
+  it('decodes a coded STATUS through its values list, per observation and per series', async () => {
+    const observations = await serveAndQuery(
+      statusFixture(
+        { id: 'STATUS', values: [{ id: 'E' }, { id: 'B' }] },
+        {
+          '0:0:0:0': {
+            '0': ['7.0', null, 0, 0],
+            '1': ['7.45', null, 0, 1],
+            '2': ['7.5', null, 0, null],
+          },
+          '1:0:0:0': { '0': [null, null, 0, 1] },
+        },
+      ),
+    );
+
+    expect(observations).toEqual([
+      { series_key: 'HTI.XDC_USD.PA_RT.M', time_period: '1991-M08', value: 7, status: 'E' },
+      { series_key: 'DOM.XDC_USD.PA_RT.M', time_period: '1991-M08', value: null, status: 'B' },
+      { series_key: 'HTI.XDC_USD.PA_RT.M', time_period: '1991-M09', value: 7.45, status: 'B' },
+      { series_key: 'HTI.XDC_USD.PA_RT.M', time_period: '1991-M10', value: 7.5, status: null },
+    ]);
+  });
+
+  it('reads an inline STATUS literal when the attribute ships no values', async () => {
+    const observations = await serveAndQuery(
+      statusFixture(
+        { id: 'STATUS' },
+        {
+          '0:0:0:0': {
+            '0': ['7.0'],
+            '1': ['7.45', null, 0, 'T'],
+            '2': ['7.5', null, 0, null],
+          },
+          '1:0:0:0': {
+            '0': [null, null, 0, 'NA'],
+            '1': [null, null, 0, 'C'],
+            '2': [null, null, 0, '/temporarily removed 148118'],
+          },
+        },
+      ),
+    );
+
+    expect(observations).toEqual([
+      { series_key: 'HTI.XDC_USD.PA_RT.M', time_period: '1991-M08', value: 7, status: null },
+      { series_key: 'DOM.XDC_USD.PA_RT.M', time_period: '1991-M08', value: null, status: 'NA' },
+      { series_key: 'HTI.XDC_USD.PA_RT.M', time_period: '1991-M09', value: 7.45, status: 'T' },
+      { series_key: 'DOM.XDC_USD.PA_RT.M', time_period: '1991-M09', value: null, status: 'C' },
+      { series_key: 'HTI.XDC_USD.PA_RT.M', time_period: '1991-M10', value: 7.5, status: null },
+      {
+        series_key: 'DOM.XDC_USD.PA_RT.M',
+        time_period: '1991-M10',
+        value: null,
+        status: '/temporarily removed 148118',
+      },
+    ]);
+  });
+});
+
+describe('ImfSdmxService.fetchData request parameters (#53)', () => {
+  let svc: ImfSdmxService;
+  let requested: string[];
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    requested = [];
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+    fetchWithTimeout.mockImplementation((url: string) => {
+      requested.push(url);
+      if (url.includes('/structure/datastructure/')) return Promise.resolve(mkResp(200, WEO34_DSD));
+      if (/\/structure\/dataflow\/[^/]+\//.test(url)) return Promise.resolve(mkResp(204, null));
+      if (url.includes('/structure/dataflow'))
+        return Promise.resolve(mkResp(200, WEO34_DATAFLOW_LIST));
+      if (url.includes('measures=none')) return Promise.resolve(mkResp(200, weo34Probe()));
+      return Promise.resolve(mkResp(200, weo34Suppressed()));
+    });
+  });
+
+  const dataRequests = () => requested.filter((url) => url.includes('/data/dataflow/'));
+  const DATA_URL =
+    'https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.RES/WEO/9.0.0/USA.NGDP_RPCH.A';
+
+  it('sends a query with no bounds as the bare data path', async () => {
+    await svc.fetchData(
+      'IMF.RES',
+      'WEO',
+      '9.0.0',
+      'USA.NGDP_RPCH.A',
+      undefined,
+      undefined,
+      createMockContext({ tenantId: 'test' }),
+    );
+
+    expect(dataRequests()).toEqual([DATA_URL]);
+  });
+
+  it('carries startPeriod and endPeriod on the data request when given', async () => {
+    await svc.fetchData(
+      'IMF.RES',
+      'WEO',
+      '9.0.0',
+      'USA.NGDP_RPCH.A',
+      '2018',
+      '2026',
+      createMockContext({ tenantId: 'test' }),
+    );
+
+    expect(dataRequests()).toEqual([`${DATA_URL}?startPeriod=2018&endPeriod=2026`]);
+  });
+
+  it('adds lastNObservations to the data request when passed', async () => {
+    await svc.fetchData(
+      'IMF.RES',
+      'WEO',
+      '9.0.0',
+      'USA.NGDP_RPCH.A',
+      undefined,
+      undefined,
+      createMockContext({ tenantId: 'test' }),
+      undefined,
+      1,
+    );
+
+    expect(dataRequests()).toEqual([`${DATA_URL}?lastNObservations=1`]);
+  });
+
+  it('keeps lastNObservations off the attributes-only group probe', async () => {
+    // A + key on the dimension UNIT is grouped by fires the #34 probe.
+    await svc.fetchData(
+      'IMF.RES',
+      'WEO',
+      '9.0.0',
+      'USA.NGDP_RPCH+NGDPD.A',
+      undefined,
+      undefined,
+      createMockContext({ tenantId: 'test' }),
+      undefined,
+      3,
+    );
+
+    const [data, probe, ...rest] = dataRequests();
+    expect(rest).toEqual([]);
+    expect(data).toBe(
+      `https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.RES/WEO/9.0.0/${encodeURIComponent('USA.NGDP_RPCH+NGDPD.A')}?lastNObservations=3`,
+    );
+    expect(probe).toContain('attributes=series&measures=none');
+    expect(probe).not.toContain('lastNObservations');
   });
 });

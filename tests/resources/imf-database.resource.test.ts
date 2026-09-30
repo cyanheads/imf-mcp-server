@@ -81,6 +81,10 @@ if (!resourceParams) throw new Error('imfDatabaseResource must declare a params 
 const resourceOutput = imfDatabaseResource.output;
 if (!resourceOutput) throw new Error('imfDatabaseResource must declare an output schema');
 
+/** The contract `recovery` the resource factory puts on the wire for `reason`. */
+const declaredRecovery = (reason: string): string =>
+  imfDatabaseResource.errors?.find((entry) => entry.reason === reason)?.recovery ?? '';
+
 describe('imfDatabaseResource', () => {
   let mockSvc: {
     findDataflow: ReturnType<typeof vi.fn>;
@@ -192,11 +196,10 @@ describe('imfDatabaseResource', () => {
 
     await expect(imfDatabaseResource.handler(params, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
-      data: {
-        reason: 'dataflow_not_found',
-        recovery: { hint: expect.stringContaining('imf_list_databases') },
-      },
+      data: { reason: 'dataflow_not_found' },
     });
+    // The resource factory fills the declared recovery onto the wire from the reason.
+    expect(declaredRecovery('dataflow_not_found')).toContain('imf_list_databases');
   });
 
   it('throws NotFound when structure fetch returns not-found error', async () => {
@@ -216,11 +219,9 @@ describe('imfDatabaseResource', () => {
 
     await expect(imfDatabaseResource.handler(params, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
-      data: {
-        reason: 'structure_unavailable',
-        recovery: { hint: expect.stringMatching(/retry/i) },
-      },
+      data: { reason: 'structure_unavailable' },
     });
+    expect(declaredRecovery('structure_unavailable')).toMatch(/retry/i);
   });
 
   it('#40 bounds codelists at 50 entries and exposes tool continuation metadata', async () => {
@@ -311,5 +312,36 @@ describe('imfDatabaseResource', () => {
 
     expect(err.data?.reason).toBe('dataflow_list_unavailable');
     expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('Retry') });
+  });
+
+  // -- #52: imf://database/weo resolves to the catalog spelling ------------------
+
+  /** Echoes the id it was asked for, as the pre-#52 service did with its argument. */
+  const structureEchoingArgument = (dataflowId: string) =>
+    Promise.resolve({ ...MOCK_STRUCTURE, dataflowId });
+
+  it('#52 resolves a lowercase dataflow_id and echoes the catalog spelling', async () => {
+    mockSvc.fetchDataflowStructure.mockImplementation(structureEchoingArgument);
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
+    const params = resourceParams.parse({ dataflow_id: 'weo' });
+
+    const result = resourceOutput.parse(await imfDatabaseResource.handler(params, ctx));
+
+    expect(mockSvc.findDataflow).toHaveBeenCalledWith('weo', undefined, undefined, ctx);
+    expect(mockSvc.fetchDataflowStructure).toHaveBeenCalledWith('WEO', 'IMF.RES', '9.0.0', ctx);
+    expect(result.dataflow_id).toBe('WEO');
+    expect(result.continuation.dataflow_id).toBe('WEO');
+  });
+
+  it('#52 names the catalog spelling when the structure of a lowercase dataflow_id is unavailable', async () => {
+    mockSvc.fetchDataflowStructure.mockRejectedValue(new Error('connection reset'));
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
+    const params = resourceParams.parse({ dataflow_id: 'weo' });
+
+    const err = await captureMcpError(() => imfDatabaseResource.handler(params, ctx));
+
+    expect(err.data?.reason).toBe('structure_unavailable');
+    expect(err.message).toBe("Structure unavailable for dataflow 'WEO'");
+    expect(err.data?.dataflowId).toBe('WEO');
   });
 });

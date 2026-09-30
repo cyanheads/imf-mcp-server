@@ -122,14 +122,13 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
     if (!dataflow) {
       throw ctx.fail('dataflow_not_found', `Dataflow '${params.dataflow_id}' not found`, {
         dataflowId: params.dataflow_id,
-        ...ctx.recoveryFor('dataflow_not_found'),
       });
     }
 
     let structure: Awaited<ReturnType<typeof svc.fetchDataflowStructure>>;
     try {
       structure = await svc.fetchDataflowStructure(
-        params.dataflow_id,
+        dataflow.id,
         dataflow.agencyId,
         dataflow.version,
         ctx,
@@ -141,20 +140,14 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
         throw ctx.fail(
           'dataflow_not_found',
           `Dataflow '${params.dataflow_id}' not found`,
-          {
-            dataflowId: params.dataflow_id,
-            ...ctx.recoveryFor('dataflow_not_found'),
-          },
+          { dataflowId: params.dataflow_id },
           { cause: err },
         );
       }
       throw ctx.fail(
         'structure_unavailable',
-        `Structure unavailable for dataflow '${params.dataflow_id}'`,
-        {
-          dataflowId: params.dataflow_id,
-          ...ctx.recoveryFor('structure_unavailable'),
-        },
+        `Structure unavailable for dataflow '${dataflow.id}'`,
+        { dataflowId: dataflow.id },
         { cause: err },
       );
     }
