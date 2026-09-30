@@ -12,7 +12,7 @@
     "ignorePatterns": []
   },
   "outdated": {
-    "allowlist": ["@cyanheads/mcp-ts-core", "@duckdb/node-api"]
+    "allowlist": ["@duckdb/node-api"]
   },
   "lint": {
     "truncationAllowlist": []
