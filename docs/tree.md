@@ -1,6 +1,6 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-09-30 15:49:13
+Generated on: 2026-10-16 16:09:53
 
 ```text
 imf-mcp-server/
@@ -134,6 +134,7 @@ imf-mcp-server/
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
 ├── src/
@@ -157,7 +158,9 @@ imf-mcp-server/
 │   │   │       ├── imf-list-databases.tool.ts
 │   │   │       ├── imf-query-dataset.tool.ts
 │   │   │       └── index.ts
-│   │   └── codelist-page.ts
+│   │   ├── codelist-page.ts
+│   │   ├── markdown-table.ts
+│   │   └── optional-input.ts
 │   ├── services/
 │   │   ├── canvas/
 │   │   │   └── canvas-accessor.ts
@@ -167,7 +170,10 @@ imf-mcp-server/
 │   └── index.ts
 ├── tests/
 │   ├── helpers/
-│   │   └── errors.ts
+│   │   ├── errors.ts
+│   │   └── markdown-table.ts
+│   ├── mcp-server/
+│   │   └── optional-input.test.ts
 │   ├── prompts/
 │   ├── resources/
 │   │   └── imf-database.resource.test.ts
@@ -182,7 +188,8 @@ imf-mcp-server/
 │   │   ├── imf-get-database.tool.test.ts
 │   │   ├── imf-list-databases.tool.test.ts
 │   │   └── imf-query-dataset.tool.test.ts
-│   └── cache-hints.test.ts
+│   ├── cache-hints.test.ts
+│   └── markdown-table.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

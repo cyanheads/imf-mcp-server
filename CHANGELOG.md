@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.4](changelog/0.4.x/0.4.4.md) — 2026-10-16
+
+imf_query_dataset names requested series that returned nothing, reports unrecovered attributes and classified upstream failures, adds reference periods, and settles within a 45-second call budget; limits above a page cap are served up to it; imf_dataframe_query escapes table cells.
+
 ## [0.4.3](changelog/0.4.x/0.4.3.md) — 2026-09-30
 
 imf_query_dataset checks key codes against their codelists, adds last_n_observations for each series' latest values, and holds its response budget without DataCanvas.
