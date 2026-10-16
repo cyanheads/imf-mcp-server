@@ -100,6 +100,7 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
       reason: 'structure_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'api.imf.org returns no usable data structure for the selected dataflow',
+      retryable: true,
       recovery:
         'Retry after a short wait; distinguish this upstream failure from an invalid dataflow ID.',
     },
@@ -134,6 +135,7 @@ export const imfDatabaseResource = resource('imf://database/{dataflow_id}', {
         ctx,
       );
     } catch (err: unknown) {
+      if (ctx.signal.aborted) throw err;
       if (err instanceof McpError && err.data?.reason === 'dataflow_list_unavailable') throw err;
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('not found')) {

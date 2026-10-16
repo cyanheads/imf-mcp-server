@@ -224,6 +224,41 @@ describe('imfDatabaseResource', () => {
     expect(declaredRecovery('structure_unavailable')).toMatch(/retry/i);
   });
 
+  it('declares structure_unavailable retryable, as its recovery says, and fails with it', async () => {
+    expect(
+      imfDatabaseResource.errors?.find((entry) => entry.reason === 'structure_unavailable'),
+    ).toMatchObject({ retryable: true });
+    mockSvc.fetchDataflowStructure.mockRejectedValue(new Error('connection reset'));
+    const ctx = createMockContext({ tenantId: 'test', errors: imfDatabaseResource.errors });
+    const params = resourceParams.parse({ dataflow_id: 'WEO' });
+
+    await expect(imfDatabaseResource.handler(params, ctx)).rejects.toMatchObject({
+      data: { reason: 'structure_unavailable', retryable: true },
+    });
+  });
+
+  it('keeps a cancelled structure read as RequestCancelled, never structure_unavailable', async () => {
+    const caller = new AbortController();
+    mockSvc.fetchDataflowStructure.mockImplementation(() => {
+      caller.abort();
+      return Promise.reject(
+        new McpError(JsonRpcErrorCode.RequestCancelled, 'Request was cancelled.'),
+      );
+    });
+    const ctx = createMockContext({
+      tenantId: 'test',
+      errors: imfDatabaseResource.errors,
+      signal: caller.signal,
+    });
+
+    const err = await captureMcpError(() =>
+      imfDatabaseResource.handler(resourceParams.parse({ dataflow_id: 'WEO' }), ctx),
+    );
+
+    expect(err.code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(err.data?.reason).toBeUndefined();
+  });
+
   it('#40 bounds codelists at 50 entries and exposes tool continuation metadata', async () => {
     const largeCodelist = Array.from({ length: 80 }, (_, i) => ({
       id: `C${i}`,

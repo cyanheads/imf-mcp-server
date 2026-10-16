@@ -3,6 +3,7 @@
  * @module tests/tools/imf-get-database.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -85,10 +86,16 @@ describe('imfGetDatabase', () => {
     findDataflow: ReturnType<typeof vi.fn>;
     fetchDataflowAvailability: ReturnType<typeof vi.fn>;
     fetchDataflowStructure: ReturnType<typeof vi.fn>;
+    describeDataflowMiss: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
     mockSvc = {
+      describeDataflowMiss: vi
+        .fn()
+        .mockImplementation((dataflowId: string) =>
+          Promise.resolve({ message: `Dataflow '${dataflowId}' not found` }),
+        ),
       findDataflow: vi.fn().mockResolvedValue(MOCK_DATAFLOW),
       fetchDataflowAvailability: vi.fn().mockResolvedValue(MOCK_AVAILABILITY),
       fetchDataflowStructure: vi.fn().mockResolvedValue(MOCK_STRUCTURE),
@@ -574,6 +581,67 @@ describe('imfGetDatabase', () => {
     });
   });
 
+  it('declares structure_unavailable retryable, as its recovery says, and fails with it', async () => {
+    const entry = imfGetDatabase.errors?.find((e) => e.reason === 'structure_unavailable');
+    expect(entry).toMatchObject({ retryable: true });
+    expect(entry?.recovery).toMatch(/retry/i);
+
+    mockSvc.fetchDataflowStructure.mockRejectedValue(new Error('API timeout'));
+    const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
+    const input = imfGetDatabase.input.parse({ dataflow_id: 'WEO' });
+
+    await expect(imfGetDatabase.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'structure_unavailable', retryable: true },
+    });
+  });
+
+  describe('caller cancellation', () => {
+    /** A service read that the caller cancels while it runs. */
+    const cancelledRead = (caller: AbortController) => () => {
+      caller.abort();
+      return Promise.reject(
+        new McpError(JsonRpcErrorCode.RequestCancelled, 'Request was cancelled.'),
+      );
+    };
+
+    it('keeps a cancelled structure read as RequestCancelled, never structure_unavailable', async () => {
+      const caller = new AbortController();
+      mockSvc.fetchDataflowStructure.mockImplementation(cancelledRead(caller));
+      const ctx = createMockContext({
+        tenantId: 'test',
+        errors: imfGetDatabase.errors,
+        signal: caller.signal,
+      });
+
+      const err = await captureMcpError(() =>
+        imfGetDatabase.handler(imfGetDatabase.input.parse({ dataflow_id: 'WEO' }), ctx),
+      );
+
+      expect(err.code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(err.data?.reason).toBeUndefined();
+    });
+
+    it('keeps a cancelled availability read as RequestCancelled, never availability_unavailable', async () => {
+      const caller = new AbortController();
+      mockSvc.fetchDataflowAvailability.mockImplementation(cancelledRead(caller));
+      const ctx = createMockContext({
+        tenantId: 'test',
+        errors: imfGetDatabase.errors,
+        signal: caller.signal,
+      });
+
+      const err = await captureMcpError(() =>
+        imfGetDatabase.handler(
+          imfGetDatabase.input.parse({ dataflow_id: 'WEO', available_only: true }),
+          ctx,
+        ),
+      );
+
+      expect(err.code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(err.data?.reason).toBeUndefined();
+    });
+  });
+
   it('throws ctx.fail("dataflow_not_found") when DSD fetch returns not-found error', async () => {
     mockSvc.fetchDataflowStructure.mockRejectedValue(new Error('not found'));
     const ctx = createMockContext({ tenantId: 'test', errors: imfGetDatabase.errors });
@@ -804,10 +872,10 @@ describe('imfGetDatabase', () => {
   // #36: filter validation and normalization
   // -------------------------------------------------------------------------
 
-  it('#36 rejects a whitespace-only codelist_filter at the schema boundary', () => {
-    expect(() =>
-      imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: '   ' }),
-    ).toThrow();
+  it('#36/#67 reads a whitespace-only codelist_filter as unset at the schema boundary', () => {
+    expect(
+      imfGetDatabase.input.parse({ dataflow_id: 'WEO', codelist_filter: '   ' }).codelist_filter,
+    ).toBeUndefined();
   });
 
   it('#36 trims a padded filter once for matching, structured output, and content[]', async () => {
@@ -1522,5 +1590,286 @@ describe('imfGetDatabase', () => {
 
   it('#52 dataflow_id describes no case sensitivity', () => {
     expect(imfGetDatabase.input.shape.dataflow_id.description).not.toContain('Case-sensitive');
+  });
+
+  // -------------------------------------------------------------------------
+  // #67: a blank optional input is unset
+  // -------------------------------------------------------------------------
+
+  describe('#67 blank optional inputs', () => {
+    const declaredNotFoundRecovery = () =>
+      imfGetDatabase.errors?.find((entry) => entry.reason === 'dataflow_not_found')?.recovery ?? '';
+    const callAndCapture = async (args: Record<string, unknown>) => {
+      mockSvc.findDataflow.mockClear();
+      mockSvc.fetchDataflowStructure.mockClear();
+      const response = await runToolContract(imfGetDatabase, { dataflow_id: 'WEO', ...args });
+      return {
+        response,
+        find: mockSvc.findDataflow.mock.calls.map((call) => call.slice(0, 3)),
+        structure: mockSvc.fetchDataflowStructure.mock.calls.map((call) => call.slice(0, 3)),
+      };
+    };
+    const expectSameAs = async (
+      sentArgs: Record<string, unknown>,
+      omittedArgs: Record<string, unknown>,
+    ) => {
+      const omitted = await callAndCapture(omittedArgs);
+      const sent = await callAndCapture(sentArgs);
+      expect(sent.response.isError).toBeFalsy();
+      expect(sent.response.structuredContent).toEqual(omitted.response.structuredContent);
+      expect(sent.response.content).toEqual(omitted.response.content);
+      expect(sent.find).toEqual(omitted.find);
+      expect(sent.structure).toEqual(omitted.structure);
+      return sent;
+    };
+
+    it.each(
+      ['agency_id', 'version', 'codelist_filter', 'dimension_id'].flatMap((field) =>
+        ['', '   '].map((blank) => [field, blank]),
+      ),
+    )('reads %s: %j exactly as if it were omitted', async (field, blank) => {
+      const sent = await expectSameAs({ [field]: blank }, {});
+      expect(sent.find).toEqual([['WEO', undefined, undefined]]);
+      expect(sent.response.structuredContent).not.toHaveProperty('codelist_filter');
+      expect(sent.response.structuredContent).not.toHaveProperty('dimension_id');
+    });
+
+    it('returns the all-dimension preview for a blank dimension_id with blank paging', async () => {
+      const sent = await expectSameAs({ dimension_id: '', limit: '', offset: '  ' }, {});
+      expect(
+        (sent.response.structuredContent as { dimensions: unknown[] }).dimensions,
+      ).toHaveLength(3);
+    });
+
+    it('reads blank paging on a selected dimension as the default page', async () => {
+      await expectSameAs(
+        { dimension_id: 'COUNTRY', limit: '', offset: '   ' },
+        { dimension_id: 'COUNTRY' },
+      );
+    });
+
+    it('keeps reading limit "1" and offset "1" as numbers', async () => {
+      const sent = await expectSameAs(
+        { dimension_id: 'COUNTRY', limit: '1', offset: '1' },
+        { dimension_id: 'COUNTRY', limit: 1, offset: 1 },
+      );
+      expect(sent.response.structuredContent).toMatchObject({
+        dimensions: [{ id: 'COUNTRY', offset: 1, returned_count: 1, codelist: [{ id: 'GBR' }] }],
+      });
+    });
+
+    it.each([
+      ['limit', '01'],
+      ['limit', '1e3'],
+      ['offset', '01'],
+    ])('still rejects %s %j before any upstream call', async (field, sent) => {
+      const { response, find } = await callAndCapture({ dimension_id: 'COUNTRY', [field]: sent });
+
+      expect(response.isError).toBe(true);
+      expect((response.structuredContent as { error: { code: number } }).error.code).toBe(
+        JsonRpcErrorCode.InvalidParams,
+      );
+      expect(find).toEqual([]);
+    });
+
+    it('still requires dimension_id for a non-blank limit or offset', async () => {
+      const { response, find } = await callAndCapture({ dimension_id: '  ', limit: 10 });
+      const text = (response.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('');
+
+      // The blank dimension_id reads as unset, so the missing-dimension rule rejects it.
+      expect(response.isError).toBe(true);
+      expect((response.structuredContent as { error: { code: number } }).error.code).toBe(
+        JsonRpcErrorCode.InvalidParams,
+      );
+      expect(text).toContain('dimension_id is required when limit or offset is provided.');
+      expect(find).toEqual([]);
+    });
+
+    it('still fails dimension_not_found for a non-blank unknown dimension_id', async () => {
+      const { response } = await callAndCapture({ dimension_id: 'NOPE' });
+
+      expect(
+        (response.structuredContent as { error: { data: { reason: string } } }).error.data.reason,
+      ).toBe('dimension_not_found');
+    });
+
+    it('resolves the DSD under the catalog agency and version, not the input spelling', async () => {
+      const { response, find, structure } = await callAndCapture({
+        agency_id: 'imf.res',
+        version: ' 9.0.0 ',
+      });
+
+      expect(response.isError).toBeFalsy();
+      expect(find).toEqual([['WEO', 'imf.res', ' 9.0.0 ']]);
+      expect(structure).toEqual([['WEO', 'IMF.RES', '9.0.0']]);
+    });
+
+    it('fails dataflow_not_found with the message naming where the id exists', async () => {
+      mockSvc.findDataflow.mockResolvedValue(undefined);
+      const miss =
+        "Dataflow 'WEO' not found under version '9.0.1'. It exists under IMF.RES 9.0.0 — omit agency_id and version to use it.";
+      const hint = 'Keep dataflow_id as it is; only agency_id and version missed.';
+      mockSvc.describeDataflowMiss.mockResolvedValue({ message: miss, hint });
+
+      const { response, structure } = await callAndCapture({ version: '9.0.1' });
+      const error = (
+        response.structuredContent as {
+          error: { message: string; data: { reason: string; recovery?: unknown } };
+        }
+      ).error;
+      const text = (response.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('');
+
+      expect(error.data.reason).toBe('dataflow_not_found');
+      expect(error.message).toBe(miss);
+      // The message already carries the fix, so the static recovery is not appended to it.
+      expect(error.data.recovery).toEqual({ hint });
+      expect(text).not.toContain(declaredNotFoundRecovery());
+      expect(text.split('omit agency_id and version')).toHaveLength(2);
+      expect(mockSvc.describeDataflowMiss).toHaveBeenCalledWith(
+        'WEO',
+        undefined,
+        '9.0.1',
+        expect.anything(),
+      );
+      expect(structure).toEqual([]);
+    });
+
+    it('keeps the declared dataflow_not_found recovery when the id exists nowhere', async () => {
+      mockSvc.findDataflow.mockResolvedValue(undefined);
+
+      const { response } = await callAndCapture({ dataflow_id: 'NOPE' });
+      const error = (
+        response.structuredContent as { error: { message: string; data: { recovery?: unknown } } }
+      ).error;
+      const text = (response.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('');
+
+      expect(error.message).toBe("Dataflow 'NOPE' not found");
+      expect(error.data.recovery).toEqual({ hint: declaredNotFoundRecovery() });
+      expect(text).toContain(declaredNotFoundRecovery());
+    });
+
+    it('offers no blank as an input in any field description', () => {
+      for (const [field, schema] of Object.entries(imfGetDatabase.input.shape)) {
+        expect(schema.description ?? '', field).not.toMatch(/blank|empty string|''|""/i);
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #65: a limit above the per-call cap serves the cap and says so
+  // -------------------------------------------------------------------------
+
+  describe('#65 limit above the per-call cap', () => {
+    /** WEO's COUNTRY codelist is 344 codes (2026-10-16). */
+    const COUNTRY_CODES = Array.from({ length: 344 }, (_, index) => ({
+      id: `C${String(index).padStart(3, '0')}`,
+      name: `Country ${index}`,
+    }));
+    const textOf = (response: Awaited<ReturnType<typeof runToolContract>>) =>
+      (response.content as Array<{ text?: string }>).map((block) => block.text ?? '').join('\n');
+
+    beforeEach(() => {
+      mockSvc.fetchDataflowStructure.mockResolvedValue({
+        ...MOCK_STRUCTURE,
+        dimensions: [
+          { id: 'COUNTRY', name: 'Country', position: 0, codelist: COUNTRY_CODES },
+          ...MOCK_STRUCTURE.dimensions.slice(1),
+        ],
+      });
+    });
+
+    it('serves 200 of 344 codes, echoes requested and applied limit, and names offset=200', async () => {
+      const response = await runToolContract(imfGetDatabase, {
+        dataflow_id: 'WEO',
+        dimension_id: 'COUNTRY',
+        limit: 500,
+      });
+      const structured = response.structuredContent as Record<string, unknown> & {
+        dimensions: Array<Record<string, unknown> & { codelist: unknown[] }>;
+      };
+      const text = textOf(response);
+
+      expect(response.isError).toBeFalsy();
+      expect(structured).toMatchObject({
+        truncated: true,
+        requested_limit: 500,
+        applied_limit: 200,
+      });
+      expect(structured.dimensions[0]?.codelist).toHaveLength(200);
+      expect(structured.dimensions[0]).toMatchObject({
+        matched_count: 344,
+        returned_count: 200,
+        next_offset: 200,
+        codelist_truncated: true,
+      });
+      expect(text).toContain('**requested_limit:** 500');
+      expect(text).toContain('**applied_limit:** 200');
+      expect(text).toContain(
+        '_(more matches remain — call imf_get_database with dimension_id="COUNTRY" and offset=200; each call returns at most 200 codes)_',
+      );
+    });
+
+    it('echoes from one past the cap, and not at it', async () => {
+      const atCap = await runToolContract(imfGetDatabase, {
+        dataflow_id: 'WEO',
+        dimension_id: 'COUNTRY',
+        limit: 200,
+      });
+      const pastCap = await runToolContract(imfGetDatabase, {
+        dataflow_id: 'WEO',
+        dimension_id: 'COUNTRY',
+        limit: '201',
+      });
+
+      expect(atCap.structuredContent).not.toHaveProperty('requested_limit');
+      expect(atCap.structuredContent).not.toHaveProperty('applied_limit');
+      expect(pastCap.structuredContent).toMatchObject({
+        requested_limit: 201,
+        applied_limit: 200,
+        dimensions: [{ returned_count: 200 }],
+      });
+    });
+
+    it('serves the last page under a capped limit without a next_offset', async () => {
+      const response = await runToolContract(imfGetDatabase, {
+        dataflow_id: 'WEO',
+        dimension_id: 'COUNTRY',
+        limit: 50_000,
+        offset: 200,
+      });
+
+      expect(response.structuredContent).toMatchObject({
+        truncated: true,
+        requested_limit: 50_000,
+        applied_limit: 200,
+        dimensions: [{ returned_count: 144, offset: 200, matched_count: 344 }],
+      });
+      expect(
+        (response.structuredContent as { dimensions: Array<Record<string, unknown>> })
+          .dimensions[0],
+      ).not.toHaveProperty('next_offset');
+    });
+
+    it('rejects limit 50,001 before any upstream call', async () => {
+      const response = await runToolContract(imfGetDatabase, {
+        dataflow_id: 'WEO',
+        dimension_id: 'COUNTRY',
+        limit: 50_001,
+      });
+
+      expect(response.isError).toBe(true);
+      expect(textOf(response)).toContain('50000');
+      expect(mockSvc.findDataflow).not.toHaveBeenCalled();
+    });
+
+    it('still requires dimension_id for a limit above the cap', () => {
+      expect(() => imfGetDatabase.input.parse({ dataflow_id: 'WEO', limit: 500 })).toThrow();
+    });
+
+    it('advertises 50,000 as the limit maximum', () => {
+      expect(z.toJSONSchema(imfGetDatabase.input).properties?.limit).toMatchObject({
+        maximum: 50_000,
+      });
+    });
   });
 });

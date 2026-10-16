@@ -10,8 +10,16 @@ import type { CodelistEntry } from '@/services/imf-sdmx/types.js';
 /** Default number of codelist entries returned per dimension or selected page. */
 export const CODELIST_PREVIEW_LIMIT = 50;
 
-/** Largest selected-dimension codelist page a caller may request. */
+/** Largest selected-dimension codelist page one call returns. */
 export const MAX_CODELIST_PAGE_LIMIT = 200;
+
+/**
+ * Largest selected-dimension `limit` accepted, above the portal's largest
+ * codelist (45,087 codes, IMF.STA CL_MFS_LABELS, 2026-10-16). A limit between
+ * MAX_CODELIST_PAGE_LIMIT and this returns a MAX_CODELIST_PAGE_LIMIT page and
+ * says so; past it the value is not a page size for any codelist.
+ */
+export const CODELIST_PAGE_LIMIT_CEILING = 50_000;
 
 export interface CodelistPage {
   codelist: CodelistEntry[];

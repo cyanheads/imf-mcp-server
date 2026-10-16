@@ -9,10 +9,16 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import {
+  CODELIST_PAGE_LIMIT_CEILING,
   CODELIST_PREVIEW_LIMIT,
   MAX_CODELIST_PAGE_LIMIT,
   projectCodelist,
 } from '@/mcp-server/codelist-page.js';
+import {
+  blankAsUnset,
+  blankAsUnsetBoolean,
+  blankAsUnsetNumber,
+} from '@/mcp-server/optional-input.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
 /** IMF SDMX 3.0 data portal base URL — used to construct per-dataflow attribution links. */
@@ -42,61 +48,35 @@ export const imfGetDatabase = tool('imf_get_database', {
       dataflow_id: z
         .string()
         .describe('Dataflow identifier from imf_list_databases, e.g. WEO, BOP, CPI.'),
-      agency_id: z
-        .string()
-        .optional()
-        .describe(
-          'Agency ID that publishes this dataflow, e.g. IMF.RES or IMF.STA. ' +
-            'Auto-detected from the dataflow list when omitted.',
-        ),
-      version: z
-        .string()
-        .optional()
-        .describe(
-          'Dataflow version, e.g. 9.0.0. Auto-detected from the dataflow list when omitted.',
-        ),
-      codelist_filter: z
-        .string()
-        .trim()
-        .min(1)
-        .optional()
-        .describe(
-          "Optional words to search for in each dimension's codelist, split on spaces and commas. A code matches " +
-            'when every word appears, case-insensitively, in its code ID or name; different words may match different fields. ' +
-            `Filtering runs before the ${CODELIST_PREVIEW_LIMIT}-entry preview or selected-dimension page. ` +
-            'Example: "CPI", "GDP constant prices", or "NGDP_RPCH percent" surfaces matching WEO indicator codes.',
-        ),
-      available_only: z
-        .boolean()
-        .default(false)
-        .describe(
-          'Return only codes reported by the dataflow-wide availability constraint. Default false keeps ordinary codelist discovery unchanged.',
-        ),
-      dimension_id: z
-        .string()
-        .trim()
-        .min(1)
-        .optional()
-        .describe(
-          'Exact dimension ID from this tool, e.g. INDICATOR. Select one dimension to page beyond its preview.',
-        ),
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(MAX_CODELIST_PAGE_LIMIT)
-        .optional()
-        .describe(
-          `Entries to return from the selected dimension. Valid only with dimension_id; default ${CODELIST_PREVIEW_LIMIT}, maximum ${MAX_CODELIST_PAGE_LIMIT}.`,
-        ),
-      offset: z
-        .number()
-        .int()
-        .min(0)
-        .optional()
-        .describe(
-          'Matching entries to skip in the selected dimension before this page. Valid only with dimension_id; default 0.',
-        ),
+      agency_id: blankAsUnset(z.string().optional()).describe(
+        'Agency ID that publishes this dataflow, e.g. IMF.RES or IMF.STA, matched case-insensitively. ' +
+          'Auto-detected from the dataflow list when omitted.',
+      ),
+      version: blankAsUnset(z.string().optional()).describe(
+        'Dataflow version, e.g. 9.0.0. Auto-detected from the dataflow list when omitted.',
+      ),
+      codelist_filter: blankAsUnset(z.string().trim().min(1).optional()).describe(
+        "Optional words to search for in each dimension's codelist, split on spaces and commas. A code matches " +
+          'when every word appears, case-insensitively, in its code ID or name; different words may match different fields. ' +
+          `Filtering runs before the ${CODELIST_PREVIEW_LIMIT}-entry preview or selected-dimension page. ` +
+          'Example: "CPI", "GDP constant prices", or "NGDP_RPCH percent" surfaces matching WEO indicator codes.',
+      ),
+      available_only: blankAsUnsetBoolean(z.boolean().default(false)).describe(
+        'Return only codes reported by the dataflow-wide availability constraint. Default false keeps ordinary codelist discovery unchanged.',
+      ),
+      dimension_id: blankAsUnset(z.string().trim().min(1).optional()).describe(
+        'Exact dimension ID from this tool, e.g. INDICATOR. Select one dimension to page beyond its preview.',
+      ),
+      limit: blankAsUnsetNumber(
+        z.number().int().min(1).max(CODELIST_PAGE_LIMIT_CEILING).optional(),
+      ).describe(
+        `Entries to return from the selected dimension. Valid only with dimension_id; default ${CODELIST_PREVIEW_LIMIT}. ` +
+          `One call returns at most ${MAX_CODELIST_PAGE_LIMIT}, so a larger limit (up to ${CODELIST_PAGE_LIMIT_CEILING.toLocaleString('en-US')}) ` +
+          `returns ${MAX_CODELIST_PAGE_LIMIT}, echoes requested_limit and applied_limit, and next_offset names the rest.`,
+      ),
+      offset: blankAsUnsetNumber(z.number().int().min(0).optional()).describe(
+        'Matching entries to skip in the selected dimension before this page. Valid only with dimension_id; default 0.',
+      ),
     })
     .superRefine((input, refinement) => {
       if (
@@ -242,9 +222,10 @@ export const imfGetDatabase = tool('imf_get_database', {
     {
       reason: 'dataflow_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'dataflow_id does not match any known dataflow on api.imf.org',
+      when: 'dataflow_id matches no catalog dataflow on api.imf.org, or none under the agency_id and version given',
       severity: 'warning',
-      recovery: 'Call imf_list_databases to browse available dataflow IDs.',
+      recovery:
+        'Call imf_list_databases to browse available dataflow IDs, or omit agency_id and version to auto-detect them.',
     },
     {
       reason: 'dimension_not_found',
@@ -257,6 +238,7 @@ export const imfGetDatabase = tool('imf_get_database', {
       reason: 'structure_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'api.imf.org returns non-200 on the DSD endpoint',
+      retryable: true,
       recovery: 'Retry after a short wait; the IMF SDMX 3.0 portal is occasionally slow.',
     },
     {
@@ -287,6 +269,18 @@ export const imfGetDatabase = tool('imf_get_database', {
         'Populated when a codelist_filter matched no entries anywhere, or when a dimension has no ' +
           'resolvable codelist, or when offset is past the final match.',
       ),
+    requested_limit: z
+      .number()
+      .optional()
+      .describe(
+        `The limit requested, echoed only when it exceeded the per-call maximum of ${MAX_CODELIST_PAGE_LIMIT}.`,
+      ),
+    applied_limit: z
+      .number()
+      .optional()
+      .describe(
+        `The limit the selected dimension's page was cut to — the per-call maximum of ${MAX_CODELIST_PAGE_LIMIT} — echoed beside requested_limit.`,
+      ),
   },
 
   async handler(input, ctx) {
@@ -294,8 +288,15 @@ export const imfGetDatabase = tool('imf_get_database', {
 
     const dataflow = await svc.findDataflow(input.dataflow_id, input.agency_id, input.version, ctx);
     if (!dataflow) {
-      throw ctx.fail('dataflow_not_found', `Dataflow '${input.dataflow_id}' not found`, {
+      const miss = await svc.describeDataflowMiss(
+        input.dataflow_id,
+        input.agency_id,
+        input.version,
+        ctx,
+      );
+      throw ctx.fail('dataflow_not_found', miss.message, {
         dataflowId: input.dataflow_id,
+        ...(miss.hint ? { recovery: { hint: miss.hint } } : {}),
       });
     }
 
@@ -303,11 +304,12 @@ export const imfGetDatabase = tool('imf_get_database', {
     try {
       structure = await svc.fetchDataflowStructure(
         dataflow.id,
-        input.agency_id ?? dataflow.agencyId,
-        input.version ?? dataflow.version,
+        dataflow.agencyId,
+        dataflow.version,
         ctx,
       );
     } catch (err: unknown) {
+      if (ctx.signal.aborted) throw err;
       if (err instanceof McpError && err.data?.reason === 'dataflow_list_unavailable') throw err;
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('not found')) {
@@ -339,11 +341,17 @@ export const imfGetDatabase = tool('imf_get_database', {
     }
 
     const dimensionsToProject = selectedDimension ? [selectedDimension] : structure.dimensions;
+    const limit =
+      input.limit === undefined ? undefined : Math.min(input.limit, MAX_CODELIST_PAGE_LIMIT);
+    if (input.limit !== undefined && input.limit > MAX_CODELIST_PAGE_LIMIT) {
+      ctx.enrich({ requested_limit: input.limit, applied_limit: MAX_CODELIST_PAGE_LIMIT });
+    }
     let availability: Awaited<ReturnType<typeof svc.fetchDataflowAvailability>> | undefined;
     if (input.available_only) {
       try {
         availability = await svc.fetchDataflowAvailability(dataflow, ctx, ctx.signal);
       } catch (err: unknown) {
+        if (ctx.signal.aborted) throw err;
         if (err instanceof McpError && err.data?.reason === 'availability_unavailable') throw err;
         throw ctx.fail(
           'availability_unavailable',
@@ -367,7 +375,7 @@ export const imfGetDatabase = tool('imf_get_database', {
         ...(availability ? { available_count: sourceEntries.length } : {}),
         ...projectCodelist(sourceEntries, {
           ...(input.codelist_filter ? { filter: input.codelist_filter } : {}),
-          ...(selectedDimension && input.limit !== undefined ? { limit: input.limit } : {}),
+          ...(selectedDimension && limit !== undefined ? { limit } : {}),
           ...(selectedDimension && input.offset !== undefined ? { offset: input.offset } : {}),
         }),
       };
@@ -497,7 +505,7 @@ export const imfGetDatabase = tool('imf_get_database', {
         }
         if (dim.next_offset !== undefined) {
           lines.push(
-            `_(more matches remain — call imf_get_database with dimension_id="${dim.id}" and offset=${dim.next_offset}; limit may be up to ${MAX_CODELIST_PAGE_LIMIT})_`,
+            `_(more matches remain — call imf_get_database with dimension_id="${dim.id}" and offset=${dim.next_offset}; each call returns at most ${MAX_CODELIST_PAGE_LIMIT} codes)_`,
           );
         }
       } else if (dim.matched_count > 0) {
