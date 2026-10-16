@@ -1624,8 +1624,8 @@ describe('imfGetDatabase', () => {
     };
 
     it.each(
-      ['agency_id', 'version', 'codelist_filter', 'dimension_id'].flatMap((field) =>
-        ['', '   '].map((blank) => [field, blank]),
+      ['agency_id', 'version', 'codelist_filter', 'dimension_id', 'available_only'].flatMap(
+        (field) => ['', '   '].map((blank) => [field, blank]),
       ),
     )('reads %s: %j exactly as if it were omitted', async (field, blank) => {
       const sent = await expectSameAs({ [field]: blank }, {});

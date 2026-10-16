@@ -1413,6 +1413,7 @@ describe('imfDataframeQuery', () => {
 
     expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(err.data?.reason).toBe('sql_not_permitted');
+    expect(err.data?.canvasId).toBe('canvas-abc');
     expect(err.message).toBe(message);
   });
 
@@ -1435,6 +1436,7 @@ describe('imfDataframeQuery', () => {
 
     expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(err.data?.reason).toBe('sql_execution_error');
+    expect(err.data?.canvasId).toBe('canvas-abc');
     expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('TRY_CAST') });
     expect(err.message).toBe(message);
   });
