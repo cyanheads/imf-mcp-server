@@ -8,6 +8,7 @@
  * @module tests/tools/imf-list-databases.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -104,11 +105,6 @@ describe('imfListDatabases', () => {
 
     expect(result.total_count).toBe(1);
     expect(result.dataflows[0]!.id).toBe('CPI');
-  });
-
-  it('#46 rejects a whitespace-only filter at the schema boundary', () => {
-    expect(imfListDatabases.input.safeParse({ filter: '   ' }).success).toBe(false);
-    expect(mockSvc.fetchDataflows).not.toHaveBeenCalled();
   });
 
   it('#46 normalizes padded filters and keeps case-insensitive ID, name, and full-description matching', async () => {
@@ -364,8 +360,10 @@ describe('imfListDatabases', () => {
     expect(result.total_count).toBe(103);
   });
 
-  it('#29 rejects a limit past the ceiling rather than silently capping it', () => {
-    expect(() => imfListDatabases.input.parse({ limit: 500 })).toThrow();
+  it('#29/#65 accepts a limit up to the 1,000 hard ceiling and rejects one past it', () => {
+    expect(imfListDatabases.input.parse({ limit: 500 }).limit).toBe(500);
+    expect(imfListDatabases.input.parse({ limit: 1_000 }).limit).toBe(1_000);
+    expect(() => imfListDatabases.input.parse({ limit: 1_001 })).toThrow();
     expect(() => imfListDatabases.input.parse({ offset: -1 })).toThrow();
   });
 
@@ -644,5 +642,172 @@ describe('imfListDatabases', () => {
     expect(err.data?.reason).toBe('dataflow_list_unavailable');
     expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('Retry') });
     expect(JSON.stringify({ message: err.message, data: err.data })).not.toContain('/structure/');
+  });
+
+  // -------------------------------------------------------------------------
+  // #67: a blank optional input is unset
+  // -------------------------------------------------------------------------
+
+  describe('#67 blank optional inputs', () => {
+    beforeEach(() => {
+      mockSvc.fetchDataflows.mockResolvedValue(catalogOf(103));
+    });
+
+    it.each(
+      ['filter', 'limit', 'offset', 'include_vintages'].flatMap((field) =>
+        ['', '   '].map((blank) => [field, blank]),
+      ),
+    )('reads %s: %j exactly as if it were omitted', async (field, blank) => {
+      const omitted = await runToolContract(imfListDatabases, {});
+      const sent = await runToolContract(imfListDatabases, { [field]: blank });
+
+      expect(sent.isError).toBeFalsy();
+      expect(sent.structuredContent).toEqual(omitted.structuredContent);
+      expect(sent.content).toEqual(omitted.content);
+      // The defaults applied: a 50-entry page from offset 0.
+      expect(sent.structuredContent).toMatchObject({ returned_count: 50, offset: 0 });
+    });
+
+    it('keeps reading limit "50" and offset "50" as numbers', async () => {
+      const sent = await runToolContract(imfListDatabases, { limit: '50', offset: '50' });
+      const typed = await runToolContract(imfListDatabases, { limit: 50, offset: 50 });
+
+      expect(sent.isError).toBeFalsy();
+      expect(sent.structuredContent).toEqual(typed.structuredContent);
+    });
+
+    it.each([
+      ['limit', '01'],
+      ['limit', '1e3'],
+      ['offset', '01'],
+    ])('still rejects %s %j', async (field, sent) => {
+      const response = await runToolContract(imfListDatabases, { [field]: sent });
+
+      expect(response.isError).toBe(true);
+      expect(mockSvc.fetchDataflows).not.toHaveBeenCalled();
+    });
+
+    it('offers no blank as an input in any field description', () => {
+      for (const [field, schema] of Object.entries(imfListDatabases.input.shape)) {
+        expect(schema.description ?? '', field).not.toMatch(/blank|empty string|''|""/i);
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #65: a limit above the per-call cap serves the cap and says so
+  // -------------------------------------------------------------------------
+
+  describe('#65 limit above the per-call cap', () => {
+    const textOf = (response: Awaited<ReturnType<typeof runToolContract>>) =>
+      (response.content as Array<{ text?: string }>).map((block) => block.text ?? '').join('\n');
+    const listAll = async (count: number, args: Record<string, unknown>) => {
+      mockSvc.fetchDataflows.mockResolvedValue(catalogOf(count));
+      return await runToolContract(imfListDatabases, args);
+    };
+
+    it('serves 200 of 224, echoes requested and applied limit, and names the next offset', async () => {
+      const response = await listAll(224, { limit: 250, include_vintages: true });
+      const structured = response.structuredContent as Record<string, unknown> & {
+        dataflows: unknown[];
+      };
+
+      expect(response.isError).toBeFalsy();
+      expect(structured.dataflows).toHaveLength(200);
+      expect(structured).toMatchObject({
+        total_count: 224,
+        returned_count: 200,
+        offset: 0,
+        requested_limit: 250,
+        applied_limit: 200,
+        truncated: true,
+        shown: 200,
+        cap: 200,
+      });
+      expect(structured.notice).toBe(
+        'limit 250 is above the per-call maximum of 200, so this page holds 200. Showing 1–200 of 224 matching dataflows. Call again with offset=200 for the next page, or narrow with filter.',
+      );
+      const text = textOf(response);
+      expect(text).toContain('**requested_limit:** 250');
+      expect(text).toContain('**applied_limit:** 200');
+      expect(text).toContain('offset=200');
+      expect(text).not.toContain('raise limit');
+    });
+
+    it('returns a whole catalog under the cap with the echo and no truncation notice', async () => {
+      const response = await listAll(104, { limit: 250 });
+      const structured = response.structuredContent as Record<string, unknown>;
+
+      expect(structured).toMatchObject({
+        total_count: 104,
+        returned_count: 104,
+        requested_limit: 250,
+        applied_limit: 200,
+      });
+      expect(structured).not.toHaveProperty('notice');
+      expect(structured).not.toHaveProperty('truncated');
+    });
+
+    it('reads limit "250" as 250', async () => {
+      const sent = await listAll(224, { limit: '250' });
+      const typed = await listAll(224, { limit: 250 });
+
+      expect(sent.isError).toBeFalsy();
+      expect(sent.structuredContent).toEqual(typed.structuredContent);
+    });
+
+    it('echoes from one past the cap, and not at it', async () => {
+      const atCap = (await listAll(500, { limit: 200 })).structuredContent as Record<
+        string,
+        unknown
+      >;
+      const pastCap = (await listAll(500, { limit: 201 })).structuredContent as Record<
+        string,
+        unknown
+      >;
+
+      expect(atCap).not.toHaveProperty('requested_limit');
+      expect(atCap).not.toHaveProperty('applied_limit');
+      expect(atCap.notice).toBe(
+        'Showing 1–200 of 500 matching dataflows. Call again with offset=200 for the next page, or narrow with filter.',
+      );
+      expect(pastCap).toMatchObject({
+        requested_limit: 201,
+        applied_limit: 200,
+        returned_count: 200,
+      });
+    });
+
+    it('keeps a capped page past the end of the catalog on the past-the-end notice', async () => {
+      const structured = (await listAll(104, { limit: 500, offset: 300 }))
+        .structuredContent as Record<string, unknown>;
+
+      expect(structured).toMatchObject({
+        returned_count: 0,
+        requested_limit: 500,
+        applied_limit: 200,
+      });
+      expect(structured.notice).toBe(
+        'offset 300 is past the end of 104 matching dataflow(s) — request a smaller offset to see them.',
+      );
+    });
+
+    it('rejects limit 1,001 naming the 1,000 maximum, before any upstream call', async () => {
+      const response = await listAll(104, { limit: 1_001 });
+
+      expect(response.isError).toBe(true);
+      expect(textOf(response)).toContain('1000');
+      expect(mockSvc.fetchDataflows).not.toHaveBeenCalled();
+    });
+
+    it.each([0, -1, 1.5])('still rejects limit %s', (limit) => {
+      expect(imfListDatabases.input.safeParse({ limit }).success).toBe(false);
+    });
+
+    it('advertises 1,000 as the limit maximum', () => {
+      expect(z.toJSONSchema(imfListDatabases.input).properties?.limit).toMatchObject({
+        maximum: 1_000,
+      });
+    });
   });
 });

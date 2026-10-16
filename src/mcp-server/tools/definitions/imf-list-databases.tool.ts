@@ -10,15 +10,27 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createFilterMatcher } from '@/mcp-server/codelist-page.js';
+import {
+  blankAsUnset,
+  blankAsUnsetBoolean,
+  blankAsUnsetNumber,
+} from '@/mcp-server/optional-input.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
 const VINTAGE_PATTERN = /VINTAGE/i;
 
-/** Default page size — the whole catalog is 103 non-vintage dataflows, 222 with vintages. */
+/** Default page size — the whole catalog is 104 non-vintage dataflows, 224 with vintages (2026-10-16). */
 const DEFAULT_LIMIT = 50;
 
-/** Largest page a caller may ask for — one call still reaches every non-vintage dataflow. */
+/** Largest page one call returns — it still reaches every non-vintage dataflow. */
 const MAX_LIMIT = 200;
+
+/**
+ * Largest limit accepted. A limit between MAX_LIMIT and this returns a
+ * MAX_LIMIT page and says so; past it the value is not a page size for this
+ * catalog (more than four times its size), so it is rejected.
+ */
+const LIMIT_CEILING = 1_000;
 
 /**
  * Longest description this listing carries per dataflow. Descriptions run to a
@@ -40,7 +52,7 @@ export const imfListDatabases = tool('imf_list_databases', {
     'List IMF SDMX dataflows available on the portal. ' +
     'Entry point for every query: imf_get_database and imf_query_dataset both require a dataflow id obtained here. ' +
     'Vintage (historical snapshot) dataflows such as WEO_2025_OCT_VINTAGE are excluded by default; set include_vintages=true to include them. ' +
-    'Results are paged — 50 per call by default, adjustable with limit and offset — and total_count ' +
+    'Results are paged — 50 per call by default and at most 200, adjustable with limit and offset — and total_count ' +
     'reports how many dataflows matched. Descriptions are shortened here; imf_get_database returns ' +
     'the full text for a single dataflow.',
   annotations: {
@@ -49,42 +61,26 @@ export const imfListDatabases = tool('imf_list_databases', {
     openWorldHint: true,
   },
   input: z.object({
-    filter: z
-      .string()
-      .trim()
-      .min(1)
-      .optional()
-      .describe(
-        'Optional words to filter results by, split on spaces and commas. A dataflow matches when every word ' +
-          'appears, case-insensitively, somewhere in its ID, name, or full description. ' +
-          'Example: "exchange rate" returns ER and related dataflows; "WEO outlook" returns WEO and the regional outlooks built on it.',
-      ),
-    include_vintages: z
-      .boolean()
-      .default(false)
-      .describe(
-        'Include vintage (historical snapshot) dataflows such as WEO_2025_OCT_VINTAGE. ' +
-          'Default false — vintages are excluded to keep the discovery surface clean.',
-      ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(MAX_LIMIT)
-      .default(DEFAULT_LIMIT)
-      .describe(
-        `Maximum dataflows to return in this call. Default ${DEFAULT_LIMIT}, ceiling ${MAX_LIMIT}; ` +
-          'total_count reports how many matched, so a partial page is always recognizable as one.',
-      ),
-    offset: z
-      .number()
-      .int()
-      .min(0)
-      .default(0)
-      .describe(
-        'Number of matching dataflows to skip before this page. Combine with limit to page through ' +
-          'a broad or unfiltered catalog.',
-      ),
+    filter: blankAsUnset(z.string().trim().min(1).optional()).describe(
+      'Optional words to filter results by, split on spaces and commas. A dataflow matches when every word ' +
+        'appears, case-insensitively, somewhere in its ID, name, or full description. ' +
+        'Example: "exchange rate" returns ER and related dataflows; "WEO outlook" returns WEO and the regional outlooks built on it.',
+    ),
+    include_vintages: blankAsUnsetBoolean(z.boolean().default(false)).describe(
+      'Include vintage (historical snapshot) dataflows such as WEO_2025_OCT_VINTAGE. ' +
+        'Default false — vintages are excluded to keep the discovery surface clean.',
+    ),
+    limit: blankAsUnsetNumber(
+      z.number().int().min(1).max(LIMIT_CEILING).default(DEFAULT_LIMIT),
+    ).describe(
+      `Maximum dataflows to return in this call. Default ${DEFAULT_LIMIT}; one call returns at most ${MAX_LIMIT}, ` +
+        `so a larger limit (up to ${LIMIT_CEILING.toLocaleString('en-US')}) returns ${MAX_LIMIT} and echoes requested_limit and applied_limit. ` +
+        'total_count reports how many matched, so a partial page is always recognizable as one.',
+    ),
+    offset: blankAsUnsetNumber(z.number().int().min(0).default(0)).describe(
+      'Number of matching dataflows to skip before this page. Combine with limit to page through ' +
+        'a broad or unfiltered catalog.',
+    ),
   }),
   output: z.object({
     dataflows: z
@@ -144,6 +140,18 @@ export const imfListDatabases = tool('imf_list_databases', {
       .describe('True when matching dataflows remain beyond this page.'),
     shown: z.number().optional().describe('Dataflows returned in this page.'),
     cap: z.number().optional().describe('The limit that bounded this page.'),
+    requested_limit: z
+      .number()
+      .optional()
+      .describe(
+        `The limit requested, echoed only when it exceeded the per-call maximum of ${MAX_LIMIT}.`,
+      ),
+    applied_limit: z
+      .number()
+      .optional()
+      .describe(
+        `The limit this page was cut to — the per-call maximum of ${MAX_LIMIT} — echoed beside requested_limit.`,
+      ),
   },
 
   async handler(input, ctx) {
@@ -164,7 +172,10 @@ export const imfListDatabases = tool('imf_list_databases', {
     }
 
     const totalCount = dataflows.length;
-    const page = dataflows.slice(input.offset, input.offset + input.limit);
+    const limit = Math.min(input.limit, MAX_LIMIT);
+    const page = dataflows.slice(input.offset, input.offset + limit);
+    const capped = input.limit > MAX_LIMIT;
+    if (capped) ctx.enrich({ requested_limit: input.limit, applied_limit: limit });
 
     ctx.log.info('Dataflows listed', {
       total: totalCount,
@@ -195,13 +206,16 @@ export const imfListDatabases = tool('imf_list_databases', {
     } else if (input.offset + page.length < totalCount) {
       // A page that does not say it is one reads as the whole catalog. Only
       // offer a bigger page when one is available — pointing a caller already
-      // at the ceiling back at `limit` sends them at the one control that
-      // cannot move.
-      const raiseLimit = input.limit < MAX_LIMIT ? ` raise limit (max ${MAX_LIMIT}),` : '';
+      // at the per-call maximum back at `limit` sends them at the one control
+      // that cannot move.
+      const raiseLimit = limit < MAX_LIMIT ? ` raise limit (max ${MAX_LIMIT}),` : '';
+      const capClause = capped
+        ? `limit ${input.limit} is above the per-call maximum of ${MAX_LIMIT}, so this page holds ${limit}. `
+        : '';
       ctx.enrich.truncated({
         shown: page.length,
-        cap: input.limit,
-        guidance: `Showing ${input.offset + 1}–${input.offset + page.length} of ${totalCount} matching dataflows. Call again with offset=${input.offset + page.length} for the next page,${raiseLimit} or narrow with filter.`,
+        cap: limit,
+        guidance: `${capClause}Showing ${input.offset + 1}–${input.offset + page.length} of ${totalCount} matching dataflows. Call again with offset=${input.offset + page.length} for the next page,${raiseLimit} or narrow with filter.`,
       });
     }
 
