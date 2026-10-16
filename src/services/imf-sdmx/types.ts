@@ -22,6 +22,13 @@ export interface Dataflow {
 /** The catalog identity that names one dataflow version: agency, id, and version. */
 export type DataflowRef = Pick<Dataflow, 'agencyId' | 'id' | 'version'>;
 
+/** A `dataflow_not_found` message, with a recovery hint when the message already states the fix. */
+export interface DataflowMiss {
+  /** Present when the id exists under another agency or version, which the message names. */
+  hint?: string;
+  message: string;
+}
+
 /** A single codelist entry: the machine code and human-readable name. */
 export interface CodelistEntry {
   id: string;
@@ -60,6 +67,12 @@ export interface DataflowStructure {
 
 /** A decoded observation row. */
 export interface Observation {
+  /**
+   * The observation's own reference (base) period, exactly as published (`2010A`,
+   * `2010M1`). Present only when the observation carries one; never filled in
+   * from the series.
+   */
+  reference_period?: string;
   /** Dot-separated dimension codes for this series, e.g. "USA.NGDP_RPCH.A". */
   series_key: string;
   status: string | null;
@@ -67,9 +80,23 @@ export interface Observation {
   value: number | null;
 }
 
-/** Attributes carried per-series (unit, scale, decimals). */
+/**
+ * The attributes located on the series row or, failing that, on the dimension
+ * group covering the series — and so the ones the group recovery probe can
+ * bring back. `reference_period` is read from the series row alone and is
+ * deliberately not one of them.
+ */
+export type GroupedSeriesAttribute = 'decimals' | 'scale' | 'unit';
+
+/** Attributes carried per-series (unit, scale, decimals, reference period). */
 export interface SeriesAttributes {
   decimals: number | null;
+  /**
+   * Reference (base) period of an index series, exactly as published — free
+   * text such as `2010A`, `2010=100`, or `Multiple`. Present only when the
+   * series row carries one.
+   */
+  reference_period?: string;
   /**
    * Power of ten the IMF publishes the series in, as the upstream code (`"9"`
    * billions, `"0"` units). Observation values already arrive in base units, so
@@ -100,6 +127,27 @@ export interface DataQueryResult {
    */
   seriesAttributesByKey: Record<string, SeriesAttributes>;
   startPeriod?: string;
+  /**
+   * Present only when the request that recovers suppressed dimension-group
+   * attributes fired and failed before a probe response could be read. Absent
+   * when no probe fired, and when one answered without a value — that answer
+   * confirms the dataflow publishes none.
+   */
+  unresolvedAttributes?: UnresolvedGroupAttributes;
+}
+
+/** Dimension-group attributes a failed recovery probe left unrecovered. */
+export interface UnresolvedGroupAttributes {
+  /** Attributes left null on the series the suppressed groups describe. */
+  concepts: GroupedSeriesAttribute[];
+  /** The id of the dimension `widenedKey` matches every code at; present with it. */
+  widenedDimension?: string;
+  /**
+   * The probe's key, with one position widened to `*` — a key the portal
+   * answers with these attributes populated. Absent when the structure could
+   * not size a position to widen.
+   */
+  widenedKey?: string;
 }
 
 /** Raw SDMX 3.0 JSON response shape (compact format). */

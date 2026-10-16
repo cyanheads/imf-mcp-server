@@ -1,6 +1,9 @@
 /**
  * @fileoverview IMF SDMX 3.0 REST API service — fetches dataflows, data structures,
- * and observations from api.imf.org. Implements caching via ctx.state and retry.
+ * and observations from api.imf.org. Implements caching via ctx.state and retry,
+ * with every upstream read of one call — retries included — drawing on one
+ * shared time budget (`CALL_BUDGET_MS`) that settles the call before an MCP
+ * client's default 60-second timeout.
  * A flow's own name, version, agency, and description survive a shared DSD;
  * series attributes are decoded per series and keyed by series key, so a
  * multi-series key does not collapse to one record, and unit / scale / decimals
@@ -10,15 +13,24 @@
  * the catalog puts UNIT. A group the portal ships empty because the key
  * combines codes with `+` on a dimension that group is declared against is
  * recovered by one attributes-only request for the same series under a wildcard
- * key, which is the shape that makes the portal emit the group values;
- * the SDMX 2.1 availability constraint is parsed for no-data enrichment, listing
+ * key, which is the shape that makes the portal emit the group values, and a
+ * recovery that fails is reported with the concepts it left null. A reference
+ * (base) period is read from the series row and from each observation, each
+ * scope on its own; the SDMX 2.1 availability constraint is parsed for no-data enrichment, listing
  * a dimension's codes up to AVAILABILITY_CODE_CAP alongside the pre-cap total.
  * @module services/imf-sdmx/imf-sdmx-service
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import {
+  JsonRpcErrorCode,
+  McpError,
+  notFound,
+  requestCancelled,
+  serviceUnavailable,
+  timeout,
+} from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import type {
@@ -27,10 +39,12 @@ import type {
   CodelistEntry,
   Dataflow,
   DataflowAvailabilityResult,
+  DataflowMiss,
   DataflowRef,
   DataflowStructure,
   DataQueryResult,
   Dimension,
+  GroupedSeriesAttribute,
   Observation,
   SdmxAttributeDef,
   SdmxConcept,
@@ -38,11 +52,42 @@ import type {
   SdmxStructure,
   SdmxStructureResponse,
   SeriesAttributes,
+  UnresolvedGroupAttributes,
 } from './types.js';
 
 const DATAFLOWS_CACHE_TTL = 3600; // 1 hour
 const DSD_CACHE_TTL = 86_400; // 24 hours
 const DATAFLOW_AVAILABILITY_CACHE_TTL = 3600; // 1 hour
+/** Cap on one availability-constraint request, inside the call's budget. */
+const AVAILABILITY_TIMEOUT_MS = 10_000;
+
+/**
+ * One tool call's budget for upstream requests, shared by every read it chains —
+ * the catalog, the structure and its fallback, the data request, the
+ * dimension-group probe, the latest-N re-fetch, and the availability lookups —
+ * and by every retry and backoff inside them. MCP SDK clients abandon a request
+ * after 60 s by default, and four 30 s attempts of one read outlast that, so a
+ * failure the server would have classified reached the caller as a client-side
+ * timeout. 45 s leaves 15 s to decode, stage, and format the response: the
+ * heaviest calls measured (CPI `*.CPI._T.IX.M`, 7.3 MB; IRFCL `*.*.*.D`,
+ * 3.8 MB) spend 8–11 s upstream and 1–2 s after it, and no single request can
+ * succeed past its own 30 s timeout anyway. Not configurable: the 60 s it guards
+ * is the client's, which the server cannot see.
+ */
+export const CALL_BUDGET_MS = 45_000;
+
+/**
+ * The expiry of a call's budget, in the one shape `withRetry` gives its own
+ * deadline expiry, so every path recognizes both alike: thrown when a read
+ * starts with nothing left, before any request is sent.
+ */
+function callBudgetSpent(): McpError {
+  return timeout(`No time is left of the ${CALL_BUDGET_MS / 1000}-second budget for one call.`, {
+    reason: 'retry_deadline_exceeded',
+    deadlineMs: CALL_BUDGET_MS,
+    retryAttempts: 0,
+  });
+}
 
 /**
  * Most codes a dimension may list in an availability constraint — a message-size
@@ -65,6 +110,105 @@ const DATAFLOW_LIST_UNAVAILABLE_MESSAGE =
   'IMF dataflow catalog is unavailable — the upstream SDMX structure endpoint did not return a usable response.';
 const DATAFLOW_LIST_RECOVERY_HINT =
   'Retry in a few moments. The IMF SDMX 3.0 portal is intermittently unavailable; if it keeps failing the upstream service is down.';
+
+/**
+ * Recovery for a `dataflow_not_found` whose message already names the agency and
+ * version the id exists under and how to reach it, so it adds what the message
+ * does not say rather than repeating it.
+ */
+const DATAFLOW_ELSEWHERE_HINT =
+  'The dataflow_id itself is right, so keep it. imf_list_databases with filter set to the id lists every agency and version it is published under.';
+
+/**
+ * Statuses that refuse a request for the length of its request line. The IMF
+ * portal's IIS front end answers an over-long data URL with HTTP 400 and its
+ * "Bad Request - Invalid URL" page (encoded key of 1,531 characters refused,
+ * 1,524 accepted, measured 2026-10-16); 414 and 431 are how a proxy or mirror in
+ * front of it says the same.
+ */
+const URL_TOO_LONG_STATUSES = new Set([414, 431]);
+
+/** Codes a data request fails with when a later attempt or call can succeed. */
+const TRANSIENT_DATA_CODES = new Set([
+  JsonRpcErrorCode.ServiceUnavailable,
+  JsonRpcErrorCode.Timeout,
+  JsonRpcErrorCode.RateLimited,
+]);
+
+/**
+ * The client-facing error for a failed data request. `fetchWithTimeout` names
+ * the request's origin in its message and carries up to 500 bytes of the
+ * upstream page in `data.body`/`data.responseBody`; `IMF_BASE_URL` is
+ * configurable, so neither leaves the server (the full failure is already
+ * logged where it happened).
+ *
+ * Every failure a later call can get past carries a declared reason, one per
+ * code: HTTP 429 is `rate_limited` (`RateLimited`, with the portal's
+ * `Retry-After` when it sent one), and a 5xx, an unreachable portal, a timed-out
+ * attempt, an unusable body, or a spent call budget is `data_unavailable`
+ * (`ServiceUnavailable` — a timeout included, since retrying is the same
+ * remedy). A refusal of the URL's length becomes `key_too_long`. Any other
+ * status — a 401/403/404 reachable only through a misrouted `IMF_BASE_URL`, or
+ * a 501 — keeps its code and status with no reason. Retry attempts carry over
+ * from `withRetry`'s exhausted error. A caller's cancellation outranks all of
+ * it.
+ */
+function dataRequestFailure(err: unknown, signal: AbortSignal | undefined): McpError {
+  if (signal?.aborted) return requestCancelled('IMF data request was cancelled.');
+  const data = err instanceof McpError ? (err.data ?? {}) : {};
+  const status = data.errorSource === 'FetchHttpError' ? Number(data.status) : undefined;
+  if (
+    status !== undefined &&
+    (URL_TOO_LONG_STATUSES.has(status) ||
+      (status === 400 && /Invalid URL/i.test(String(data.body ?? ''))))
+  ) {
+    return new McpError(
+      JsonRpcErrorCode.InvalidParams,
+      `The IMF portal refused the data request because its URL is too long (HTTP ${status}).`,
+      { reason: 'key_too_long', status, retryable: false },
+    );
+  }
+
+  const detail = {
+    ...(status !== undefined ? { status } : {}),
+    ...(data.retryAfter !== undefined ? { retryAfter: data.retryAfter } : {}),
+    ...(data.retryAttempts !== undefined ? { retryAttempts: data.retryAttempts } : {}),
+  };
+  const message =
+    data.reason === 'retry_deadline_exceeded'
+      ? `IMF data request did not finish within the ${CALL_BUDGET_MS / 1000}-second budget for one call.`
+      : status !== undefined
+        ? `IMF data request failed with HTTP ${status}.`
+        : data.errorSource === 'FetchTimeout' || data.errorSource === 'FetchSignalTimeout'
+          ? 'IMF data request timed out.'
+          : data.errorSource === 'FetchNetworkError' ||
+              data.errorSource === 'FetchNetworkErrorWrapper'
+            ? 'IMF data request failed: the portal could not be reached.'
+            : err instanceof McpError
+              ? err.message
+              : 'IMF data request failed before a response arrived.';
+
+  // A raw rejection is a failure no response explains, so it is retried like one.
+  const code = err instanceof McpError ? err.code : JsonRpcErrorCode.ServiceUnavailable;
+  if (!TRANSIENT_DATA_CODES.has(code) || data.retryable === false) {
+    return new McpError(code, message, {
+      ...detail,
+      ...(data.retryable !== undefined ? { retryable: data.retryable } : {}),
+    });
+  }
+  if (code === JsonRpcErrorCode.RateLimited) {
+    return new McpError(JsonRpcErrorCode.RateLimited, message, {
+      reason: 'rate_limited',
+      retryable: true,
+      ...detail,
+    });
+  }
+  return new McpError(JsonRpcErrorCode.ServiceUnavailable, message, {
+    reason: 'data_unavailable',
+    retryable: true,
+    ...detail,
+  });
+}
 
 /**
  * The series-attribute ids that carry unit, scale, and precision, per decoded
@@ -93,7 +237,35 @@ const SERIES_ATTRIBUTE_ALIASES = {
   unit: ['UNIT', 'UNIT_MEASURE'],
   scale: ['SCALE', 'UNIT_MULT'],
   decimals: ['DECIMALS_DISPLAYED', 'DECIMALS', 'DECIMAL_DISPLAYED'],
-} as const satisfies Record<keyof SeriesAttributes, readonly string[]>;
+} as const satisfies Record<GroupedSeriesAttribute, readonly string[]>;
+
+/**
+ * The series-attribute ids that carry a series' reference (base) period, in
+ * precedence order — located by concept, the way unit, scale, and precision
+ * are.
+ *
+ * `CPI` names it `COMMON_REFERENCE_PERIOD`; `PPI`, `PI`, `PI_WCA`, `ITG`, and
+ * `LS` name it `REFERENCE_PERIOD`; `QNEA` and `ANEA` name it
+ * `REFERENCE_PERIOD_REPORTED`. No dataflow declares two of them on the series
+ * row, so the order only fixes how one that later does resolves.
+ *
+ * It is read from the series row alone. `CTOT` declares `REFERENCE_PERIOD` at
+ * dimension-group level and publishes no value for it, so the concept stays out
+ * of the group lookup and of the suppressed-group probe, which could only
+ * spend a request recovering nothing.
+ */
+const REFERENCE_PERIOD_SERIES_ALIASES = [
+  'COMMON_REFERENCE_PERIOD',
+  'REFERENCE_PERIOD',
+  'REFERENCE_PERIOD_REPORTED',
+] as const;
+
+/**
+ * The observation-attribute id that carries one observation's own reference
+ * period. `CPI` and `GS_LEPM` publish it there, where it can vary within a
+ * series whose series-level value reads `Multiple`.
+ */
+const REFERENCE_PERIOD_OBSERVATION_ID = 'REFERENCE_PERIOD';
 
 /**
  * Position of the first alias present in a payload's series attribute
@@ -235,12 +407,34 @@ interface GroupAttributeOverlay {
 }
 
 /** Recovered group attributes, per concept. Absent concepts were not recovered. */
-type DimensionGroupOverlay = Partial<Record<keyof SeriesAttributes, GroupAttributeOverlay>>;
+type DimensionGroupOverlay = Partial<Record<GroupedSeriesAttribute, GroupAttributeOverlay>>;
+
+/**
+ * What the group probe settled to: the values it recovered, if any, or — when
+ * it fired and no probe response was read — the concepts it left unrecovered.
+ * A probe that answered with nothing yields neither, since that answer is the
+ * fact that the dataflow publishes no value.
+ */
+interface GroupProbeOutcome {
+  overlay?: DimensionGroupOverlay;
+  unresolved?: UnresolvedGroupAttributes;
+}
 
 /** Every decoded concept, typed so a lookup over the alias table stays exhaustive. */
-const SERIES_ATTRIBUTE_CONCEPTS = Object.keys(SERIES_ATTRIBUTE_ALIASES) as Array<
-  keyof SeriesAttributes
->;
+const SERIES_ATTRIBUTE_CONCEPTS = Object.keys(SERIES_ATTRIBUTE_ALIASES) as GroupedSeriesAttribute[];
+
+/**
+ * One attribute cell as the code it carries: a coded cell is a JSON number
+ * indexing the definition's `values` and resolves to that code's id, while an
+ * uncoded one is the literal itself. Null when the cell is absent or null.
+ */
+function codeOrLiteral(
+  cell: string | number | null | undefined,
+  codes: SdmxAttributeDef['values'],
+): string | null {
+  if (cell == null) return null;
+  return codes?.[Number.parseInt(String(cell), 10)]?.id ?? String(cell);
+}
 
 /** Digit count from an already-resolved attribute value, or null when it is not a number. */
 function toDecimals(value: string | null): number | null {
@@ -271,9 +465,7 @@ function toDecimals(value: string | null): number | null {
  * A definition without a relationship is skipped: nothing then says which slots
  * of a group key describe it, so a differently-shaped request cannot help.
  */
-function suppressedGroupConcepts(
-  structure: SdmxStructure | undefined,
-): Array<keyof SeriesAttributes> {
+function suppressedGroupConcepts(structure: SdmxStructure | undefined): GroupedSeriesAttribute[] {
   const defs = structure?.attributes?.dimensionGroup ?? [];
   if (defs.length === 0) return [];
   return SERIES_ATTRIBUTE_CONCEPTS.filter((concept) => {
@@ -286,7 +478,7 @@ function suppressedGroupConcepts(
 /** Ids of every dimension the given suppressed groups are declared against. */
 function suppressedGroupDimensions(
   structure: SdmxStructure | undefined,
-  concepts: Array<keyof SeriesAttributes>,
+  concepts: GroupedSeriesAttribute[],
 ): Set<string> {
   const defs = structure?.attributes?.dimensionGroup ?? [];
   return new Set(
@@ -323,7 +515,7 @@ function suppressedGroupDimensions(
 function plusOnGroupDimension(
   key: string,
   structure: SdmxStructure | undefined,
-  concepts: Array<keyof SeriesAttributes>,
+  concepts: GroupedSeriesAttribute[],
 ): boolean {
   const segments = key.split('.');
   const seriesDims = structure?.dimensions?.series ?? [];
@@ -351,14 +543,14 @@ function plusOnGroupDimension(
  * Dimensions the suppressed groups are declared against are excluded, since
  * widening one of those multiplies the group rows themselves rather than just
  * the series. Returns undefined when no other position has a resolved codelist
- * to size — the query then answers exactly as it does without the probe.
+ * to size — the probe then fails before it is sent.
  */
 function widenedProbeKey(
   key: string,
   dimensions: Dimension[],
   structure: SdmxStructure | undefined,
-  concepts: Array<keyof SeriesAttributes>,
-): string | undefined {
+  concepts: GroupedSeriesAttribute[],
+): { dimension: string; key: string } | undefined {
   const segments = key.split('.');
   if (segments.length !== dimensions.length) return;
 
@@ -375,7 +567,10 @@ function widenedProbeKey(
   }
   if (position < 0) return;
 
-  return segments.map((segment, index) => (index === position ? '*' : segment)).join('.');
+  return {
+    dimension: dimensions[position]?.id ?? '',
+    key: segments.map((segment, index) => (index === position ? '*' : segment)).join('.'),
+  };
 }
 
 /** An SDMX artefact reference: the agency / id / version triple a URN encodes. */
@@ -426,13 +621,79 @@ function parseConceptUrn(
   return { agencyId, schemeId, conceptId };
 }
 
+/**
+ * Whether a catalog identifier matches a caller's, trimmed and
+ * case-insensitively. An absent caller value matches anything. In the catalog
+ * as of 2026-10, no two agency ids or versions differ only by case.
+ */
+function matchesLoosely(catalogValue: string, wanted: string | undefined): boolean {
+  return wanted == null || catalogValue.toLowerCase() === wanted.trim().toLowerCase();
+}
+
 export class ImfSdmxService {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
+  /**
+   * When each call's budget started, keyed on the call's own Context — every
+   * tool and resource call gets a fresh one, so the first upstream read a call
+   * makes starts its clock and every later read draws on what is left. Held
+   * weakly, so an entry goes with its call.
+   */
+  private readonly callStartedAt = new WeakMap<Context, number>();
 
   constructor(_config: AppConfig, _storage: StorageService, baseUrl: string, timeoutMs: number) {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.timeoutMs = timeoutMs;
+  }
+
+  /** What is left of this call's {@link CALL_BUDGET_MS}, starting the clock on first use. */
+  private remainingBudgetMs(ctx: Context): number {
+    let startedAt = this.callStartedAt.get(ctx);
+    if (startedAt === undefined) {
+      startedAt = Date.now();
+      this.callStartedAt.set(ctx, startedAt);
+    }
+    return Math.max(0, CALL_BUDGET_MS - (Date.now() - startedAt));
+  }
+
+  /**
+   * One upstream read under `withRetry`, bounded by what is left of the call's
+   * budget: that remainder is the ladder's deadline, and each attempt's timeout
+   * is the per-request timeout or the remainder, whichever is shorter. A read
+   * that starts with nothing left sends no request. `signal` is the caller's;
+   * a cancellation on it outranks the budget and is never relabelled as one.
+   */
+  private readWithRetry<T>(
+    ctx: Context,
+    operation: string,
+    signal: AbortSignal | undefined,
+    read: (signal: AbortSignal, timeoutMs: number) => Promise<T>,
+  ): Promise<T> {
+    const deadlineMs = this.remainingBudgetMs(ctx);
+    if (deadlineMs === 0) return Promise.reject(callBudgetSpent());
+    return withRetry(
+      ({ signal: attemptSignal, remainingMs }) =>
+        read(attemptSignal, Math.min(this.timeoutMs, remainingMs)),
+      {
+        operation,
+        context: ctx,
+        maxRetries: 3,
+        baseDelayMs: 1000,
+        deadlineMs,
+        ...(signal ? { signal } : {}),
+      },
+    );
+  }
+
+  /**
+   * The timeout for a single, unretried request: its own cap, the per-request
+   * timeout, or what is left of the call's budget, whichever is shortest.
+   * Throws the budget's expiry when nothing is left, before a request is sent.
+   */
+  private singleRequestTimeoutMs(ctx: Context, capMs: number): number {
+    const remaining = this.remainingBudgetMs(ctx);
+    if (remaining === 0) throw callBudgetSpent();
+    return Math.min(this.timeoutMs, capMs, remaining);
   }
 
   // ---------------------------------------------------------------------------
@@ -457,26 +718,24 @@ export class ImfSdmxService {
      */
     let raw: SdmxStructureResponse;
     try {
-      raw = await withRetry(
-        async () => {
+      raw = await this.readWithRetry(
+        ctx,
+        'ImfSdmxService.fetchDataflows',
+        ctx.signal,
+        async (signal, timeoutMs) => {
           const url = `${this.baseUrl}/structure/dataflow`;
-          ctx.log.debug('Fetching dataflow list', { url });
-          const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
+          ctx.log.debug('Fetching dataflow list');
+          const response = await fetchWithTimeout(url, timeoutMs, ctx, {
             headers: { Accept: 'application/json' },
-            signal: ctx.signal,
+            signal,
           });
           const text = await response.text();
           return this.parseJson<SdmxStructureResponse>(text, 'dataflow list');
         },
-        {
-          operation: 'ImfSdmxService.fetchDataflows',
-          context: ctx,
-          maxRetries: 3,
-          baseDelayMs: 1000,
-          signal: ctx.signal,
-        },
       );
     } catch (err: unknown) {
+      // A caller's cancellation is not an unavailable catalog.
+      if (ctx.signal.aborted) throw err;
       // Upstream detail stays server-side; only the controlled message goes out.
       ctx.log.error(
         'Dataflow list fetch failed',
@@ -484,6 +743,7 @@ export class ImfSdmxService {
       );
       throw serviceUnavailable(DATAFLOW_LIST_UNAVAILABLE_MESSAGE, {
         reason: 'dataflow_list_unavailable',
+        retryable: true,
         recovery: { hint: DATAFLOW_LIST_RECOVERY_HINT },
       });
     }
@@ -497,7 +757,9 @@ export class ImfSdmxService {
   /**
    * Find a dataflow by id, optionally constraining by agencyId/version. The id is
    * trimmed and matched case-insensitively (the portal itself is case-sensitive),
-   * with an exact spelling preferred; callers use the returned `id` downstream.
+   * with an exact spelling preferred; agencyId and version are trimmed and
+   * matched case-insensitively too. Callers use the returned entry's spellings
+   * downstream.
    */
   async findDataflow(
     dataflowId: string,
@@ -508,14 +770,45 @@ export class ImfSdmxService {
     const all = await this.fetchDataflows(ctx);
     const wanted = dataflowId.trim();
     const inScope = all.filter(
-      (df) =>
-        (agencyId == null || df.agencyId === agencyId) &&
-        (version == null || df.version === version),
+      (df) => matchesLoosely(df.agencyId, agencyId) && matchesLoosely(df.version, version),
     );
     return (
-      inScope.find((df) => df.id === wanted) ??
-      inScope.find((df) => df.id.toLowerCase() === wanted.toLowerCase())
+      inScope.find((df) => df.id === wanted) ?? inScope.find((df) => matchesLoosely(df.id, wanted))
     );
+  }
+
+  /**
+   * The not-found message for a findDataflow() miss. When the id exists under
+   * another agency or version, the message names where, so the caller corrects
+   * the constraint instead of the id — and `hint` replaces the tools' static
+   * recovery, whose "omit agency_id and version" the message already says.
+   */
+  async describeDataflowMiss(
+    dataflowId: string,
+    agencyId: string | undefined,
+    version: string | undefined,
+    ctx: Context,
+  ): Promise<DataflowMiss> {
+    const notFound = `Dataflow '${dataflowId}' not found`;
+    const variants = (await this.fetchDataflows(ctx)).filter((df) =>
+      matchesLoosely(df.id, dataflowId),
+    );
+    const [first] = variants;
+    if (!first) return { message: notFound };
+
+    const constraint = [
+      ...(agencyId !== undefined ? [`agency_id '${agencyId.trim()}'`] : []),
+      ...(version !== undefined ? [`version '${version.trim()}'`] : []),
+    ].join(' and ');
+    const where = variants.map((df) => `${df.agencyId} ${df.version}`).join(', ');
+    const fix =
+      variants.length === 1
+        ? 'omit agency_id and version to use it'
+        : `pass one of these, or omit agency_id and version for ${first.agencyId} ${first.version}`;
+    return {
+      message: `${notFound} under ${constraint}. It exists under ${where} — ${fix}.`,
+      hint: DATAFLOW_ELSEWHERE_HINT,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -536,13 +829,16 @@ export class ImfSdmxService {
       return cached;
     }
 
-    const raw = await withRetry(
-      async () => {
+    const raw = await this.readWithRetry(
+      ctx,
+      'ImfSdmxService.fetchDataStructure',
+      ctx.signal,
+      async (signal, timeoutMs) => {
         const url = `${this.baseUrl}/structure/datastructure/${encodeURIComponent(agencyId)}/${encodeURIComponent(dsdId)}/${encodeURIComponent(version)}?references=all`;
-        ctx.log.debug('Fetching data structure', { url });
-        const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
+        ctx.log.debug('Fetching data structure', { agencyId, dsdId, version });
+        const response = await fetchWithTimeout(url, timeoutMs, ctx, {
           headers: { Accept: 'application/json' },
-          signal: ctx.signal,
+          signal,
         });
         // HTTP 204 (or an empty body) means the DSD id does not exist — a
         // definitive miss, not a transient error. Opt out of retry (retryable:
@@ -556,13 +852,6 @@ export class ImfSdmxService {
           });
         }
         return this.parseJson<SdmxStructureResponse>(text, 'data structure');
-      },
-      {
-        operation: 'ImfSdmxService.fetchDataStructure',
-        context: ctx,
-        maxRetries: 3,
-        baseDelayMs: 1000,
-        signal: ctx.signal,
       },
     );
 
@@ -605,19 +894,26 @@ export class ImfSdmxService {
     const fallback = () =>
       this.fetchDataflowStructureFallback(id, dataflow.agencyId, dataflow.version, ctx);
 
+    // A caller's cancellation is not an unavailable structure: it skips the
+    // fallback and leaves both catches untouched.
     let structure: DataflowStructure | undefined;
     try {
       structure = dsdRef
         ? await this.fetchDataStructure(dsdRef.agencyId, dsdRef.id, dsdRef.version, ctx).catch(
-            fallback,
+            (err: unknown) => {
+              if (ctx.signal.aborted) throw err;
+              return fallback();
+            },
           )
         : await fallback();
-    } catch {
+    } catch (err: unknown) {
+      if (ctx.signal.aborted) throw err;
       // Both primary and fallback DSD fetch failed; throw a controlled message
       // (the raw McpError would carry the upstream URL path in its message).
       throw serviceUnavailable(`Structure unavailable for dataflow '${id}'`, {
         reason: 'structure_unavailable',
         dataflowId: id,
+        retryable: true,
       });
     }
 
@@ -625,6 +921,7 @@ export class ImfSdmxService {
       throw serviceUnavailable(`Structure unavailable for dataflow '${id}'`, {
         reason: 'structure_unavailable',
         dataflowId: id,
+        retryable: true,
       });
     }
 
@@ -657,23 +954,19 @@ export class ImfSdmxService {
     const cached = await ctx.state.get<DataflowStructure>(cacheKey);
     if (cached) return cached;
 
-    const raw = await withRetry(
-      async () => {
+    const raw = await this.readWithRetry(
+      ctx,
+      'ImfSdmxService.fetchDataflowStructureFallback',
+      ctx.signal,
+      async (signal, timeoutMs) => {
         const url = `${this.baseUrl}/structure/dataflow/${encodeURIComponent(agencyId)}/${encodeURIComponent(dataflowId)}/${encodeURIComponent(version)}?references=all`;
-        ctx.log.debug('Fetching dataflow structure (fallback)', { url });
-        const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
+        ctx.log.debug('Fetching dataflow structure (fallback)', { agencyId, dataflowId, version });
+        const response = await fetchWithTimeout(url, timeoutMs, ctx, {
           headers: { Accept: 'application/json' },
-          signal: ctx.signal,
+          signal,
         });
         const text = await response.text();
         return this.parseJson<SdmxStructureResponse>(text, 'dataflow structure (fallback)');
-      },
-      {
-        operation: 'ImfSdmxService.fetchDataflowStructureFallback',
-        context: ctx,
-        maxRetries: 3,
-        baseDelayMs: 1000,
-        signal: ctx.signal,
       },
     );
 
@@ -714,27 +1007,25 @@ export class ImfSdmxService {
     const qs = qsStr ? `?${qsStr}` : '';
 
     const effectiveSignal = signal ?? ctx.signal;
-    const raw = await withRetry(
-      async () => {
+    const raw = await this.readWithRetry(
+      ctx,
+      'ImfSdmxService.fetchData',
+      effectiveSignal,
+      async (attemptSignal, timeoutMs) => {
         const url = `${this.baseUrl}/data/dataflow/${encodeURIComponent(agencyId)}/${encodeURIComponent(dataflowId)}/${encodeURIComponent(version)}/${encodeURIComponent(key)}${qs}`;
-        ctx.log.debug('Fetching data', { url });
-        const response = await fetchWithTimeout(url, this.timeoutMs, ctx, {
+        ctx.log.debug('Fetching data', { agencyId, dataflowId, version, key, query: qsStr });
+        const response = await fetchWithTimeout(url, timeoutMs, ctx, {
           headers: { Accept: 'application/json' },
-          signal: effectiveSignal,
+          signal: attemptSignal,
         });
         const text = await response.text();
         return this.parseJson<SdmxDataResponse>(text, 'data query');
       },
-      {
-        operation: 'ImfSdmxService.fetchData',
-        context: ctx,
-        maxRetries: 3,
-        baseDelayMs: 1000,
-        signal: effectiveSignal,
-      },
-    );
+    ).catch((err: unknown) => {
+      throw dataRequestFailure(err, effectiveSignal);
+    });
 
-    const overlay = await this.fetchGroupAttributeOverlay(
+    const probe = await this.fetchGroupAttributeOverlay(
       raw,
       agencyId,
       dataflowId,
@@ -744,7 +1035,10 @@ export class ImfSdmxService {
       effectiveSignal,
     );
 
-    return this.decodeObservations(raw, dataflowId, key, startPeriod, endPeriod, overlay);
+    return {
+      ...this.decodeObservations(raw, dataflowId, key, startPeriod, endPeriod, probe.overlay),
+      ...(probe.unresolved ? { unresolvedAttributes: probe.unresolved } : {}),
+    };
   }
 
   /**
@@ -754,15 +1048,21 @@ export class ImfSdmxService {
    * The response cannot be repaired after the fact — the values are simply not
    * in it — so the only recovery is a differently-shaped request. This one is
    * shaped to carry the attributes and nothing else: a single GET, no retry,
-   * its own short timeout, `ATTRIBUTES_ONLY_QUERY` so no observation comes
+   * its own short timeout cut to what is left of the call's budget,
+   * `ATTRIBUTES_ONLY_QUERY` so no observation comes
    * back, and the cheapest position to widen (see `widenedProbeKey`). Measured
    * live, it adds ~6.5 KB and ~0.25 s on `WEO` and ~4 KB on `PPI`, to queries
    * that would otherwise report no unit at all.
    *
-   * Every exit is the query answering as it does today. A probe that fails,
-   * times out, is aborted, or comes back with nothing returns undefined, and
-   * the concepts stay `null` — it is an addition to the success path, so it may
-   * never turn one into a failure.
+   * It is an addition to the success path, so it may never turn one into a
+   * failure: every exit keeps the query's observations, and the concepts it
+   * does not recover stay `null`. What separates the exits is whether a probe
+   * response was read. One that answered with nothing confirms the dataflow
+   * publishes no value, and reports nothing. Any other exit once the probe
+   * fires — a structure that will not resolve, no position to widen, a non-200,
+   * a timeout, a spent call budget, an unparseable body — leaves the null unexplained, so it is
+   * reported as `unresolved`, with the widened key when one was built. A
+   * cancellation by the caller is not a probe outcome and is rethrown.
    *
    * It fires only for the shape it can fix. A key that already carries a `*` is
    * already the shape the probe would build, so its response is as complete as
@@ -782,31 +1082,37 @@ export class ImfSdmxService {
     key: string,
     ctx: Context,
     signal?: AbortSignal,
-  ): Promise<DimensionGroupOverlay | undefined> {
-    if (key.includes('*')) return;
+  ): Promise<GroupProbeOutcome> {
+    if (key.includes('*')) return {};
 
     const dataStructure = raw.data?.structures?.[0];
     const concepts = suppressedGroupConcepts(dataStructure);
-    if (concepts.length === 0) return;
-    if (!plusOnGroupDimension(key, dataStructure, concepts)) return;
+    if (concepts.length === 0) return {};
+    if (!plusOnGroupDimension(key, dataStructure, concepts)) return {};
     // Last, because it is the only guard that walks the payload: a wide + key
     // resolves to thousands of series, and the cheap tests above have already
     // rejected every response shape but the one this can repair.
-    if (Object.keys(raw.data?.dataSets?.[0]?.series ?? {}).length === 0) return;
+    if (Object.keys(raw.data?.dataSets?.[0]?.series ?? {}).length === 0) return {};
 
+    let widened: ReturnType<typeof widenedProbeKey>;
     try {
       const structure = await this.fetchDataflowStructure(dataflowId, agencyId, version, ctx);
-      const probeKey = widenedProbeKey(key, structure.dimensions, dataStructure, concepts);
-      if (!probeKey) return;
+      widened = widenedProbeKey(key, structure.dimensions, dataStructure, concepts);
+      if (!widened) {
+        ctx.log.debug('Dimension-group probe not sent: no position to widen', { dataflowId });
+        return { unresolved: { concepts } };
+      }
+      const probeKey = widened.key;
 
       const url = `${this.baseUrl}/data/dataflow/${encodeURIComponent(agencyId)}/${encodeURIComponent(dataflowId)}/${encodeURIComponent(version)}/${encodeURIComponent(probeKey)}?${ATTRIBUTES_ONLY_QUERY}`;
       ctx.log.debug('Probing for suppressed dimension-group attributes', {
-        url,
+        dataflowId,
+        probeKey,
         concepts,
       });
       const response = await fetchWithTimeout(
         url,
-        Math.min(this.timeoutMs, GROUP_PROBE_TIMEOUT_MS),
+        this.singleRequestTimeoutMs(ctx, GROUP_PROBE_TIMEOUT_MS),
         ctx,
         {
           headers: { Accept: 'application/json' },
@@ -817,13 +1123,24 @@ export class ImfSdmxService {
         await response.text(),
         'dimension-group probe',
       );
-      return this.buildGroupOverlay(probe, concepts);
+      const overlay = this.buildGroupOverlay(probe, concepts);
+      return overlay ? { overlay } : {};
     } catch (err: unknown) {
-      ctx.log.debug('Dimension-group probe returned nothing usable', {
+      if (signal?.aborted) throw requestCancelled('IMF data request was cancelled.');
+      // ctx.log reaches the client, so the failure is named by kind and status,
+      // never by the fetch error's message, which carries the upstream origin.
+      ctx.log.debug('Dimension-group probe failed; attributes left unresolved', {
         dataflowId,
-        error: err instanceof Error ? err.message : String(err),
+        ...(err instanceof McpError
+          ? { errorCode: err.code, errorSource: err.data?.errorSource, status: err.data?.status }
+          : { errorName: err instanceof Error ? err.name : typeof err }),
       });
-      return;
+      return {
+        unresolved: {
+          concepts,
+          ...(widened ? { widenedKey: widened.key, widenedDimension: widened.dimension } : {}),
+        },
+      };
     }
   }
 
@@ -844,7 +1161,7 @@ export class ImfSdmxService {
    */
   private buildGroupOverlay(
     raw: SdmxDataResponse,
-    concepts: Array<keyof SeriesAttributes>,
+    concepts: GroupedSeriesAttribute[],
   ): DimensionGroupOverlay | undefined {
     const structure = raw.data?.structures?.[0];
     const defs = structure?.attributes?.dimensionGroup ?? [];
@@ -922,7 +1239,8 @@ export class ImfSdmxService {
    * cube region for both, while the unscoped one reports the dataflow's own total
    * and the codes that do have data.
    *
-   * Never throws — returns null on any failure so callers can degrade gracefully.
+   * Returns null on any failure so callers can degrade gracefully — except a
+   * caller's cancellation, which is rethrown untouched rather than read as a miss.
    */
   async fetchAvailabilityConstraint(
     dataflow: DataflowRef,
@@ -940,7 +1258,7 @@ export class ImfSdmxService {
     try {
       const response = await fetchWithTimeout(
         url,
-        Math.min(this.timeoutMs, 10_000), // cap availability lookup at 10s
+        this.singleRequestTimeoutMs(ctx, AVAILABILITY_TIMEOUT_MS),
         ctx,
         {
           headers: { Accept: 'application/xml, text/xml' },
@@ -951,7 +1269,8 @@ export class ImfSdmxService {
       // fetchWithTimeout throws on any non-2xx, so a returned response is always ok.
       const xml = await response.text();
       return this.parseAvailabilityXml(xml);
-    } catch {
+    } catch (err: unknown) {
+      if (ctx.signal.aborted) throw err;
       return null;
     }
   }
@@ -979,10 +1298,15 @@ export class ImfSdmxService {
     const effectiveSignal = signal ?? ctx.signal;
 
     try {
-      const response = await fetchWithTimeout(url, Math.min(this.timeoutMs, 10_000), ctx, {
-        headers: { Accept: 'application/xml, text/xml' },
-        signal: effectiveSignal,
-      });
+      const response = await fetchWithTimeout(
+        url,
+        this.singleRequestTimeoutMs(ctx, AVAILABILITY_TIMEOUT_MS),
+        ctx,
+        {
+          headers: { Accept: 'application/xml, text/xml' },
+          signal: effectiveSignal,
+        },
+      );
 
       const availability = this.parseDataflowAvailabilityXml(await response.text());
       if (!availability) throw new Error('Availability response was not a usable SDMX constraint');
@@ -990,6 +1314,8 @@ export class ImfSdmxService {
       await ctx.state.set(cacheKey, availability, { ttl: DATAFLOW_AVAILABILITY_CACHE_TTL });
       return availability;
     } catch (err: unknown) {
+      // A caller's cancellation is not unavailable coverage.
+      if (ctx.signal.aborted) throw err;
       ctx.log.error(
         'Dataflow availability fetch failed',
         err instanceof Error ? err : new Error(String(err)),
@@ -1316,15 +1642,20 @@ export class ImfSdmxService {
     const obsAttrs = structure?.attributes?.observation ?? [];
     const groupAttrs = structure?.attributes?.dimensionGroup ?? [];
 
-    // Find STATUS attribute index in observation attributes
+    // Observation attributes read per observation: STATUS, and the observation's
+    // own reference period.
     const statusObsIdx = obsAttrs.findIndex((a) => a.id === 'STATUS');
     const statusCodes = obsAttrs[statusObsIdx]?.values;
+    const refPeriodObsIdx = obsAttrs.findIndex((a) => a.id === REFERENCE_PERIOD_OBSERVATION_ID);
+    const refPeriodObsCodes = obsAttrs[refPeriodObsIdx]?.values;
 
     // Find attribute indices in series attributes, across every id the portal
     // spells each attribute with (see SERIES_ATTRIBUTE_ALIASES).
     const unitIdx = findSeriesAttrIndex(seriesAttrs, SERIES_ATTRIBUTE_ALIASES.unit);
     const scaleIdx = findSeriesAttrIndex(seriesAttrs, SERIES_ATTRIBUTE_ALIASES.scale);
     const decimalsIdx = findSeriesAttrIndex(seriesAttrs, SERIES_ATTRIBUTE_ALIASES.decimals);
+    const refPeriodIdx = findSeriesAttrIndex(seriesAttrs, REFERENCE_PERIOD_SERIES_ALIASES);
+    const refPeriodCodes = seriesAttrs[refPeriodIdx]?.values;
 
     // Series-level dimensions for decoding the colon-separated series key ("0:0:0").
     const seriesDims = structure?.dimensions?.series ?? [];
@@ -1356,7 +1687,7 @@ export class ImfSdmxService {
      * series dimensions, since the overlay is addressed by dimension id and
      * code — the two responses order their `values` lists independently.
      */
-    const overlayPositions = new Map<keyof SeriesAttributes, number[]>();
+    const overlayPositions = new Map<GroupedSeriesAttribute, number[]>();
     if (overlay) {
       const seriesDimIds = seriesDims.map((dim) => dim.id);
       for (const concept of SERIES_ATTRIBUTE_CONCEPTS) {
@@ -1367,7 +1698,7 @@ export class ImfSdmxService {
         overlayPositions.set(concept, positions);
       }
     }
-    const overlayValueOf = (concept: keyof SeriesAttributes, codeParts: string[]) => {
+    const overlayValueOf = (concept: GroupedSeriesAttribute, codeParts: string[]) => {
       const positions = overlayPositions.get(concept);
       if (!positions) return null;
       return (
@@ -1444,6 +1775,12 @@ export class ImfSdmxService {
           ) ??
           toDecimals(overlayValueOf('decimals', seriesCodeParts)),
       };
+      // Series row only, and present only when the row carries one.
+      const referencePeriod = codeOrLiteral(
+        refPeriodIdx >= 0 ? attrs[refPeriodIdx] : undefined,
+        refPeriodCodes,
+      );
+      if (referencePeriod != null) decodedAttributes.reference_period = referencePeriod;
       seriesAttributesByKey[decodedSeriesKey] = decodedAttributes;
       // First write wins. Counting the map's keys here instead made the decode
       // quadratic in series count — a `*` key on a wide dataflow resolves to
@@ -1463,15 +1800,25 @@ export class ImfSdmxService {
          * `values` when it has them, and as the literal the cell carries when it
          * does not. Every dataflow checked that declares STATUS ships it uncoded
          * (`[null, null, 0, "T"]`), so reading only the coded form reported
-         * `null` for every flag. A coded cell arrives as a JSON number.
+         * `null` for every flag. The observation's reference period resolves the
+         * same way, and is never filled in from the series row.
          */
-        const statusCell = statusObsIdx >= 0 ? obsValues?.[statusObsIdx + 1] : undefined;
-        const status =
-          statusCell == null
-            ? null
-            : (statusCodes?.[Number.parseInt(String(statusCell), 10)]?.id ?? String(statusCell));
+        const status = codeOrLiteral(
+          statusObsIdx >= 0 ? obsValues?.[statusObsIdx + 1] : undefined,
+          statusCodes,
+        );
+        const referencePeriod = codeOrLiteral(
+          refPeriodObsIdx >= 0 ? obsValues?.[refPeriodObsIdx + 1] : undefined,
+          refPeriodObsCodes,
+        );
 
-        observations.push({ series_key: decodedSeriesKey, time_period: timePeriod, value, status });
+        observations.push({
+          series_key: decodedSeriesKey,
+          time_period: timePeriod,
+          value,
+          status,
+          ...(referencePeriod != null ? { reference_period: referencePeriod } : {}),
+        });
       }
     }
 

@@ -17,9 +17,10 @@
  * because the key combines codes with `+` on a dimension it is declared against
  * is recovered by one bounded attributes-only request under a wildcard key —
  * and every other key shape, including the many dataflows that declare a unit
- * and publish none, still costs exactly one request), and #57 (an observation's
+ * and publish none, still costs exactly one request), #57 (an observation's
  * STATUS resolves through its `values` when coded and as the inline literal
- * when not).
+ * when not), and #62 (a group probe that fails before its response is read
+ * reports the concepts it left null, while one that answered empty does not).
  *
  * Fixtures are modeled on the live api.imf.org SDMX 3.0 response shapes: dataflow
  * `structure` is a URN string; `localRepresentation.enumeration` is a Codelist URN
@@ -39,7 +40,7 @@ import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { fetchWithTimeout } = vi.hoisted(() => ({ fetchWithTimeout: vi.fn() }));
 vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => {
@@ -1112,6 +1113,72 @@ describe('ImfSdmxService.fetchDataflowStructure', () => {
 
     expect((await svc.findDataflow('AB', undefined, undefined, ctx))?.name).toBe('Upper');
     expect((await svc.findDataflow('Ab', undefined, undefined, ctx))?.name).toBe('Mixed');
+  });
+
+  // -- #67: agency and version resolve trimmed and case-insensitively -----------
+
+  it('#67 findDataflow matches agency_id and version trimmed and case-insensitively', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    for (const [agencyId, version] of [
+      ['imf.sta', undefined],
+      [' IMF.STA ', ' 13.0.0 '],
+      [undefined, '13.0.0'],
+    ] as const) {
+      expect(await svc.findDataflow('IIP', agencyId, version, ctx)).toMatchObject({
+        id: 'IIP',
+        agencyId: 'IMF.STA',
+        version: '13.0.0',
+      });
+    }
+    // A constraint that names no catalog entry still misses.
+    expect(await svc.findDataflow('IIP', 'imf.res', undefined, ctx)).toBeUndefined();
+    expect(await svc.findDataflow('IIP', undefined, '13.0.1', ctx)).toBeUndefined();
+  });
+
+  it('#67 describeDataflowMiss names the agency and version(s) a dataflow_id exists under', async () => {
+    fetchWithTimeout.mockImplementation((url: string) =>
+      Promise.resolve(
+        new URL(url).pathname.endsWith('/structure/dataflow')
+          ? mkResp(200, {
+              data: {
+                dataflows: [
+                  { id: 'WEO', agencyID: 'IMF.RES', version: '9.0.0', names: { en: 'WEO' } },
+                  { id: 'GPT', agencyID: 'IMF.SPR', version: '1.0.1', names: { en: 'GPT' } },
+                  { id: 'GPT', agencyID: 'IMF.SPR', version: '1.0.0', names: { en: 'GPT' } },
+                ],
+              },
+            })
+          : route(url),
+      ),
+    );
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const elsewhere = await svc.describeDataflowMiss('WEO', undefined, ' 9.0.1 ', ctx);
+    expect(elsewhere.message).toBe(
+      "Dataflow 'WEO' not found under version '9.0.1'. It exists under IMF.RES 9.0.0 — omit agency_id and version to use it.",
+    );
+    expect((await svc.describeDataflowMiss('weo', 'IMF.STA', undefined, ctx)).message).toBe(
+      "Dataflow 'weo' not found under agency_id 'IMF.STA'. It exists under IMF.RES 9.0.0 — omit agency_id and version to use it.",
+    );
+    const versions = await svc.describeDataflowMiss('GPT', 'IMF.SPR', '2.0.0', ctx);
+    expect(versions.message).toBe(
+      "Dataflow 'GPT' not found under agency_id 'IMF.SPR' and version '2.0.0'. It exists under IMF.SPR 1.0.1, IMF.SPR 1.0.0 — pass one of these, or omit agency_id and version for IMF.SPR 1.0.1.",
+    );
+    // An id the catalog lacks entirely keeps the plain message, and the declared recovery.
+    expect(await svc.describeDataflowMiss('NOPE', undefined, '9.0.0', ctx)).toEqual({
+      message: "Dataflow 'NOPE' not found",
+    });
+    expect(await svc.describeDataflowMiss('NOPE', undefined, undefined, ctx)).toEqual({
+      message: "Dataflow 'NOPE' not found",
+    });
+
+    // A miss the message already explains carries a hint that does not repeat its fix.
+    for (const miss of [elsewhere, versions]) {
+      expect(miss.hint).toBe(
+        'The dataflow_id itself is right, so keep it. imf_list_databases with filter set to the id lists every agency and version it is published under.',
+      );
+    }
   });
 
   it('#52 fetchDataflowStructure returns the catalog spelling, not the argument', async () => {
@@ -2828,6 +2895,37 @@ describe('ImfSdmxService.fetchData suppressed dimension groups (#34)', () => {
     expect(probeRequests()).toHaveLength(1);
   });
 
+  it('#69 logs a failed probe by kind and status, never by the upstream origin or page', async () => {
+    serve(weo34Suppressed(), weo34Probe());
+    const served = fetchWithTimeout.getMockImplementation()!;
+    fetchWithTimeout.mockImplementation((url: string) =>
+      url.includes('measures=none') ? Promise.reject(leakyFetchError(url)) : served(url),
+    );
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const result = await svc.fetchData(
+      'IMF.RES',
+      'WEO',
+      '9.0.0',
+      'USA.NGDP_RPCH+NGDPD.A',
+      undefined,
+      undefined,
+      ctx,
+    );
+    // ctx.log reaches the client as notifications/message.
+    const logged = (ctx.log as unknown as { calls: Array<{ msg: string; data?: unknown }> }).calls;
+    const probeLog = logged.find((call) => call.msg.startsWith('Dimension-group probe'));
+
+    expect(result.observations).toHaveLength(2);
+    expect(probeLog?.data).toMatchObject({
+      errorCode: JsonRpcErrorCode.NotFound,
+      errorSource: 'FetchHttpError',
+      status: 404,
+    });
+    expect(JSON.stringify(probeLog)).not.toContain('api.imf.org');
+    expect(JSON.stringify(probeLog)).not.toContain('Resource not found');
+  });
+
   it('answers the query when the structure the widen position is sized against does not resolve', async () => {
     fetchWithTimeout.mockImplementation((url: string) => {
       requested.push(url);
@@ -2890,6 +2988,261 @@ describe('ImfSdmxService.fetchData suppressed dimension groups (#34)', () => {
     const result = await query('USA.NGDP_RPCH+NGDPD.A');
 
     expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBe('XDC');
+  });
+});
+
+// --- #62: a probe that fails is disclosed; one that answered empty stays silent ---
+
+describe('ImfSdmxService.fetchData failed group probe (#62)', () => {
+  const BASE_URL = 'https://api.imf.org/external/sdmx/3.0';
+  const ORIGIN = new URL(BASE_URL).origin;
+  let svc: ImfSdmxService;
+  let probeCalls: number;
+  let dataCalls: number;
+
+  /**
+   * Runs the framework's real fetchWithTimeout — its status mapping, timeout,
+   * and abort classification are what the probe's catch sees — against a
+   * stubbed global fetch that serves the catalog, the DSD, the data request,
+   * and the attributes-only probe, routed by origin and path.
+   */
+  const serve = (options: {
+    main: unknown;
+    probe: (init?: RequestInit) => Promise<Response>;
+    dsd?: unknown;
+  }) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        if (url.origin !== ORIGIN) {
+          return Promise.reject(new Error(`unexpected fetch to ${url.origin}`));
+        }
+        const json = (body: unknown) =>
+          Promise.resolve(new Response(JSON.stringify(body), { status: 200 }));
+        if (url.pathname.includes('/structure/datastructure/')) {
+          return json(options.dsd ?? WEO34_DSD);
+        }
+        if (/\/structure\/dataflow\/[^/]+\//.test(url.pathname)) {
+          return Promise.resolve(new Response(null, { status: 204 }));
+        }
+        if (url.pathname.endsWith('/structure/dataflow')) return json(WEO34_DATAFLOW_LIST);
+        if (url.searchParams.get('measures') === 'none') {
+          probeCalls++;
+          return options.probe(init);
+        }
+        dataCalls++;
+        return json(options.main);
+      }),
+    );
+  };
+
+  /** A probe that never answers: it settles only when its request signal aborts. */
+  const hangingProbe = (init?: RequestInit) =>
+    new Promise<Response>((_, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+    });
+
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import('@cyanheads/mcp-ts-core/utils')>(
+      '@cyanheads/mcp-ts-core/utils',
+    );
+    fetchWithTimeout.mockReset();
+    fetchWithTimeout.mockImplementation(actual.fetchWithTimeout);
+    probeCalls = 0;
+    dataCalls = 0;
+    svc = new ImfSdmxService({} as AppConfig, {} as StorageService, BASE_URL, 30_000);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  const query = (key = 'USA.NGDP_RPCH+NGDPD.A', signal?: AbortSignal) =>
+    svc.fetchData(
+      'IMF.RES',
+      'WEO',
+      '9.0.0',
+      key,
+      undefined,
+      undefined,
+      createMockContext({ tenantId: 'test', ...(signal ? { signal } : {}) }),
+      signal,
+    );
+
+  const PROBE_FAILURES: Array<{ name: string; probe: (init?: RequestInit) => Promise<Response> }> =
+    [
+      {
+        name: 'an HTTP 503',
+        probe: () => Promise.resolve(new Response('Service Unavailable', { status: 503 })),
+      },
+      {
+        name: 'an unparseable body',
+        probe: () =>
+          Promise.resolve(
+            new Response('<html><body>maintenance</body></html>', {
+              status: 200,
+              headers: { 'Content-Type': 'text/html' },
+            }),
+          ),
+      },
+      {
+        name: 'a network failure',
+        probe: () => Promise.reject(new TypeError('fetch failed')),
+      },
+    ];
+
+  it.each(PROBE_FAILURES)(
+    'names the unrecovered attributes and the widened key after $name',
+    async ({ probe }) => {
+      serve({ main: weo34Suppressed(), probe });
+
+      const result = await query();
+
+      expect(result.unresolvedAttributes).toEqual({
+        concepts: ['unit'],
+        widenedKey: 'USA.NGDP_RPCH+NGDPD.*',
+        widenedDimension: 'FREQUENCY',
+      });
+      // The observations and every attribute the main response did carry stand.
+      expect(result.observations).toHaveLength(2);
+      expect(result.seriesAttributesByKey['USA.NGDPD.A']).toEqual({
+        unit: null,
+        scale: '9',
+        decimals: 3,
+      });
+      // One GET, never retried.
+      expect(probeCalls).toBe(1);
+      expect(dataCalls).toBe(1);
+    },
+  );
+
+  it('names them after a probe that times out, still one request', async () => {
+    serve({ main: weo34Suppressed(), probe: hangingProbe });
+    vi.useFakeTimers();
+
+    const settled = query();
+    await vi.runAllTimersAsync();
+    const result = await settled;
+
+    expect(result.unresolvedAttributes).toEqual({
+      concepts: ['unit'],
+      widenedKey: 'USA.NGDP_RPCH+NGDPD.*',
+      widenedDimension: 'FREQUENCY',
+    });
+    expect(result.observations).toHaveLength(2);
+    expect(probeCalls).toBe(1);
+  });
+
+  it('names no key when the structure the widen position is sized against does not resolve', async () => {
+    // Neither the DSD nor the dataflow fallback yields a structure.
+    serve({
+      main: weo34Suppressed(),
+      probe: () => Promise.reject(new Error('unused')),
+      dsd: { data: {} },
+    });
+
+    const result = await query();
+
+    expect(result.unresolvedAttributes).toEqual({ concepts: ['unit'] });
+    expect(result.observations).toHaveLength(2);
+    expect(probeCalls).toBe(0);
+  });
+
+  it('names no key when no position outside the group has a codelist to size', async () => {
+    const indicatorOnlyDsd = structuredClone(WEO34_DSD);
+    indicatorOnlyDsd.data.codelists = [codelistOf('CL_WEO_INDICATOR', 145)];
+    serve({
+      main: weo34Suppressed(),
+      probe: () => Promise.reject(new Error('unused')),
+      dsd: indicatorOnlyDsd,
+    });
+
+    const result = await query();
+
+    expect(result.unresolvedAttributes).toEqual({ concepts: ['unit'] });
+    expect(probeCalls).toBe(0);
+  });
+
+  it('stays silent when the probe answered and carried no value either', async () => {
+    // CPI and a long tail declare a unit and publish none: the answer is the fact.
+    serve({
+      main: weo34Suppressed(),
+      probe: () =>
+        Promise.resolve(new Response(JSON.stringify(weo34Suppressed()), { status: 200 })),
+    });
+
+    const result = await query();
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBeNull();
+    expect(result).not.toHaveProperty('unresolvedAttributes');
+    expect(probeCalls).toBe(1);
+  });
+
+  it('stays silent when the probe recovers the values', async () => {
+    serve({
+      main: weo34Suppressed(),
+      probe: () => Promise.resolve(new Response(JSON.stringify(weo34Probe()), { status: 200 })),
+    });
+
+    const result = await query();
+
+    expect(result.seriesAttributesByKey['USA.NGDPD.A']?.unit).toBe('USD');
+    expect(result).not.toHaveProperty('unresolvedAttributes');
+  });
+
+  it.each([
+    ['a key that already carries a *', 'USA.NGDP_RPCH+NGDPD.*'],
+    ['a key with no + on the group dimension', 'USA.NGDPD.A'],
+  ])('stays silent at one request for %s', async (_, key) => {
+    serve({ main: weo34Suppressed(), probe: () => Promise.reject(new Error('unused')) });
+
+    const result = await query(key);
+
+    expect(result).not.toHaveProperty('unresolvedAttributes');
+    expect(probeCalls).toBe(0);
+    expect(dataCalls).toBe(1);
+  });
+
+  it('stays silent at one request when the groups already carry their values', async () => {
+    serve({
+      main: weoDimensionGroupFixture({
+        countries: ['USA'],
+        indicators: ['NGDPD', 'NGDP_RPCH'],
+        series: { '0:0:0': [0, 0, 0, '9/30/2025'], '0:1:0': [1, 0, 0, '9/30/2025'] },
+        unitCodes: ['USD', 'PT'],
+        dimensionGroupAttributes: { ':0::': groupRow(0), ':1::': groupRow(1) },
+      }),
+      probe: () => Promise.reject(new Error('unused')),
+    });
+
+    const result = await query('USA.NGDPD+NGDP_RPCH.A');
+
+    expect(result).not.toHaveProperty('unresolvedAttributes');
+    expect(probeCalls).toBe(0);
+    expect(dataCalls).toBe(1);
+  });
+
+  it('fails as cancelled, never as a disclosure, when the caller cancels during the probe', async () => {
+    const caller = new AbortController();
+    serve({
+      main: weo34Suppressed(),
+      probe: (init) => {
+        const pending = hangingProbe(init);
+        caller.abort();
+        return pending;
+      },
+    });
+
+    const outcome = await query(undefined, caller.signal).then(
+      () => 'resolved',
+      (err: unknown) => err,
+    );
+
+    expect(outcome).toBeInstanceOf(McpError);
+    expect((outcome as McpError).code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(probeCalls).toBe(1);
   });
 });
 
@@ -3045,6 +3398,321 @@ describe('ImfSdmxService.fetchData observation status (#57)', () => {
   });
 });
 
+// --- #64: reference periods on the series row and on each observation -----------
+
+type AttrCell = string | number | null;
+
+/**
+ * A `CPI`-shaped monthly payload over `USA` and `KNA`. The live structure lists
+ * `COMMON_REFERENCE_PERIOD` fourth among the series attributes and
+ * `REFERENCE_PERIOD` third among the observation attributes, both uncoded, so a
+ * series row reads `[0, null, 0, "2010A", "true"]` and an observation
+ * `["154.52", null, 0, "2010A", null]`. Each test supplies its own attribute
+ * definitions, so the alias and the coded/uncoded form are the variables.
+ */
+const referencePeriodFixture = (options: {
+  seriesDefs: SdmxAttributeDef[];
+  observationDefs: SdmxAttributeDef[];
+  groupDefs?: SdmxAttributeDef[];
+  dimensionGroupAttributes?: Record<string, AttrCell[]>;
+  indicators?: string[];
+  series: Record<string, { attributes?: AttrCell[]; observations: Record<string, AttrCell[]> }>;
+}) => ({
+  data: {
+    dataSets: [
+      {
+        ...(options.dimensionGroupAttributes
+          ? { dimensionGroupAttributes: options.dimensionGroupAttributes }
+          : {}),
+        series: options.series,
+      },
+    ],
+    structures: [
+      {
+        attributes: {
+          series: options.seriesDefs,
+          ...(options.groupDefs ? { dimensionGroup: options.groupDefs } : {}),
+          observation: options.observationDefs,
+        },
+        dimensions: {
+          series: [
+            { id: 'COUNTRY', values: [{ id: 'USA' }, { id: 'KNA' }] },
+            { id: 'INDEX_TYPE', values: [{ id: 'CPI' }] },
+            {
+              id: 'COICOP_1999',
+              values: (options.indicators ?? ['_T']).map((id) => ({ id })),
+            },
+            { id: 'TYPE_OF_TRANSFORMATION', values: [{ id: 'IX' }] },
+            { id: 'FREQUENCY', values: [{ id: 'M' }] },
+          ],
+          observation: [
+            { id: 'TIME_PERIOD', values: [{ value: '2024-M09' }, { value: '2024-M10' }] },
+          ],
+        },
+      },
+    ],
+  },
+});
+
+/** The live CPI series attribute list, `COMMON_REFERENCE_PERIOD` fourth and uncoded. */
+const CPI_SERIES_DEFS: SdmxAttributeDef[] = [
+  { id: 'SCALE', values: [{ id: '0' }] },
+  { id: 'DECIMALS_DISPLAYED' },
+  { id: 'OVERLAP', values: [{ id: 'OL' }] },
+  { id: 'COMMON_REFERENCE_PERIOD' },
+  { id: 'IFS_FLAG' },
+];
+
+/** The live CPI observation attribute list, `REFERENCE_PERIOD` third and uncoded. */
+const CPI_OBSERVATION_DEFS: SdmxAttributeDef[] = [
+  { id: 'PRECISION' },
+  { id: 'DERIVATION_TYPE', values: [{ id: 'O' }] },
+  { id: 'REFERENCE_PERIOD' },
+  { id: 'STATUS' },
+];
+
+describe('ImfSdmxService.fetchData reference periods (#64)', () => {
+  let svc: ImfSdmxService;
+  let requested: URL[];
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    requested = [];
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+  });
+
+  /** Answers the data request with `payload`; any other request is unexpected and rejects. */
+  const serveAndQuery = async (payload: unknown, key = 'USA+KNA.CPI._T.IX.M') => {
+    fetchWithTimeout.mockImplementation((url: string) => {
+      const parsed = new URL(url);
+      requested.push(parsed);
+      if (parsed.origin === 'https://api.imf.org' && parsed.pathname.includes('/data/dataflow/')) {
+        return Promise.resolve(mkResp(200, payload));
+      }
+      return Promise.reject(new Error(`unexpected request ${url}`));
+    });
+    return svc.fetchData(
+      'IMF.STA',
+      'CPI',
+      '5.0.0',
+      key,
+      undefined,
+      undefined,
+      createMockContext({ tenantId: 'test' }),
+    );
+  };
+
+  it('reads an uncoded literal on the series row and on each observation', async () => {
+    const result = await serveAndQuery(
+      referencePeriodFixture({
+        seriesDefs: CPI_SERIES_DEFS,
+        observationDefs: CPI_OBSERVATION_DEFS,
+        series: {
+          '0:0:0:0:0': {
+            attributes: [0, null, 0, '2010A', 'true'],
+            observations: { '1': ['154.5202941452979', null, 0, '2010A', null] },
+          },
+          '1:0:0:0:0': {
+            attributes: [0, null, 0, 'Multiple', 'true'],
+            observations: {
+              '0': ['112.3', null, 0, '2010M1', null],
+              '1': ['112.9', null, 0, '2010A', null],
+            },
+          },
+        },
+      }),
+    );
+
+    expect(result.seriesAttributesByKey['USA.CPI._T.IX.M']?.reference_period).toBe('2010A');
+    expect(result.seriesAttributesByKey['KNA.CPI._T.IX.M']?.reference_period).toBe('Multiple');
+    expect(result.seriesAttributes.reference_period).toBe('2010A');
+    expect(
+      result.observations.map(({ series_key, time_period, reference_period }) => [
+        series_key,
+        time_period,
+        reference_period,
+      ]),
+    ).toEqual([
+      ['KNA.CPI._T.IX.M', '2024-M09', '2010M1'],
+      ['USA.CPI._T.IX.M', '2024-M10', '2010A'],
+      ['KNA.CPI._T.IX.M', '2024-M10', '2010A'],
+    ]);
+  });
+
+  it('resolves a coded index through the definition at both scopes', async () => {
+    const result = await serveAndQuery(
+      referencePeriodFixture({
+        seriesDefs: [
+          { id: 'SCALE', values: [{ id: '0' }] },
+          { id: 'REFERENCE_PERIOD', values: [{ id: '2005=100' }, { id: '2010=100' }] },
+        ],
+        observationDefs: [{ id: 'REFERENCE_PERIOD', values: [{ id: '2016M12' }] }],
+        series: {
+          '0:0:0:0:0': { attributes: [0, 1], observations: { '0': ['101.2', 0] } },
+        },
+      }),
+      'USA.CPI._T.IX.M',
+    );
+
+    // Index 1, not the literal "1" and not the first code.
+    expect(result.seriesAttributesByKey['USA.CPI._T.IX.M']?.reference_period).toBe('2010=100');
+    expect(result.observations[0]?.reference_period).toBe('2016M12');
+  });
+
+  it.each([
+    [
+      'COMMON_REFERENCE_PERIOD over REFERENCE_PERIOD',
+      ['REFERENCE_PERIOD', 'COMMON_REFERENCE_PERIOD'],
+      'common',
+    ],
+    [
+      'REFERENCE_PERIOD over REFERENCE_PERIOD_REPORTED',
+      ['REFERENCE_PERIOD_REPORTED', 'REFERENCE_PERIOD'],
+      'reference',
+    ],
+    ['REFERENCE_PERIOD_REPORTED alone', ['REFERENCE_PERIOD_REPORTED'], 'reported'],
+  ])('takes %s, whichever the payload lists first', async (_label, ids, expected) => {
+    const values: Record<string, string> = {
+      COMMON_REFERENCE_PERIOD: 'common',
+      REFERENCE_PERIOD: 'reference',
+      REFERENCE_PERIOD_REPORTED: 'reported',
+    };
+    const result = await serveAndQuery(
+      referencePeriodFixture({
+        seriesDefs: ids.map((id) => ({ id })),
+        observationDefs: [],
+        series: {
+          '0:0:0:0:0': {
+            attributes: ids.map((id) => values[id] ?? null),
+            observations: { '0': ['1'] },
+          },
+        },
+      }),
+      'USA.CPI._T.IX.M',
+    );
+
+    expect(result.seriesAttributesByKey['USA.CPI._T.IX.M']?.reference_period).toBe(expected);
+  });
+
+  it('leaves the key off a series row and an observation that carry none', async () => {
+    const result = await serveAndQuery(
+      referencePeriodFixture({
+        seriesDefs: CPI_SERIES_DEFS,
+        observationDefs: CPI_OBSERVATION_DEFS,
+        series: {
+          // A null cell, and a row too short to reach the attribute.
+          '0:0:0:0:0': {
+            attributes: [0, null, 0, null, 'true'],
+            observations: { '0': ['1.5', null, 0, null, null] },
+          },
+          '1:0:0:0:0': { attributes: [0], observations: { '0': ['2.5'] } },
+        },
+      }),
+    );
+
+    // Both series and both observations decode; only the key is absent.
+    expect(Object.keys(result.seriesAttributesByKey)).toEqual([
+      'USA.CPI._T.IX.M',
+      'KNA.CPI._T.IX.M',
+    ]);
+    expect(result.observations.map(({ series_key, value }) => [series_key, value])).toEqual([
+      ['USA.CPI._T.IX.M', 1.5],
+      ['KNA.CPI._T.IX.M', 2.5],
+    ]);
+    for (const attrs of Object.values(result.seriesAttributesByKey)) {
+      expect(attrs).not.toHaveProperty('reference_period');
+    }
+    for (const observation of result.observations) {
+      expect(observation).not.toHaveProperty('reference_period');
+    }
+  });
+
+  it('never fills one scope in from the other', async () => {
+    const result = await serveAndQuery(
+      referencePeriodFixture({
+        seriesDefs: CPI_SERIES_DEFS,
+        observationDefs: CPI_OBSERVATION_DEFS,
+        series: {
+          // Series-level only.
+          '0:0:0:0:0': {
+            attributes: [0, null, 0, '2010A', 'true'],
+            observations: { '0': ['1.5', null, 0, null, null] },
+          },
+          // Observation-level only.
+          '1:0:0:0:0': {
+            attributes: [0, null, 0, null, 'true'],
+            observations: { '0': ['2.5', null, 0, '2010M1', null] },
+          },
+        },
+      }),
+    );
+
+    expect(result.seriesAttributesByKey['USA.CPI._T.IX.M']?.reference_period).toBe('2010A');
+    expect(result.seriesAttributesByKey['KNA.CPI._T.IX.M']).not.toHaveProperty('reference_period');
+    const byKey = Object.fromEntries(result.observations.map((obs) => [obs.series_key, obs]));
+    expect(byKey['USA.CPI._T.IX.M']).not.toHaveProperty('reference_period');
+    expect(byKey['KNA.CPI._T.IX.M']?.reference_period).toBe('2010M1');
+  });
+
+  it('does not read a group-level REFERENCE_PERIOD, and a + key on its dimension fires no probe', async () => {
+    // CTOT declares REFERENCE_PERIOD against a dimension subset and publishes no
+    // value for it. Shipped empty under a + on that dimension, it looks exactly
+    // like a suppressed unit — but the concept is series-row only, so nothing
+    // is recovered and no second request is spent on it. A populated group row
+    // is not read either.
+    const groupDefs: SdmxAttributeDef[] = [
+      {
+        id: 'REFERENCE_PERIOD',
+        relationship: { dimensions: ['COICOP_1999'] },
+        values: [{ id: '2010A' }],
+      },
+    ];
+    const emptied = await serveAndQuery(
+      referencePeriodFixture({
+        seriesDefs: [{ id: 'SCALE', values: [{ id: '0' }] }],
+        observationDefs: [],
+        groupDefs: [{ id: 'REFERENCE_PERIOD', relationship: { dimensions: ['COICOP_1999'] } }],
+        indicators: ['_T', 'CP01'],
+        series: {
+          '0:0:0:0:0': { attributes: [0], observations: { '0': ['1'] } },
+          '0:0:1:0:0': { attributes: [0], observations: { '0': ['2'] } },
+        },
+      }),
+      'USA.CPI._T+CP01.IX.M',
+    );
+    expect(requested).toHaveLength(1);
+    expect(Object.keys(emptied.seriesAttributesByKey)).toEqual([
+      'USA.CPI._T.IX.M',
+      'USA.CPI.CP01.IX.M',
+    ]);
+    for (const attrs of Object.values(emptied.seriesAttributesByKey)) {
+      expect(attrs).not.toHaveProperty('reference_period');
+    }
+
+    requested = [];
+    const populated = await serveAndQuery(
+      referencePeriodFixture({
+        seriesDefs: [{ id: 'SCALE', values: [{ id: '0' }] }],
+        observationDefs: [],
+        groupDefs,
+        dimensionGroupAttributes: { '::0:::': [0] },
+        series: { '0:0:0:0:0': { attributes: [0], observations: { '0': ['1'] } } },
+      }),
+      'USA.CPI.*.IX.M',
+    );
+    expect(requested).toHaveLength(1);
+    expect(populated.seriesAttributesByKey['USA.CPI._T.IX.M']).not.toHaveProperty(
+      'reference_period',
+    );
+    expect(populated.unresolvedAttributes).toBeUndefined();
+  });
+});
+
 describe('ImfSdmxService.fetchData request parameters (#53)', () => {
   let svc: ImfSdmxService;
   let requested: string[];
@@ -3138,5 +3806,755 @@ describe('ImfSdmxService.fetchData request parameters (#53)', () => {
     );
     expect(probe).toContain('attributes=series&measures=none');
     expect(probe).not.toContain('lastNObservations');
+  });
+});
+
+// --- #69: a data-request failure carries no upstream body, URL, or host ------------
+
+/**
+ * The page api.imf.org returned, byte for byte, for a WEO data request whose
+ * encoded key ran to 1,531 characters (2026-10-16); 1,524 was accepted. It comes
+ * from the IIS front end, not the SDMX service, so it is HTML whatever Accept says.
+ */
+const IIS_INVALID_URL_PAGE =
+  '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN""http://www.w3.org/TR/html4/strict.dtd">\r\n<HTML><HEAD><TITLE>Bad Request</TITLE>\r\n<META HTTP-EQUIV="Content-Type" Content="text/html; charset=us-ascii"></HEAD>\r\n<BODY><h2>Bad Request - Invalid URL</h2>\r\n<hr><p>HTTP Error 400. The request URL is invalid.</p>\r\n</BODY></HTML>\r\n';
+
+describe('ImfSdmxService.fetchData error boundary (#69)', () => {
+  const MIRROR_HOST = new URL(PRIVATE_BASE_URL).hostname;
+  let svc: ImfSdmxService;
+  let fetchStub: ReturnType<typeof vi.fn>;
+
+  /**
+   * Runs the framework's real fetchWithTimeout — its status mapping and body
+   * capture are what put the leak into the error — against a stubbed global
+   * fetch that answers the mirror host only.
+   */
+  const answer = (respond: (init?: RequestInit) => Promise<Response>) => {
+    fetchStub = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname !== MIRROR_HOST) {
+        return Promise.reject(new Error(`unexpected fetch to ${url.hostname}`));
+      }
+      return respond(init);
+    });
+    vi.stubGlobal('fetch', fetchStub);
+  };
+
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import('@cyanheads/mcp-ts-core/utils')>(
+      '@cyanheads/mcp-ts-core/utils',
+    );
+    fetchWithTimeout.mockReset();
+    fetchWithTimeout.mockImplementation(actual.fetchWithTimeout);
+    svc = new ImfSdmxService({} as AppConfig, {} as StorageService, PRIVATE_BASE_URL, 30_000);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** The settled rejection of one data request, with retry backoff run out on fake timers. */
+  const failedRequest = async (signal?: AbortSignal) => {
+    vi.useFakeTimers();
+    const settled = svc
+      .fetchData(
+        'IMF.RES',
+        'WEO',
+        '9.0.0',
+        'USA+GBR.NGDP_RPCH.A',
+        undefined,
+        undefined,
+        createMockContext({ tenantId: 'test', ...(signal ? { signal } : {}) }),
+        signal,
+      )
+      .then(
+        () => {
+          throw new Error('expected fetchData to reject');
+        },
+        (err: unknown) => err,
+      );
+    await vi.runAllTimersAsync();
+    return settled;
+  };
+
+  /** Nothing a client can read names the upstream, its path, or its page. */
+  const expectNoLeak = (err: unknown) => {
+    const wire = serializeError(err);
+    expect(wire).not.toContain(MIRROR_HOST);
+    expect(wire).not.toContain('/data/dataflow');
+    expect(wire).not.toContain('Fetch failed');
+    expect(wire).not.toContain('responseBody');
+    expect(wire).not.toContain('"body"');
+    expect(wire).not.toContain('<HTML>');
+    expect(wire).not.toContain('upstream detail');
+  };
+
+  it('classifies the portal’s URL-length refusal page as key_too_long, sent once', async () => {
+    answer(() =>
+      Promise.resolve(
+        new Response(IIS_INVALID_URL_PAGE, {
+          status: 400,
+          statusText: 'Bad Request',
+          headers: { 'Content-Type': 'text/html; charset=us-ascii' },
+        }),
+      ),
+    );
+
+    const err = await failedRequest();
+
+    expect(err).toBeInstanceOf(McpError);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.InvalidParams,
+      data: { reason: 'key_too_long', status: 400 },
+    });
+    expect((err as McpError).data?.retryable).toBe(false);
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expectNoLeak(err);
+  });
+
+  it.each([
+    [414, 'URI Too Long'],
+    [431, 'Request Header Fields Too Large'],
+  ])('classifies an empty-bodied HTTP %i as key_too_long', async (status, statusText) => {
+    answer(() => Promise.resolve(new Response(null, { status, statusText })));
+
+    const err = await failedRequest();
+
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.InvalidParams,
+      data: { reason: 'key_too_long', status },
+    });
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expectNoLeak(err);
+  });
+
+  it.each([
+    [400, JsonRpcErrorCode.InvalidParams, 1],
+    [401, JsonRpcErrorCode.Unauthorized, 1],
+    [403, JsonRpcErrorCode.Forbidden, 1],
+    [404, JsonRpcErrorCode.NotFound, 1],
+    // Not Implemented is no transient failure: fetchWithTimeout marks it retryable: false.
+    [501, JsonRpcErrorCode.ServiceUnavailable, 1],
+  ])(
+    'keeps HTTP %i as code %i without the upstream page or host, after %i attempt(s)',
+    async (status, code, attempts) => {
+      answer(() =>
+        Promise.resolve(
+          new Response(
+            `<html><body>upstream detail from ${MIRROR_HOST} for /data/dataflow</body></html>`,
+            { status },
+          ),
+        ),
+      );
+
+      const err = await failedRequest();
+
+      expect(err).toBeInstanceOf(McpError);
+      expect((err as McpError).code).toBe(code);
+      expect((err as McpError).data?.reason).toBeUndefined();
+      expect((err as McpError).data?.status).toBe(status);
+      expect((err as McpError).message).toContain(`HTTP ${status}`);
+      // Retried exactly as before the boundary: only transient statuses repeat.
+      expect(fetchStub).toHaveBeenCalledTimes(attempts);
+      expectNoLeak(err);
+    },
+  );
+
+  /** The transient failure every retried data-path class settles to (#70). */
+  const expectDataUnavailable = (err: unknown, retryAttempts: number) => {
+    expect(err).toBeInstanceOf(McpError);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'data_unavailable', retryable: true, retryAttempts },
+    });
+  };
+
+  it.each([
+    [500, 'Internal Server Error'],
+    [503, 'Service Unavailable'],
+    [504, 'Gateway Timeout'],
+  ])(
+    'declares HTTP %i (%s) data_unavailable after 4 attempts, the exhausted form keeping the reason',
+    async (status) => {
+      answer(() =>
+        Promise.resolve(
+          new Response(
+            `<html><body>upstream detail from ${MIRROR_HOST} for /data/dataflow</body></html>`,
+            { status },
+          ),
+        ),
+      );
+
+      const err = await failedRequest();
+
+      expectDataUnavailable(err, 4);
+      expect((err as McpError).data?.status).toBe(status);
+      expect((err as McpError).message).toBe(`IMF data request failed with HTTP ${status}.`);
+      expect(fetchStub).toHaveBeenCalledTimes(4);
+      expectNoLeak(err);
+    },
+  );
+
+  it('declares HTTP 429 rate_limited after 4 attempts, carrying the Retry-After the portal sent', async () => {
+    answer(() =>
+      Promise.resolve(
+        new Response(`slow down, ${MIRROR_HOST}`, { status: 429, headers: { 'Retry-After': '2' } }),
+      ),
+    );
+
+    const err = await failedRequest();
+
+    expect(err).toBeInstanceOf(McpError);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+      data: {
+        reason: 'rate_limited',
+        retryable: true,
+        retryAfter: '2',
+        retryAttempts: 4,
+        status: 429,
+      },
+    });
+    expect(fetchStub).toHaveBeenCalledTimes(4);
+    expectNoLeak(err);
+  });
+
+  it('declares a 429 with no Retry-After rate_limited with no retryAfter', async () => {
+    answer(() => Promise.resolve(new Response('slow down', { status: 429 })));
+
+    const err = await failedRequest();
+
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+      data: { reason: 'rate_limited', retryable: true },
+    });
+    expect((err as McpError).data).not.toHaveProperty('retryAfter');
+  });
+
+  it('keeps rate_limited and its retryAfter when the wait it names outlasts the call budget', async () => {
+    answer(() =>
+      Promise.resolve(new Response('slow down', { status: 429, headers: { 'Retry-After': '20' } })),
+    );
+
+    const err = await failedRequest();
+
+    // Attempts at 0, 20, and 40 s; a fourth 20 s wait would end past 45 s.
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+      data: { reason: 'rate_limited', retryable: true, retryAfter: '20' },
+    });
+    expect(fetchStub).toHaveBeenCalledTimes(3);
+  });
+
+  it('reports a network failure without naming the host', async () => {
+    answer(() => Promise.reject(new TypeError(`fetch failed: ${MIRROR_HOST} ECONNREFUSED`)));
+
+    const err = await failedRequest();
+
+    expect(err).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+    expectDataUnavailable(err, 4);
+    expect(fetchStub).toHaveBeenCalledTimes(4);
+    expectNoLeak(err);
+  });
+
+  it('reports a request that never answers as data_unavailable at the call budget, without naming the host', async () => {
+    answer(
+      (init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        }),
+    );
+
+    const err = await failedRequest();
+
+    // Was Timeout after four 30 s attempts (~127 s); the 45 s call budget stops it at two (#70).
+    expectDataUnavailable(err, 2);
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expectNoLeak(err);
+  });
+
+  it('declares per-attempt timeouts that exhaust the retries data_unavailable', async () => {
+    svc = new ImfSdmxService({} as AppConfig, {} as StorageService, PRIVATE_BASE_URL, 5_000);
+    answer(
+      (init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        }),
+    );
+
+    const err = await failedRequest();
+
+    expectDataUnavailable(err, 4);
+    expect((err as McpError).message).toBe('IMF data request timed out.');
+    expect(fetchStub).toHaveBeenCalledTimes(4);
+    expectNoLeak(err);
+  });
+
+  it('declares a 200 carrying an HTML page instead of JSON data_unavailable', async () => {
+    answer(() =>
+      Promise.resolve(
+        new Response(`<html><body>maintenance on ${MIRROR_HOST}</body></html>`, { status: 200 }),
+      ),
+    );
+
+    const err = await failedRequest();
+
+    expectDataUnavailable(err, 4);
+    expect(fetchStub).toHaveBeenCalledTimes(4);
+    expectNoLeak(err);
+  });
+
+  it('reports a caller cancellation as RequestCancelled without naming the host', async () => {
+    const controller = new AbortController();
+    answer(
+      (init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+          controller.abort();
+        }),
+    );
+
+    const err = await failedRequest(controller.signal);
+
+    expect(err).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expectNoLeak(err);
+  });
+
+  it('reports a caller cancellation during retry backoff as RequestCancelled, with no further attempt', async () => {
+    const controller = new AbortController();
+    answer(() => {
+      // Lands inside the first backoff, which waits 750–1,250 ms with jitter.
+      setTimeout(() => controller.abort(), 500);
+      return Promise.resolve(new Response('busy', { status: 503 }));
+    });
+
+    const err = await failedRequest(controller.signal);
+
+    expect(err).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect((err as McpError).data?.reason).toBeUndefined();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expectNoLeak(err);
+  });
+});
+
+// --- #70: one budget per tool call, shared by every upstream read it chains ------
+
+describe('ImfSdmxService per-call budget (#70)', () => {
+  const BASE_URL = 'https://api.imf.org/external/sdmx/3.0';
+  const ORIGIN = new URL(BASE_URL).origin;
+  type Route = 'catalog' | 'dsd' | 'fallback' | 'data' | 'probe' | 'availability';
+  type Respond = (init?: RequestInit) => Promise<Response>;
+
+  let svc: ImfSdmxService;
+  let calls: Record<Route, number>;
+  let routes: Record<Route, Respond>;
+
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200 });
+
+  /** Answers after `ms` of the fake clock, or rejects with the request signal's reason if it aborts first. */
+  const answersAfter =
+    (ms: number, respond: () => Response): Respond =>
+    (init) =>
+      new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(() => resolve(respond()), ms);
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(init.signal?.reason);
+        });
+      });
+
+  /** A portal that accepts the request and never answers. */
+  const never: Respond = (init) =>
+    new Promise<Response>((_, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+    });
+
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import('@cyanheads/mcp-ts-core/utils')>(
+      '@cyanheads/mcp-ts-core/utils',
+    );
+    fetchWithTimeout.mockReset();
+    fetchWithTimeout.mockImplementation(actual.fetchWithTimeout);
+    calls = { catalog: 0, dsd: 0, fallback: 0, data: 0, probe: 0, availability: 0 };
+    routes = {
+      catalog: () => Promise.resolve(json(WEO34_DATAFLOW_LIST)),
+      dsd: () => Promise.resolve(json(WEO34_DSD)),
+      fallback: () => Promise.resolve(new Response(null, { status: 204 })),
+      data: () => Promise.resolve(json(weo34Suppressed())),
+      probe: () => Promise.resolve(json(weo34Probe())),
+      availability: () => Promise.resolve(new Response('<unusable/>', { status: 200 })),
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        if (url.origin !== ORIGIN) {
+          return Promise.reject(new Error(`unexpected fetch to ${url.origin}`));
+        }
+        const route: Route = url.pathname.includes('/availableconstraint/')
+          ? 'availability'
+          : url.pathname.includes('/structure/datastructure/')
+            ? 'dsd'
+            : /\/structure\/dataflow\/[^/]+\//.test(url.pathname)
+              ? 'fallback'
+              : url.pathname.endsWith('/structure/dataflow')
+                ? 'catalog'
+                : url.searchParams.get('measures') === 'none'
+                  ? 'probe'
+                  : 'data';
+        calls[route]++;
+        return routes[route](init);
+      }),
+    );
+    vi.useFakeTimers();
+    svc = new ImfSdmxService({} as AppConfig, {} as StorageService, BASE_URL, 30_000);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * Runs `run` to settlement on the fake clock and reports how far the clock had
+   * moved when it settled — the time a client would have waited.
+   */
+  const settle = async <T>(run: () => Promise<T>) => {
+    const startedAt = Date.now();
+    let settledAt = Number.NaN;
+    const outcome = run().then(
+      (value) => {
+        settledAt = Date.now();
+        return { value, error: undefined };
+      },
+      (error: unknown) => {
+        settledAt = Date.now();
+        return { value: undefined, error };
+      },
+    );
+    await vi.runAllTimersAsync();
+    return { ...(await outcome), elapsedMs: settledAt - startedAt };
+  };
+
+  const fetchData = (ctx: ReturnType<typeof createMockContext>, key = 'USA.NGDPD.A') =>
+    svc.fetchData('IMF.RES', 'WEO', '9.0.0', key, undefined, undefined, ctx, ctx.signal);
+
+  it('settles a never-answering data request at the budget, after 2 attempts, as data_unavailable', async () => {
+    routes.data = never;
+
+    const { error, elapsedMs } = await settle(() =>
+      fetchData(createMockContext({ tenantId: 'test' })),
+    );
+
+    // Attempt 1 runs its full 30 s; attempt 2 gets the 14 s left after backoff.
+    expect(elapsedMs).toBe(45_000);
+    expect(calls.data).toBe(2);
+    expect(error).toBeInstanceOf(McpError);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'data_unavailable', retryable: true, retryAttempts: 2 },
+    });
+    expect((error as McpError).message).toBe(
+      'IMF data request did not finish within the 45-second budget for one call.',
+    );
+  });
+
+  it('still rescues a request that succeeds on its second attempt', async () => {
+    let attempt = 0;
+    routes.data = (init) =>
+      ++attempt === 1 ? never(init) : Promise.resolve(json(weo34Suppressed()));
+
+    const { value, error, elapsedMs } = await settle(() =>
+      fetchData(createMockContext({ tenantId: 'test' })),
+    );
+
+    expect(error).toBeUndefined();
+    expect(value?.observations).toHaveLength(2);
+    expect(calls.data).toBe(2);
+    expect(elapsedMs).toBeGreaterThanOrEqual(30_750);
+    expect(elapsedMs).toBeLessThan(45_000);
+  });
+
+  it('still succeeds when a slow portal answers inside the budget', async () => {
+    routes.data = answersAfter(29_000, () => json(weo34Suppressed()));
+
+    const { value, error, elapsedMs } = await settle(() =>
+      fetchData(createMockContext({ tenantId: 'test' })),
+    );
+
+    expect(error).toBeUndefined();
+    expect(value?.observations).toHaveLength(2);
+    expect(elapsedMs).toBe(29_000);
+    expect(calls.data).toBe(1);
+  });
+
+  it('shares one budget across the catalog, structure, and data reads of one call', async () => {
+    routes.catalog = answersAfter(20_000, () => json(WEO34_DATAFLOW_LIST));
+    routes.dsd = answersAfter(20_000, () => json(WEO34_DSD));
+    routes.data = never;
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const { error, elapsedMs } = await settle(async () => {
+      await svc.fetchDataflowStructure('WEO', undefined, undefined, ctx);
+      return fetchData(ctx);
+    });
+
+    // The data request had the last 5 s, so it gets one attempt and no retry.
+    expect(elapsedMs).toBe(45_000);
+    expect(calls).toMatchObject({ catalog: 1, dsd: 1, data: 1 });
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'data_unavailable', retryable: true },
+    });
+  });
+
+  it('gives a second data request in the same call — the latest-N re-fetch — only what is left', async () => {
+    routes.data = answersAfter(29_000, () => json(weo34Suppressed()));
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const { error, elapsedMs } = await settle(async () => {
+      await fetchData(ctx);
+      routes.data = never;
+      return fetchData(ctx);
+    });
+
+    expect(elapsedMs).toBe(45_000);
+    expect(calls.data).toBe(2);
+    expect(error).toMatchObject({ data: { reason: 'data_unavailable' } });
+  });
+
+  it('sends nothing for a read that starts once the budget is spent', async () => {
+    routes.catalog = never;
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const catalog = await settle(() => svc.fetchDataflows(ctx));
+    expect(catalog.elapsedMs).toBe(45_000);
+    expect(calls.catalog).toBe(2);
+    // Retryable, as every tool's contract declares the reason.
+    expect(catalog.error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'dataflow_list_unavailable', retryable: true },
+    });
+
+    const data = await settle(() => fetchData(ctx));
+    expect(data.elapsedMs).toBe(0);
+    expect(calls.data).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(data.error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'data_unavailable', retryable: true },
+    });
+  });
+
+  it('fails a hung structure read as structure_unavailable at the budget, with no fallback request', async () => {
+    routes.dsd = never;
+
+    const { error, elapsedMs } = await settle(() =>
+      svc.fetchDataflowStructure(
+        'WEO',
+        undefined,
+        undefined,
+        createMockContext({ tenantId: 'test' }),
+      ),
+    );
+
+    expect(elapsedMs).toBe(45_000);
+    expect(calls).toMatchObject({ catalog: 1, dsd: 2, fallback: 0 });
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'structure_unavailable' },
+    });
+  });
+
+  it('cuts the dimension-group probe at the budget and discloses it, keeping the observations', async () => {
+    routes.catalog = answersAfter(20_000, () => json(WEO34_DATAFLOW_LIST));
+    routes.dsd = answersAfter(20_000, () => json(WEO34_DSD));
+    routes.data = answersAfter(4_000, () => json(weo34Suppressed()));
+    routes.probe = never;
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const { value, error, elapsedMs } = await settle(async () => {
+      await svc.fetchDataflowStructure('WEO', undefined, undefined, ctx);
+      return fetchData(ctx, 'USA.NGDP_RPCH+NGDPD.A');
+    });
+
+    // The probe's own 10 s cap would have run to 54 s; the budget ends it at 45 s.
+    expect(error).toBeUndefined();
+    expect(elapsedMs).toBe(45_000);
+    expect(calls.probe).toBe(1);
+    expect(value?.observations).toHaveLength(2);
+    expect(value?.unresolvedAttributes).toEqual({
+      concepts: ['unit'],
+      widenedKey: 'USA.NGDP_RPCH+NGDPD.*',
+      widenedDimension: 'FREQUENCY',
+    });
+  });
+
+  it('keeps a caller cancellation as RequestCancelled at once, never data_unavailable', async () => {
+    const caller = new AbortController();
+    routes.data = (init) => {
+      setTimeout(() => caller.abort(), 5_000);
+      return never(init);
+    };
+
+    const { error, elapsedMs } = await settle(() =>
+      fetchData(createMockContext({ tenantId: 'test', signal: caller.signal })),
+    );
+
+    expect(elapsedMs).toBe(5_000);
+    expect(calls.data).toBe(1);
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect((error as McpError).data?.reason).toBeUndefined();
+  });
+
+  /** A request the caller cancels 5 s in, while the portal has not yet answered. */
+  const cancelledAfter5s =
+    (caller: AbortController): Respond =>
+    (init) => {
+      setTimeout(() => caller.abort(), 5_000);
+      return never(init);
+    };
+
+  it('keeps a caller cancellation during the catalog read as RequestCancelled, never dataflow_list_unavailable', async () => {
+    const caller = new AbortController();
+    routes.catalog = cancelledAfter5s(caller);
+
+    const { error, elapsedMs } = await settle(() =>
+      svc.fetchDataflows(createMockContext({ tenantId: 'test', signal: caller.signal })),
+    );
+
+    expect(elapsedMs).toBe(5_000);
+    expect(calls.catalog).toBe(1);
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect((error as McpError).data?.reason).toBeUndefined();
+  });
+
+  it('keeps a caller cancellation during the structure read as RequestCancelled, with no fallback request', async () => {
+    const caller = new AbortController();
+    routes.dsd = cancelledAfter5s(caller);
+
+    const { error, elapsedMs } = await settle(() =>
+      svc.fetchDataflowStructure(
+        'WEO',
+        undefined,
+        undefined,
+        createMockContext({ tenantId: 'test', signal: caller.signal }),
+      ),
+    );
+
+    expect(elapsedMs).toBe(5_000);
+    expect(calls).toMatchObject({ catalog: 1, dsd: 1, fallback: 0 });
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect((error as McpError).data?.reason).toBeUndefined();
+  });
+
+  it('keeps a caller cancellation during the structure fallback as RequestCancelled', async () => {
+    const caller = new AbortController();
+    routes.dsd = () => Promise.resolve(new Response(null, { status: 204 }));
+    routes.fallback = cancelledAfter5s(caller);
+
+    const { error, elapsedMs } = await settle(() =>
+      svc.fetchDataflowStructure(
+        'WEO',
+        undefined,
+        undefined,
+        createMockContext({ tenantId: 'test', signal: caller.signal }),
+      ),
+    );
+
+    expect(elapsedMs).toBe(5_000);
+    expect(calls).toMatchObject({ catalog: 1, dsd: 1, fallback: 1 });
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect((error as McpError).data?.reason).toBeUndefined();
+  });
+
+  it('fails structure_unavailable as retryable, as every contract declares it', async () => {
+    routes.dsd = () => Promise.resolve(new Response('not json', { status: 200 }));
+    routes.fallback = () => Promise.resolve(new Response('not json', { status: 200 }));
+
+    const { error } = await settle(() =>
+      svc.fetchDataflowStructure(
+        'WEO',
+        undefined,
+        undefined,
+        createMockContext({ tenantId: 'test' }),
+      ),
+    );
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'structure_unavailable', retryable: true },
+    });
+  });
+
+  it('fails a structure that decodes to nothing as retryable structure_unavailable', async () => {
+    routes.dsd = () => Promise.resolve(json({ data: { dataStructures: [] } }));
+
+    const { error } = await settle(() =>
+      svc.fetchDataflowStructure(
+        'WEO',
+        undefined,
+        undefined,
+        createMockContext({ tenantId: 'test' }),
+      ),
+    );
+
+    // The DSD answered, so the fallback is not tried.
+    expect(calls).toMatchObject({ dsd: 1, fallback: 0 });
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'structure_unavailable', retryable: true },
+    });
+  });
+
+  const WEO_FLOW = { agencyId: 'IMF.RES', id: 'WEO', version: '9.0.0' };
+
+  it('rethrows a caller cancellation during the availability lookup instead of degrading to null', async () => {
+    const caller = new AbortController();
+    routes.availability = cancelledAfter5s(caller);
+
+    const { value, error, elapsedMs } = await settle(() =>
+      svc.fetchAvailabilityConstraint(
+        WEO_FLOW,
+        'USA',
+        createMockContext({ tenantId: 'test', signal: caller.signal }),
+      ),
+    );
+
+    expect(elapsedMs).toBe(5_000);
+    expect(calls.availability).toBe(1);
+    expect(value).toBeUndefined();
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+  });
+
+  it('still degrades a failed availability lookup to null', async () => {
+    routes.availability = () => Promise.resolve(new Response('busy', { status: 503 }));
+
+    const { value, error } = await settle(() =>
+      svc.fetchAvailabilityConstraint(WEO_FLOW, 'USA', createMockContext({ tenantId: 'test' })),
+    );
+
+    expect(calls.availability).toBe(1);
+    expect(error).toBeUndefined();
+    expect(value).toBeNull();
+  });
+
+  it('keeps a caller cancellation during the dataflow-wide availability read as RequestCancelled, never availability_unavailable', async () => {
+    const caller = new AbortController();
+    routes.availability = cancelledAfter5s(caller);
+
+    const { error, elapsedMs } = await settle(() =>
+      svc.fetchDataflowAvailability(
+        WEO_FLOW,
+        createMockContext({ tenantId: 'test', signal: caller.signal }),
+      ),
+    );
+
+    expect(elapsedMs).toBe(5_000);
+    expect(calls.availability).toBe(1);
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect((error as McpError).data?.reason).toBeUndefined();
   });
 });

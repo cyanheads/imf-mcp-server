@@ -1,11 +1,16 @@
 /**
  * @fileoverview Tool: imf_query_dataset — query a dataflow by dimension key over a time range.
- * Key codes are trimmed and resolved against the DSD codelists before the fetch,
- * so a misspelled or misplaced code fails with nearby codes instead of reading
- * as missing coverage. Periods are compared as the date spans they name, so a bound coarser than the
+ * Key codes are trimmed, cleared of empty and repeated + members, and resolved
+ * against the DSD codelists before the fetch, so a misspelled or misplaced code
+ * fails with nearby codes instead of reading as missing coverage.
+ * Periods are compared as the date spans they name, so a bound coarser than the
  * observation frequency covers every sub-period inside it. A key resolving to
- * several series carries each one's own unit/scale/decimals, inline and on the
- * canvas. Large result sets spill to DataCanvas for SQL analysis; without a
+ * several series carries each one's own unit/scale/decimals and reference
+ * period, inline and on the canvas, and content[] renders them for every series
+ * whenever they fit the response budget. A requested series of a + key that
+ * came back empty is named with its reason, and attributes a failed recovery
+ * request left null are disclosed.
+ * Large result sets spill to DataCanvas for SQL analysis; without a
  * canvas they are cut to the same response budget as a time-ascending prefix.
  * @module mcp-server/tools/definitions/imf-query-dataset.tool
  */
@@ -14,13 +19,17 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema, type ColumnSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { idGenerator } from '@cyanheads/mcp-ts-core/utils';
+import { tableCell } from '@/mcp-server/markdown-table.js';
+import { blankAsUnset, blankAsUnsetNumber } from '@/mcp-server/optional-input.js';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 import type {
   AvailabilityResult,
   CodelistEntry,
+  GroupedSeriesAttribute,
   Observation,
   SeriesAttributes,
+  UnresolvedGroupAttributes,
 } from '@/services/imf-sdmx/types.js';
 
 /** Maximum serialized size of a staged tool result, across both MCP result channels. */
@@ -42,11 +51,15 @@ const IMF_DATA_PORTAL = 'https://data.imf.org/';
 const PUBLISHED_IN_UNITS = 'published in units';
 
 /**
- * Most per-series rows the formatted channel renders. A `*` key resolves to
- * hundreds of series (WEO's `*.NGDPD+NGDP_RPCH.A` is 420), and a table that long
- * costs more than the observations it annotates. `structuredContent` keeps every
- * entry, and each canvas row carries its own unit/scale/decimals, so the cap
- * bounds the rendering rather than the data — it is disclosed, never silent.
+ * Entries the series-attribute table falls back to when rendering every one
+ * would leave the result's fixed part no room for its notice inside the
+ * response budget (see `rendersEverySeries`). The table
+ * groups series sharing an attribute combination into one row, so WEO's 420
+ * series of `*.NGDPD+NGDP_RPCH.A` render whole; only a key resolving to a
+ * thousand or more (PI and ITG `*.*.*.M`) reaches the fallback. It renders the
+ * first 20 entries and says where the rest are — and, a grouped row carrying the
+ * same cells as the per-series row it replaced, costs no more than the 20-row
+ * table did, beyond a reference-period cell on a result that publishes one.
  */
 const SERIES_METADATA_PREVIEW_ROWS = 20;
 
@@ -59,18 +72,6 @@ const SERIES_METADATA_PREVIEW_ROWS = 20;
 function scaleLabel(scale: string | null): string | null {
   if (scale == null) return null;
   return scale === '0' ? PUBLISHED_IN_UNITS : `${PUBLISHED_IN_UNITS} of 10^${scale}`;
-}
-
-/**
- * One GFM table cell holding text the tool did not author, or `—` when the
- * upstream left it null. A `|` would end the cell and a backtick can open a code
- * span across the rest of the row, so both are backslash-escaped, after the
- * backslash itself so an escape in the text cannot swallow the one added here.
- * A line break would end the row, so it becomes a space.
- */
-function tableCell(text: string | null): string {
-  if (text == null) return '—';
-  return text.replace(/[\\|`]/g, '\\$&').replace(/\r\n|\r|\n/g, ' ');
 }
 
 /** The Period line's value: a range for both bounds, and a lone bound named as the one it is. */
@@ -112,12 +113,31 @@ function isNullPadding(obs: Observation): boolean {
   );
 }
 
-/** Largest `last_n_observations`, above the longest series the portal publishes (an IRFCL daily series spans 9,437 days). */
-const MAX_LAST_N_OBSERVATIONS = 10_000;
+/**
+ * Largest `last_n_observations` accepted. N only selects — the response budget
+ * and the canvas already bound what a call returns, and N past a series' length
+ * returns the series whole — so this ceiling guards only against absurd input.
+ * The portal answers `lastNObservations` up to 2,147,483,646 (2^31 − 1 draws an
+ * HTTP 403), so every accepted N can be forwarded.
+ */
+const MAX_LAST_N_OBSERVATIONS = 1_000_000;
 
-/** A blank from a form client is "unset", never a value to validate. */
-const blankAsUnset = <T extends z.ZodType>(schema: T) =>
-  z.preprocess((value) => (value === '' ? undefined : value), schema);
+/**
+ * Whether a `lastNObservations` response may be missing real rows. The portal
+ * counts null padding toward N, so only a series that came back with N cells,
+ * padding among them, can have real observations the response left out; a
+ * series that came back shorter than N came back whole.
+ */
+function paddingHidesRows(observations: Observation[], n: number): boolean {
+  const cells = new Map<string, { count: number; padded: boolean }>();
+  for (const obs of observations) {
+    const series = cells.get(obs.series_key) ?? { count: 0, padded: false };
+    series.count++;
+    series.padded ||= isNullPadding(obs);
+    cells.set(obs.series_key, series);
+  }
+  return [...cells.values()].some((series) => series.padded && series.count >= n);
+}
 
 /**
  * Each series' last `n` observations, in their original order. Rows arrive
@@ -199,6 +219,72 @@ function describeInvalidCode({
       ? notes.join(' — ')
       : `no close match; page the ${dimension} codes with imf_get_database (dimension_id=${dimension}, codelist_filter)`;
   return `position ${position} (${dimension}) '${code}' — ${detail}`;
+}
+
+/**
+ * Longest dimension id or period label a notice quotes whole; a longer one is
+ * cut to this many characters and an ellipsis. Upstream text has no length
+ * bound of its own, and `format()` reserves room for the notice from a bound
+ * that depends on this one (see `noticeCharsBound`).
+ */
+const NOTICE_LABEL_CHARS = 40;
+
+/** Most + members one key position can hold: an array's maximum length. */
+const MAX_POSITION_MEMBERS = 2 ** 32 - 1;
+
+const clipNoticeLabel = (label: string) =>
+  label.length > NOTICE_LABEL_CHARS ? `${label.slice(0, NOTICE_LABEL_CHARS)}…` : label;
+
+/** Members dropped from one key position: how many were empty, how many repeated a code. */
+interface DroppedAtPosition {
+  dimension: string;
+  duplicate: number;
+  empty: number;
+  index: number;
+}
+
+/** The dropped-member notice text: one entry per position that lost a member, then the key queried. */
+function droppedMembersNotice(positions: DroppedAtPosition[], key: string): string {
+  const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? '' : 's'}`;
+  const entries = positions.map(({ dimension, duplicate, empty, index }) => {
+    const counts = [
+      ...(empty > 0 ? [plural(empty, 'empty + member')] : []),
+      ...(duplicate > 0 ? [plural(duplicate, 'duplicate + member')] : []),
+    ];
+    return `position ${index + 1} (${clipNoticeLabel(dimension)}): ${counts.join(', ')}`;
+  });
+  return `Dropped from the key before the query — ${entries.join('; ')}. Queried as ${key}.`;
+}
+
+/**
+ * The notice for + members dropped from the key, or undefined when none were:
+ * per position, how many members were empty and how many repeated a code
+ * already listed, and the key that was queried instead. `sent` holds each
+ * position's trimmed members as given, `kept` the ones queried, and
+ * `dimensions` each position's dimension id.
+ */
+function describeDroppedMembers(
+  sent: string[][],
+  kept: string[][],
+  dimensions: readonly { id: string }[],
+  key: string,
+): string | undefined {
+  const dropped = sent.flatMap((members, index) => {
+    const empty = members.filter((member) => member === '').length;
+    const duplicate = members.length - empty - (kept[index]?.length ?? 0);
+    const dimension = dimensions[index]?.id ?? 'unknown';
+    return empty > 0 || duplicate > 0 ? [{ dimension, duplicate, empty, index }] : [];
+  });
+  if (dropped.length === 0) return;
+  return droppedMembersNotice(dropped, key);
+}
+
+/** The notice for observations whose period label the range filter could not read. */
+function unparseablePeriodNotice(count: number, samples: string[]): string {
+  return (
+    `${count} observation(s) carry a period label this tool cannot parse (${samples.map(clipNoticeLabel).join(', ')}), ` +
+    'so start_period/end_period were not applied to them and they are returned unfiltered.'
+  );
 }
 
 /** The inclusive span of dates a period label names. */
@@ -347,11 +433,131 @@ function observedRange(observations: Observation[]): { first: string; last: stri
   };
 }
 
-interface SeriesMetadata {
-  decimals: number | null;
-  scale: string | null;
+/** Most requested series `missing_series` lists; `missing_series_count` carries the total. */
+const MISSING_SERIES_CAP = 20;
+
+/** A requested series that returned no observation, with the reason a query for it alone gives. */
+interface MissingSeries {
+  /** Present with `no_data_in_range`: the window the series' own observations span. */
+  available_range?: { first: string; last: string };
+  reason: 'no_data' | 'no_data_in_range';
   series_key: string;
-  unit: string | null;
+}
+
+/**
+ * The requested series a `+` key named that came back empty, listed up to
+ * MISSING_SERIES_CAP in key order, and how many there are in all — or undefined
+ * when none is missing.
+ *
+ * A requested series is one cell of the product of each position's members,
+ * a `*` position staying `*`. A cell is returned when an observation in
+ * `returned` (the full result, never a budget-cut prefix) carries its code at
+ * every literal position. Each returned series lands in exactly one cell, so
+ * the total missing is the cell count less the returned cells, and walking the
+ * cells in key order stops at the cap after visiting at most the returned cells
+ * plus the cap — a wide key is counted, never expanded.
+ *
+ * A cell is `no_data_in_range` when `unfiltered` (the result before the range
+ * filter, padding already dropped) holds observations for it, and `no_data`
+ * when it holds none: the same split the single-series errors make.
+ *
+ * A key with one cell is skipped: the result is non-empty, so it was returned.
+ */
+function findMissingSeries(
+  keyMembers: string[][],
+  returned: Observation[],
+  unfiltered: Observation[],
+): { count: number; listed: MissingSeries[] } | undefined {
+  if (keyMembers.every((members) => members.length === 1)) return;
+
+  const memberSets = keyMembers.map((members) => new Set(members));
+  const cellOf = (seriesKey: string): string | undefined => {
+    const codes = seriesKey.split('.');
+    const cell = keyMembers.map((members, position) =>
+      members[0] === '*' ? '*' : codes[position],
+    );
+    return cell.every((code, position) => code !== undefined && memberSets[position]?.has(code))
+      ? cell.join('.')
+      : undefined;
+  };
+
+  const returnedSeries = new Set(returned.map((obs) => obs.series_key));
+  const returnedCells = new Set<string>();
+  for (const seriesKey of returnedSeries) {
+    const cell = cellOf(seriesKey);
+    if (cell) returnedCells.add(cell);
+  }
+  const cellCount = keyMembers.reduce((product, members) => product * members.length, 1);
+  const count = cellCount - returnedCells.size;
+  if (count === 0) return;
+
+  const outOfRange = new Map<string, Observation[]>();
+  for (const obs of unfiltered) {
+    if (returnedSeries.has(obs.series_key)) continue;
+    const cell = cellOf(obs.series_key);
+    if (!cell) continue;
+    const rows = outOfRange.get(cell);
+    if (rows) rows.push(obs);
+    else outOfRange.set(cell, [obs]);
+  }
+
+  const listed: MissingSeries[] = [];
+  const digits = keyMembers.map(() => 0);
+  while (listed.length < MISSING_SERIES_CAP) {
+    const cell = digits.map((digit, position) => keyMembers[position]?.[digit]).join('.');
+    if (!returnedCells.has(cell)) {
+      const observed = outOfRange.get(cell);
+      listed.push(
+        observed
+          ? {
+              series_key: cell,
+              reason: 'no_data_in_range',
+              available_range: observedRange(observed),
+            }
+          : { series_key: cell, reason: 'no_data' },
+      );
+    }
+    // Advance like an odometer, the last position fastest, so cells run in key order.
+    let position = digits.length - 1;
+    for (; position >= 0; position--) {
+      const next = (digits[position] ?? 0) + 1;
+      if (next < (keyMembers[position]?.length ?? 0)) {
+        digits[position] = next;
+        break;
+      }
+      digits[position] = 0;
+    }
+    if (position < 0) break;
+  }
+  return { count, listed };
+}
+
+/** A failed attribute recovery, as `unresolved_attributes` reports it. */
+interface UnresolvedAttributes {
+  concepts: GroupedSeriesAttribute[];
+  guidance: string;
+  series_count: number;
+}
+
+/**
+ * What to do about attributes the recovery request failed to bring back: retry,
+ * or query a key with a `*` — the shape the portal answers with them filled —
+ * naming the probe's own widened key when one was built.
+ */
+function unresolvedGuidance({
+  concepts,
+  widenedKey,
+  widenedDimension,
+}: UnresolvedGroupAttributes): string {
+  const names = concepts.join(', ');
+  const failed = `The request that recovers ${names} for this + key failed, so a null ${concepts.join(' or ')} here does not mean the dataflow publishes none.`;
+  return widenedKey
+    ? `${failed} Retry the query, or query key ${widenedKey} instead: the portal reports ${names} for it, and it matches every ${widenedDimension} code, so keep only the series requested here.`
+    : `${failed} Retry the query, or put * in place of the codes at one key position: the portal reports ${names} for a key with a *, and it then matches every code there, so keep only the series requested here.`;
+}
+
+interface SeriesMetadata extends SeriesAttributes {
+  series_key: string;
 }
 
 /** Domain result fields consumed by the formatter and response-budget measurement. */
@@ -361,6 +567,8 @@ interface QueryDatasetResult {
   end_period?: string;
   key: string;
   last_n_observations?: number;
+  missing_series?: MissingSeries[];
+  missing_series_count?: number;
   observation_count: number;
   observations: Observation[];
   retrieval_guidance?: string;
@@ -371,10 +579,113 @@ interface QueryDatasetResult {
   start_period?: string;
   table_name?: string;
   truncated: boolean;
+  unresolved_attributes?: UnresolvedAttributes;
+}
+
+/**
+ * The series-attribute table: one row per distinct combination of unit, scale,
+ * decimals, and — when any entry carries one — reference period, in order of
+ * first appearance, listing every series key that has it. A null fact is `—`,
+ * never dropped. Each key costs its own text plus a separator inside a shared
+ * row, against a whole row of four cells before, so grouping is what lets a
+ * `*` key's full inventory fit beside its observations.
+ */
+function seriesAttributeTable(entries: SeriesMetadata[], withReferencePeriod: boolean): string[] {
+  const rows = new Map<string, { cells: string; keys: string[] }>();
+  for (const entry of entries) {
+    const facts = [
+      tableCell(entry.unit),
+      tableCell(scaleLabel(entry.scale)),
+      entry.decimals ?? '—',
+      ...(withReferencePeriod ? [tableCell(entry.reference_period ?? null)] : []),
+    ].join(' | ');
+    const row = rows.get(facts) ?? { cells: facts, keys: [] };
+    row.keys.push(tableCell(entry.series_key));
+    rows.set(facts, row);
+  }
+  return [
+    withReferencePeriod
+      ? '| Unit | Scale | Decimals | Reference Period | Series |'
+      : '| Unit | Scale | Decimals | Series |',
+    withReferencePeriod
+      ? '|:-----|:------|---------:|:-----------------|:-------|'
+      : '|:-----|:------|---------:|:-------|',
+    ...[...rows.values()].map(({ cells, keys }) => `| ${cells} | ${keys.join(', ')} |`),
+  ];
+}
+
+/**
+ * An upper bound on what the `notice` enrichment can add to `result`'s envelope:
+ * its `structuredContent.notice` field and its `content[]` trailer block. Built
+ * from the longest notice the handler can compose for this result — a
+ * dropped-member entry for every key position, each naming a dimension id cut
+ * to NOTICE_LABEL_CHARS and the widest member counts, then `result.key`; and,
+ * when a period bound is set, the unparseable-label notice with the
+ * observation count and three labels at the clip length — plus the JSON
+ * escaping each quoted label could still add (six serialized characters, as in
+ * `\u0000`, for each character kept).
+ */
+function noticeCharsBound(result: QueryDatasetResult): number {
+  const label = 'x'.repeat(NOTICE_LABEL_CHARS + 1);
+  const positions = result.key.split('.').length;
+  const notices = [
+    droppedMembersNotice(
+      Array.from({ length: positions }, (_, index) => ({
+        dimension: label,
+        duplicate: MAX_POSITION_MEMBERS,
+        empty: MAX_POSITION_MEMBERS,
+        index,
+      })),
+      result.key,
+    ),
+  ];
+  let labels = positions;
+  if (result.start_period || result.end_period) {
+    notices.push(unparseablePeriodNotice(result.observation_count, [label, label, label]));
+    labels += 3;
+  }
+  const notice = notices.join(' ');
+  const escapes = 5 * NOTICE_LABEL_CHARS * labels;
+  return (
+    `,"notice":${JSON.stringify(notice)}`.length +
+    `,{"type":"text","text":${JSON.stringify(`\n\n> ${notice}`)}}`.length +
+    2 * escapes
+  );
+}
+
+/**
+ * Whether the series-attribute table can list every entry: true when the
+ * result's fixed part — everything but its observations, `missing_series` and
+ * `unresolved_attributes` included — fits the response budget with the full
+ * table rendered and room left for any notice. `format()` never sees the
+ * `notice` enrichment, which the framework appends after it, so the room it
+ * leaves is `noticeCharsBound`, an upper bound computed from the result alone:
+ * the rendering measured against the budget is the one delivered, and a full
+ * table chosen here still fits once the notice is added. Otherwise the
+ * fallback renders, which costs no more than the 20-row table it replaced.
+ */
+function rendersEverySeries(result: QueryDatasetResult): boolean {
+  const entries = result.series_metadata?.length ?? 0;
+  if (entries <= SERIES_METADATA_PREVIEW_ROWS) return true;
+  const fixedPart = { ...result, observations: [] };
+  const content = [{ type: 'text' as const, text: renderQueryDataset(fixedPart, true) }];
+  return (
+    JSON.stringify({ structuredContent: fixedPart, content }).length + noticeCharsBound(result) <=
+    RESPONSE_BUDGET_CHARS
+  );
 }
 
 /** Render the domain result identically for normal delivery and budget measurement. */
 function formatQueryDataset(result: QueryDatasetResult) {
+  return [{ type: 'text' as const, text: renderQueryDataset(result, rendersEverySeries(result)) }];
+}
+
+/**
+ * The formatted text, with the series-attribute table listing every entry or,
+ * when `everySeries` is false, the first SERIES_METADATA_PREVIEW_ROWS entries
+ * and where the rest are: the staged table's rows, or a call over fewer series.
+ */
+function renderQueryDataset(result: QueryDatasetResult, everySeries: boolean): string {
   const lines: string[] = [];
   lines.push(`## IMF Data: ${result.dataflow_id} — \`${result.key}\``);
 
@@ -384,30 +695,41 @@ function formatQueryDataset(result: QueryDatasetResult) {
     lines.push(`**Last observations:** ${result.last_n_observations} per series`);
   }
 
-  const { unit, scale, decimals } = result.series_attributes;
-  const primaryMeta = [unit, scaleLabel(scale), decimals != null ? `${decimals} decimals` : null]
+  const { unit, scale, decimals, reference_period } = result.series_attributes;
+  const primaryMeta = [
+    unit != null ? tableCell(unit) : null,
+    scaleLabel(scale),
+    decimals != null ? `${decimals} decimals` : null,
+    reference_period != null ? `reference period ${tableCell(reference_period)}` : null,
+  ]
     .filter(Boolean)
     .join(' | ');
 
   if (result.series_metadata) {
-    const shown = result.series_metadata.slice(0, SERIES_METADATA_PREVIEW_ROWS);
-    const heading =
-      shown.length < result.series_metadata.length
-        ? `\n**Series attributes** — ${shown.length} of ${result.series_metadata.length} series shown; every entry remains in structuredContent${result.staged ? ', and every canvas row carries its own unit, scale, and decimals' : ''}\n`
-        : '\n**Series attributes** — one row per series\n';
-    lines.push(heading);
-    lines.push('| Series Key | Unit | Scale | Decimals |');
-    lines.push('|:-----------|:-----|:------|---------:|');
-    for (const series of shown) {
-      lines.push(
-        `| ${tableCell(series.series_key)} | ${tableCell(series.unit)} | ${tableCell(scaleLabel(series.scale))} | ${series.decimals ?? '—'} |`,
-      );
-    }
-    if (primaryMeta) {
-      lines.push(
-        `\n\`series_attributes\` describes the first row (${result.series_metadata[0]?.series_key ?? ''}): ${primaryMeta}\n`,
-      );
-    }
+    const total = result.series_metadata.length;
+    const shown = everySeries
+      ? result.series_metadata
+      : result.series_metadata.slice(0, SERIES_METADATA_PREVIEW_ROWS);
+    const rest = result.staged
+      ? `the rest: imf_dataframe_query on table ${result.table_name}, whose rows carry each series' attributes`
+      : 'query fewer series per call for the rest';
+    lines.push(
+      shown.length < total
+        ? `\n**Series attributes** — ${shown.length} of ${total} series shown; ${rest}\n`
+        : '\n**Series attributes** — one row per combination, naming every series that has it\n',
+    );
+    lines.push(
+      ...seriesAttributeTable(
+        shown,
+        result.series_metadata.some((entry) => entry.reference_period != null),
+      ),
+    );
+    // Either way a blank line ends the table: a line straight after it reads as one more row.
+    lines.push(
+      primaryMeta
+        ? `\n\`series_attributes\` describes the first series, ${tableCell(result.series_metadata[0]?.series_key ?? '')}: ${primaryMeta}\n`
+        : '',
+    );
   } else if (primaryMeta) {
     lines.push(`**Series:** ${primaryMeta}`);
   }
@@ -415,6 +737,31 @@ function formatQueryDataset(result: QueryDatasetResult) {
   lines.push(
     `**Observations:** ${result.observation_count} | **Staged:** ${result.staged} | **Truncated:** ${result.truncated}`,
   );
+
+  if (result.missing_series && result.missing_series_count !== undefined) {
+    const listed = result.missing_series.length;
+    const total = result.missing_series_count;
+    const extent =
+      listed < total ? `${listed} of ${total} listed, in key order` : `${total}, in key order`;
+    lines.push(
+      `\n**Requested series with no observations** — ${extent}; the reason is the error a query for that series alone returns\n`,
+    );
+    lines.push('| Series Key | Reason | Data Spans |');
+    lines.push('|:-----------|:-------|:-----------|');
+    for (const missing of result.missing_series) {
+      const span = missing.available_range
+        ? `${tableCell(missing.available_range.first)} – ${tableCell(missing.available_range.last)}`
+        : '—';
+      lines.push(`| ${tableCell(missing.series_key)} | ${missing.reason} | ${span} |`);
+    }
+  }
+
+  if (result.unresolved_attributes) {
+    const { concepts, series_count, guidance } = result.unresolved_attributes;
+    lines.push(
+      `\n**Attributes not recovered:** ${concepts.join(', ')} — null on ${series_count} series. ${guidance}`,
+    );
+  }
 
   if (result.staged) {
     lines.push(
@@ -425,12 +772,24 @@ function formatQueryDataset(result: QueryDatasetResult) {
   }
 
   if (result.observations.length > 0) {
-    lines.push('\n| Series Key | Time Period | Value (base units) | Status |');
-    lines.push('|:-----------|:------------|-------------------:|:-------|');
+    const withReferencePeriod = result.observations.some((obs) => obs.reference_period != null);
+    lines.push(
+      withReferencePeriod
+        ? '\n| Series Key | Time Period | Value (base units) | Status | Reference Period |'
+        : '\n| Series Key | Time Period | Value (base units) | Status |',
+    );
+    lines.push(
+      withReferencePeriod
+        ? '|:-----------|:------------|-------------------:|:-------|:-----------------|'
+        : '|:-----------|:------------|-------------------:|:-------|',
+    );
     for (const obs of result.observations) {
       const val = obs.value != null ? obs.value.toString() : '—';
+      const referencePeriod = withReferencePeriod
+        ? ` ${tableCell(obs.reference_period ?? null)} |`
+        : '';
       lines.push(
-        `| ${tableCell(obs.series_key)} | ${tableCell(obs.time_period)} | ${val} | ${tableCell(obs.status)} |`,
+        `| ${tableCell(obs.series_key)} | ${tableCell(obs.time_period)} | ${val} | ${tableCell(obs.status)} |${referencePeriod}`,
       );
     }
   }
@@ -438,7 +797,7 @@ function formatQueryDataset(result: QueryDatasetResult) {
   lines.push(`\n_${result.source}_`);
   if (result.retrieval_guidance) lines.push(`\n> ${result.retrieval_guidance}`);
 
-  return [{ type: 'text' as const, text: lines.join('\n') }];
+  return lines.join('\n');
 }
 
 /**
@@ -505,6 +864,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     'Returns observations with time_period, value, and status, plus the unit, scale, and ' +
     'decimals of each series — a key resolving to several series carries one entry per series ' +
     'in series_metadata, since unit and scale differ between them. ' +
+    'An index series also carries the reference_period it is based on (e.g. 2010A, 2010=100) exactly as published, ' +
+    'on the series and, where the dataflow publishes one per observation, on each observation. ' +
     'Requires imf_get_database first to obtain the correct key_format and valid dimension codes. ' +
     'Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE). ' +
     'Key format: dot-separated codes in DSD keyPosition order (e.g. USA.NGDP_RPCH.A for WEO). ' +
@@ -514,6 +875,10 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     'an unknown code is rejected with the nearest valid codes. ' +
     'Codelists from imf_get_database enumerate the code universe, not actual coverage — ' +
     'valid codes can still return no_data if the combination has no series. ' +
+    'When a + key returns data for some requested series and none for others, missing_series names each empty one ' +
+    'with the reason a query for it alone gives (no_data or no_data_in_range). ' +
+    'When the extra request that recovers the unit, scale, or decimals a + key suppresses fails, ' +
+    'unresolved_attributes names them and how to get them. ' +
     'start_period and end_period must be valid period strings (YYYY, YYYY-SN, YYYY-QN, ' +
     'YYYY-MM, or a calendar-valid YYYY-MM-DD) with start_period no later than end_period; malformed or ' +
     'reversed ranges are rejected. ' +
@@ -539,16 +904,12 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         'Dataflow identifier from imf_list_databases, e.g. WEO, BOP, CPI. ' +
           'Matched case-insensitively; the response echoes the catalog spelling.',
       ),
-    agency_id: z
-      .string()
-      .optional()
-      .describe(
-        'Agency ID, e.g. IMF.RES or IMF.STA. Auto-detected from dataflow list when omitted.',
-      ),
-    version: z
-      .string()
-      .optional()
-      .describe('Dataflow version. Auto-detected from dataflow list when omitted.'),
+    agency_id: blankAsUnset(z.string().optional()).describe(
+      'Agency ID, e.g. IMF.RES or IMF.STA, matched case-insensitively. Auto-detected from dataflow list when omitted.',
+    ),
+    version: blankAsUnset(z.string().optional()).describe(
+      'Dataflow version, e.g. 9.0.0. Auto-detected from dataflow list when omitted.',
+    ),
     key: z
       .string()
       .describe(
@@ -559,49 +920,42 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           'indicator for all countries, and CAN.*.A every indicator for Canada. ' +
           'Every position needs a code or a *; an empty segment (USA..A) is rejected. ' +
           'A * stands alone at its position — combined with other codes (USA+*) it is rejected. ' +
-          'Codes are trimmed and matched case-insensitively (usa resolves to USA), and the response echoes the canonical key. ' +
+          'Codes are trimmed and matched case-insensitively (usa resolves to USA), empty and repeated + members are dropped ' +
+          '(USA++GBR+USA is queried as USA+GBR, and notice says so), and the response echoes the canonical key. ' +
           "A code missing from its dimension's codelist is rejected before the query, naming the nearest valid codes. " +
+          'The portal limits the request URL, so a + list of a few hundred codes is rejected as too long — use * there, or split the codes across calls. ' +
           'Country codes are ISO 3-letter: USA not US, GBR not GB, DEU not DE.',
       ),
-    start_period: z
-      .string()
-      .optional()
-      .describe(
-        'Start of time range (inclusive). Accepts any of YYYY (annual), ' +
-          'YYYY-SN (semi-annual, e.g. 2023-S1), YYYY-QN (quarterly, e.g. 2023-Q1), ' +
-          'YYYY-MM (monthly), or a calendar-valid YYYY-MM-DD (daily), whatever the ' +
-          "dataflow's frequency. The bound covers the whole period it names, so " +
-          'start_period 2023 admits 2023-M01 and 2023-Q1. ' +
-          'Observations before this period are excluded from the result.',
-      ),
-    end_period: z
-      .string()
-      .optional()
-      .describe(
-        'End of time range (inclusive). Same formats as start_period, and must not ' +
-          'be earlier than it. The bound covers the whole period it names, so ' +
-          'end_period 2023 admits 2023-M12 and 2023-Q4. ' +
-          'Observations after this period are excluded from the result.',
-      ),
-    last_n_observations: blankAsUnset(
+    start_period: blankAsUnset(z.string().trim().optional()).describe(
+      'Start of time range (inclusive). Accepts any of YYYY (annual), ' +
+        'YYYY-SN (semi-annual, e.g. 2023-S1), YYYY-QN (quarterly, e.g. 2023-Q1), ' +
+        'YYYY-MM (monthly), or a calendar-valid YYYY-MM-DD (daily), whatever the ' +
+        "dataflow's frequency. The bound covers the whole period it names, so " +
+        'start_period 2023 admits 2023-M01 and 2023-Q1. ' +
+        'Observations before this period are excluded from the result.',
+    ),
+    end_period: blankAsUnset(z.string().trim().optional()).describe(
+      'End of time range (inclusive). Same formats as start_period, and must not ' +
+        'be earlier than it. The bound covers the whole period it names, so ' +
+        'end_period 2023 admits 2023-M12 and 2023-Q4. ' +
+        'Observations after this period are excluded from the result.',
+    ),
+    last_n_observations: blankAsUnsetNumber(
       z.number().int().min(1).max(MAX_LAST_N_OBSERVATIONS).optional(),
     ).describe(
-      "Keep only each series' last N observations, an integer from 1 to 10,000; 1 returns each series' latest value. " +
+      "Keep only each series' last N observations, an integer from 1 to 1,000,000; 1 returns each series' latest value. " +
         'Latest is per series: series end at different periods, and a WEO series ends in its projection years (e.g. 2031), ' +
         'so set end_period to stop at a past year. With start_period or end_period, the last N inside that range. ' +
         'A series with fewer than N observations is returned whole. Omit to return every observation.',
     ),
-    canvas_id: CanvasIdSchema.optional().describe(
+    canvas_id: blankAsUnset(CanvasIdSchema.optional()).describe(
       'Existing canvas ID to accumulate results into across multiple queries. ' +
         'This selects the destination only; it does not force staging. Use output_mode="canvas" to stage an under-budget result.',
     ),
-    output_mode: z
-      .enum(['auto', 'canvas'])
-      .default('auto')
-      .describe(
-        'Result placement. auto returns an under-budget result inline and spills only when needed. ' +
-          'canvas explicitly stages the full result, using canvas_id when supplied or allocating a fresh canvas.',
-      ),
+    output_mode: blankAsUnset(z.enum(['auto', 'canvas']).default('auto')).describe(
+      'Result placement. auto returns an under-budget result inline and spills only when needed. ' +
+        'canvas explicitly stages the full result, using canvas_id when supplied or allocating a fresh canvas.',
+    ),
   }),
   output: z.object({
     dataflow_id: z
@@ -661,6 +1015,14 @@ export const imfQueryDataset = tool('imf_query_dataset', {
                   'A null value with no status, or whose only status is the not-available marker NA or n.a. (any letter case), is omitted as padding; ' +
                   'a null value with any other status is returned.',
               ),
+            reference_period: z
+              .string()
+              .optional()
+              .describe(
+                "This observation's own reference (base) period, exactly as published, e.g. 2010A or 2010M1. " +
+                  'Present only when the observation carries one (CPI and GS_LEPM publish it); where the series-level value reads Multiple, it varies by observation. ' +
+                  'Never filled in from the series.',
+              ),
           })
           .describe('A single time-series observation.'),
       )
@@ -684,6 +1046,13 @@ export const imfQueryDataset = tool('imf_query_dataset', {
               'Observation values are already in base units, so the published figure is value / 10^scale.',
           ),
         decimals: z.number().nullable().describe('Number of decimal places shown.'),
+        reference_period: z
+          .string()
+          .optional()
+          .describe(
+            'Reference (base) period of an index series, exactly as published: free text such as 2010A, 2016M12, 2010=100, or Multiple ' +
+              '(the observations carry their own). Present only when the series carries one; never parsed as a time_period.',
+          ),
       })
       .describe(
         'Attributes of the first series in the result — the same series as series_metadata[0]. ' +
@@ -716,8 +1085,15 @@ export const imfQueryDataset = tool('imf_query_dataset', {
               .number()
               .nullable()
               .describe('Number of decimal places shown for this series.'),
+            reference_period: z
+              .string()
+              .optional()
+              .describe(
+                "This series' reference (base) period, exactly as published, e.g. 2010A or 2010=100. " +
+                  'Present only when the series carries one.',
+              ),
           })
-          .describe('Unit, scale, and decimals for one series in the result.'),
+          .describe('Unit, scale, decimals, and reference period for one series in the result.'),
       )
       .optional()
       .describe(
@@ -726,6 +1102,63 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           'values in series_attributes instead. Unit and scale differ across series in one query — ' +
           'WEO NGDPD is USD published in billions (scale 9) while NGDP_RPCH is PT at scale 0 — so interpret each series ' +
           'against its own entry.',
+      ),
+    unresolved_attributes: z
+      .object({
+        concepts: z
+          .array(z.enum(['unit', 'scale', 'decimals']))
+          .describe('Attributes the recovery request failed to bring back, e.g. ["unit"].'),
+        series_count: z
+          .number()
+          .describe('Series in the result whose value for a listed attribute is null.'),
+        guidance: z
+          .string()
+          .describe(
+            'How to get them: retry, or query the key with a * it names (or a * at one position), which matches every code there, so keep only the series requested.',
+          ),
+      })
+      .optional()
+      .describe(
+        'Present only when a + key on the dimension an attribute is grouped by made the portal leave unit, scale, or decimals out, ' +
+          'and the extra request that recovers them failed. A listed attribute that is null is then unknown, not unpublished. ' +
+          'Absent when that request found no value — the dataflow publishes none — or was not needed.',
+      ),
+    missing_series: z
+      .array(
+        z
+          .object({
+            series_key: z
+              .string()
+              .describe(
+                'A requested series that returned no observation: one code per key position, * where the key has *, e.g. ASM.NGDP_RPCH.A.',
+              ),
+            reason: z
+              .enum(['no_data', 'no_data_in_range'])
+              .describe(
+                'What a query for this series alone reports: no_data when it has no observations at all, ' +
+                  'no_data_in_range when it has some, but none inside start_period/end_period.',
+              ),
+            available_range: z
+              .object({
+                first: z.string().describe('Earliest time_period the series has.'),
+                last: z.string().describe('Latest time_period the series has.'),
+              })
+              .optional()
+              .describe('With no_data_in_range: the window the series covers.'),
+          })
+          .describe('One requested series the result does not carry.'),
+      )
+      .optional()
+      .describe(
+        'Requested series of a + key that returned no observation while others did, in key order, at most 20. ' +
+          'A requested series is each combination of the codes listed at every position. ' +
+          'Counted over the full result, so a series left out of a truncated preview is not listed. Absent when every requested series returned.',
+      ),
+    missing_series_count: z
+      .number()
+      .optional()
+      .describe(
+        'How many requested series returned no observation — the full count when missing_series stops at 20. Present with missing_series.',
       ),
     observation_count: z
       .number()
@@ -771,9 +1204,10 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     {
       reason: 'dataflow_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'dataflow_id does not match any known dataflow on api.imf.org',
+      when: 'dataflow_id matches no catalog dataflow on api.imf.org, or none under the agency_id and version given',
       severity: 'warning',
-      recovery: 'Call imf_list_databases to browse available dataflow IDs.',
+      recovery:
+        'Call imf_list_databases to browse available dataflow IDs, or omit agency_id and version to auto-detect them.',
     },
     {
       reason: 'no_data',
@@ -808,7 +1242,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     {
       reason: 'empty_key_segment',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A dot-separated position in key is empty or blank, which matches no series upstream',
+      when: 'A dot-separated position in key is empty or blank, or holds only empty + members (USA.NGDP_RPCH.+), which matches no series upstream',
       severity: 'warning',
       recovery:
         'Put * at that position to match every code there, or a code from imf_get_database to pin it.',
@@ -830,6 +1264,14 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         "Replace each named code with one from its dimension's codelist — a suggested code, or one found with imf_get_database using dimension_id and codelist_filter.",
     },
     {
+      reason: 'key_too_long',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'The IMF portal refused the data request because its URL is too long — a + list of a few hundred codes at one position',
+      severity: 'warning',
+      recovery:
+        'Put * at the position the message names to match every code there, or split its codes across several calls.',
+    },
+    {
       reason: 'invalid_period_format',
       code: JsonRpcErrorCode.ValidationError,
       when: 'start_period or end_period is not one of the recognized period formats',
@@ -848,6 +1290,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       reason: 'structure_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
       when: 'The dataflow structure (DSD) cannot be fetched after the dataflow catalog resolved successfully',
+      retryable: true,
       recovery: 'Retry the structure lookup after a short wait.',
     },
     {
@@ -875,6 +1318,26 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       recovery:
         'Retry in a few moments; the IMF SDMX 3.0 portal is intermittently unavailable and the catalog is cached for an hour once it succeeds.',
     },
+    {
+      reason: 'data_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'The data request failed after its retries — the portal answered 5xx or an unusable body, could not be reached, or timed out — or the call spent its 45-second budget for upstream requests',
+      retryable: true,
+      // Raised inside ImfSdmxService.fetchData() and re-thrown untouched.
+      thrownBy: 'service',
+      recovery:
+        'Retry shortly; the IMF portal is intermittently slow or unavailable. A wide key (* or a long + list) on a large dataflow can also be narrowed to fewer series so the portal answers sooner.',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'The IMF portal answered the data request with HTTP 429 after its retries',
+      retryable: true,
+      // Raised inside ImfSdmxService.fetchData() and re-thrown untouched.
+      thrownBy: 'service',
+      recovery:
+        'Wait the retryAfter seconds the error carries, or a few seconds when it carries none, then retry the same call.',
+    },
   ],
 
   enrichment: {
@@ -882,7 +1345,9 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .string()
       .optional()
       .describe(
-        'Populated when a period bound was set but some observations carry a time_period label the range filter does not recognize. Composes with retrieval_guidance, staged or not, when both apply.',
+        'Populated when empty or duplicate + members were dropped from key (naming each position and the key queried), ' +
+          'or when a period bound was set but some observations carry a time_period label the range filter does not recognize; ' +
+          'both texts appear when both apply. Composes with retrieval_guidance, staged or not, when both apply.',
       ),
   },
 
@@ -926,13 +1391,20 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     // Resolve dataflow
     const dataflow = await svc.findDataflow(input.dataflow_id, input.agency_id, input.version, ctx);
     if (!dataflow) {
-      throw ctx.fail('dataflow_not_found', `Dataflow '${input.dataflow_id}' not found`, {
+      const miss = await svc.describeDataflowMiss(
+        input.dataflow_id,
+        input.agency_id,
+        input.version,
+        ctx,
+      );
+      throw ctx.fail('dataflow_not_found', miss.message, {
         dataflowId: input.dataflow_id,
+        ...(miss.hint ? { recovery: { hint: miss.hint } } : {}),
       });
     }
 
-    // The catalog spelling — findDataflow resolves dataflow_id case-insensitively,
-    // and the portal only answers the exact id.
+    // The catalog spelling — findDataflow resolves dataflow_id, agency_id, and
+    // version case-insensitively, and the portal only answers the exact strings.
     const dataflowId = dataflow.id;
 
     // Get DSD to validate key dimension count
@@ -940,11 +1412,12 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     try {
       structure = await svc.fetchDataflowStructure(
         dataflowId,
-        input.agency_id ?? dataflow.agencyId,
-        input.version ?? dataflow.version,
+        dataflow.agencyId,
+        dataflow.version,
         ctx,
       );
     } catch (err: unknown) {
+      if (ctx.signal.aborted) throw err;
       if (err instanceof McpError && err.data?.reason === 'dataflow_list_unavailable') throw err;
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('not found')) {
@@ -957,13 +1430,16 @@ export const imfQueryDataset = tool('imf_query_dataset', {
      * The portal matches codes case- and whitespace-sensitively, answering a
      * padded or lowercased code with HTTP 200 and zero series. Trim every
      * position and + member here; the codelist check below restores each code's
-     * canonical spelling.
+     * canonical spelling. Empty and repeated + members are dropped in the same
+     * step: the portal ignores an empty member but counts a repeated one toward
+     * its URL-length limit, and a position whose members were all blank is left
+     * empty so it fails as one. Every check below sees the key that is sent.
      */
-    const keySegments = input.key.split('.').map((segment) =>
-      segment
-        .split('+')
-        .map((member) => member.trim())
-        .join('+'),
+    const sentMembers = input.key
+      .split('.')
+      .map((segment) => segment.split('+').map((member) => member.trim()));
+    const keySegments = sentMembers.map((members) =>
+      [...new Set(members.filter((member) => member !== ''))].join('+'),
     );
     const trimmedKey = keySegments.join('.');
     const namePositions = (indexes: number[]) =>
@@ -994,9 +1470,12 @@ export const imfQueryDataset = tool('imf_query_dataset', {
      */
     const blankPositions = keySegments.flatMap((segment, index) => (segment === '' ? [index] : []));
     if (blankPositions.length > 0) {
+      const blankList = blankPositions.some((index) => (sentMembers[index]?.length ?? 0) > 1)
+        ? ' A + list whose members are all blank is empty too.'
+        : '';
       throw ctx.fail(
         'empty_key_segment',
-        `Key '${trimmedKey}' leaves position ${namePositions(blankPositions)} empty. An empty position matches no series — use * to match every code there. Key format: ${structure.keyFormat}`,
+        `Key '${trimmedKey}' leaves position ${namePositions(blankPositions)} empty.${blankList} An empty position matches no series — use * to match every code there. Key format: ${structure.keyFormat}`,
         {
           key: trimmedKey,
           emptyPositions: blankPositions.map((index) => index + 1),
@@ -1029,35 +1508,33 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     /**
      * Resolve every code against its own dimension's codelist before the fetch.
      * An unknown code otherwise comes back as HTTP 200 with zero series and is
-     * misdiagnosed as missing coverage. `*`, empty + members, and positions whose
-     * codelist resolved empty pass through unchecked.
+     * misdiagnosed as missing coverage. `*` and positions whose codelist resolved
+     * empty pass through unchecked. Two spellings of one code resolve to one
+     * member, so the repeat is dropped here, as an exact one was above.
      */
     const invalidCodes: InvalidKeyCode[] = [];
-    const key = keySegments
-      .map((segment, index) => {
-        const dimension = structure.dimensions[index];
-        if (!dimension || dimension.codelist.length === 0) return segment;
-        return segment
-          .split('+')
-          .map((member) => {
-            if (member === '' || member === '*') return member;
-            const canonical = resolveCode(member, dimension.codelist);
-            if (canonical) return canonical;
-            const belongsTo = structure.dimensions.find(
-              (other) => other !== dimension && resolveCode(member, other.codelist),
-            )?.id;
-            invalidCodes.push({
-              position: index + 1,
-              dimension: dimension.id,
-              code: member,
-              suggestions: nearestCodes(member, dimension.codelist),
-              ...(belongsTo ? { belongsTo } : {}),
-            });
-            return member;
-          })
-          .join('+');
-      })
-      .join('.');
+    const keyMembers = keySegments.map((segment, index) => {
+      const dimension = structure.dimensions[index];
+      const members = segment.split('+');
+      if (!dimension || dimension.codelist.length === 0) return members;
+      const resolved = members.map((member) => {
+        if (member === '*') return member;
+        const canonical = resolveCode(member, dimension.codelist);
+        if (canonical) return canonical;
+        const belongsTo = structure.dimensions.find(
+          (other) => other !== dimension && resolveCode(member, other.codelist),
+        )?.id;
+        invalidCodes.push({
+          position: index + 1,
+          dimension: dimension.id,
+          code: member,
+          suggestions: nearestCodes(member, dimension.codelist),
+          ...(belongsTo ? { belongsTo } : {}),
+        });
+        return member;
+      });
+      return [...new Set(resolved)];
+    });
     if (invalidCodes.length > 0) {
       throw ctx.fail(
         'invalid_key_code',
@@ -1065,47 +1542,89 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         { key: trimmedKey, invalidCodes, keyFormat: structure.keyFormat },
       );
     }
+    /**
+     * The normalized key: trimmed, in codelist spelling, with no empty or
+     * repeated member. It drives the data request, both availability probes,
+     * every message, and the `key` echo; `keyMembers` holds its codes per position.
+     */
+    const key = keyMembers.map((members) => members.join('+')).join('.');
+
+    /**
+     * Every notice the response carries, composed into the one `notice` slot in
+     * the order they arise. The composed text is what `serializedResultChars`
+     * and `fitToBudget` measure below, and `noticeCharsBound` bounds.
+     */
+    const notices: string[] = [];
+    const droppedNotice = describeDroppedMembers(
+      sentMembers,
+      keyMembers,
+      structure.dimensions,
+      key,
+    );
+    if (droppedNotice) notices.push(droppedNotice);
+
+    /**
+     * The portal refuses a request URL past its length limit without saying
+     * which part is long; the position listing the most characters is the one
+     * a `*` or a split shortens most.
+     */
+    const keyTooLong = () => {
+      const lengths = keyMembers.map((members) => encodeURIComponent(members.join('+')).length);
+      const index = lengths.indexOf(Math.max(...lengths));
+      const memberCount = keyMembers[index]?.length ?? 0;
+      return ctx.fail(
+        'key_too_long',
+        `Key is too long for one IMF data request — the portal refused the request URL for its length. Its longest part is position ${namePositions([index])}, which lists ${memberCount} code${memberCount === 1 ? '' : 's'}.`,
+        {
+          position: index + 1,
+          dimension: structure.dimensions[index]?.id,
+          memberCount,
+          keyLength: key.length,
+        },
+      );
+    };
 
     // Fetch data
     // Preserve the service's actual McpError code, reason, retryability, and
     // cause. A data-request failure is not evidence that the DSD was unavailable.
     const fetchObservations = (lastNObservations: number | undefined) =>
-      svc.fetchData(
-        dataflow.agencyId,
-        dataflowId,
-        dataflow.version,
-        key,
-        input.start_period,
-        input.end_period,
-        ctx,
-        ctx.signal,
-        lastNObservations,
-      );
+      svc
+        .fetchData(
+          dataflow.agencyId,
+          dataflowId,
+          dataflow.version,
+          key,
+          input.start_period,
+          input.end_period,
+          ctx,
+          ctx.signal,
+          lastNObservations,
+        )
+        .catch((err: unknown) => {
+          if (err instanceof McpError && err.data?.reason === 'key_too_long') throw keyTooLong();
+          throw err;
+        });
 
     /**
      * The portal honors `lastNObservations` per series but ignores the period
      * bounds, so N is forwarded only when no bound is set; with one, the range
      * is applied locally and N selected inside it. The portal also counts null
-     * padding toward N, so a series whose last N cells are padding would vanish
-     * in the drop below: a forwarded response the drop takes any row from is
-     * fetched again in full and selected locally.
+     * padding toward N, so a series whose last N cells hold padding would lose
+     * real rows in the drop below: when one came back with N cells and padding
+     * among them, the request is fetched again in full and N selected locally.
      */
     const lastN = input.last_n_observations;
     const forwardedN = input.start_period || input.end_period ? undefined : lastN;
     let queryResult = await fetchObservations(forwardedN);
-    let nonPaddingObservations = queryResult.observations.filter((obs) => !isNullPadding(obs));
-    if (
-      forwardedN !== undefined &&
-      nonPaddingObservations.length < queryResult.observations.length
-    ) {
+    if (forwardedN !== undefined && paddingHidesRows(queryResult.observations, forwardedN)) {
       ctx.log.debug('lastNObservations response carried null padding; re-fetching in full', {
         dataflowId,
         key,
         lastN: forwardedN,
       });
       queryResult = await fetchObservations(undefined);
-      nonPaddingObservations = queryResult.observations.filter((obs) => !isNullPadding(obs));
     }
+    const nonPaddingObservations = queryResult.observations.filter((obs) => !isNullPadding(obs));
 
     // Apply period filter server-side (startSpan / endSpan validated at handler top).
     const filteredObservations =
@@ -1147,10 +1666,14 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     // with availability to separate "code not covered" from "wrong combination".
     if (filteredObservations.length === 0) {
       // Uses the first dimension code from the key (e.g. "TUR" from "TUR.MFS135.M").
+      // A failed lookup comes back null; only a caller cancellation throws.
       const firstCode = key.split('.')[0] ?? '';
-      const availability = await svc
-        .fetchAvailabilityConstraint(dataflow, firstCode, ctx, ctx.signal)
-        .catch(() => null);
+      const availability = await svc.fetchAvailabilityConstraint(
+        dataflow,
+        firstCode,
+        ctx,
+        ctx.signal,
+      );
 
       /**
        * A key-scoped constraint answers "does this code have series" and nothing
@@ -1162,7 +1685,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
        */
       const dataflowAvailability =
         availability?.series_count === 0
-          ? await svc.fetchAvailabilityConstraint(dataflow, '', ctx, ctx.signal).catch(() => null)
+          ? await svc.fetchAvailabilityConstraint(dataflow, '', ctx, ctx.signal)
           : null;
 
       let noDataMsg: string;
@@ -1242,19 +1765,17 @@ export const imfQueryDataset = tool('imf_query_dataset', {
      * before, so say it: the response would otherwise echo a range it did not
      * apply to these rows.
      */
-    let periodNotice: string | undefined;
     if (startSpan || endSpan) {
       const unrecognized = selectedObservations.filter(
         (obs) => periodSpan(obs.time_period) === null,
       );
       if (unrecognized.length > 0) {
         const samples = [...new Set(unrecognized.map((obs) => obs.time_period))].slice(0, 3);
-        periodNotice =
-          `${unrecognized.length} observation(s) carry a period label this tool cannot parse (${samples.join(', ')}), ` +
-          `so start_period/end_period were not applied to them and they are returned unfiltered.`;
-        ctx.enrich.notice(periodNotice);
+        notices.push(unparseablePeriodNotice(unrecognized.length, samples));
       }
     }
+    const notice = notices.length > 0 ? notices.join(' ') : undefined;
+    if (notice) ctx.enrich.notice(notice);
 
     /**
      * Attributes belong to a series, not to a query. Everything downstream — the
@@ -1277,6 +1798,12 @@ export const imfQueryDataset = tool('imf_query_dataset', {
               unit: attrs.unit,
               scale: attrs.scale,
               decimals: attrs.decimals,
+              // Present only when published: every response carries this list
+              // in its fixed part, where an always-present null would cost
+              // PI's and ITG's thousand-series keys their place in the budget.
+              ...(attrs.reference_period != null
+                ? { reference_period: attrs.reference_period }
+                : {}),
             };
           })
         : undefined;
@@ -1294,6 +1821,34 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       ? attributesFor(primarySeriesKey)
       : queryResult.seriesAttributes;
 
+    /**
+     * Requested series the portal left out of a + key's response, named over
+     * the full result — the inline prefix below may be cut to the budget, and a
+     * series it leaves out is still returned.
+     */
+    const missing = findMissingSeries(keyMembers, filteredObservations, nonPaddingObservations);
+
+    /**
+     * Attributes the recovery request failed to bring back, counted over the
+     * series still null for one of them. A failure the decode has nothing left
+     * null for is no failure the caller can see.
+     */
+    const unresolved = queryResult.unresolvedAttributes;
+    const unresolvedSeriesCount = unresolved
+      ? seriesKeys.filter((seriesKey) => {
+          const attrs = attributesFor(seriesKey);
+          return unresolved.concepts.some((concept) => attrs[concept] === null);
+        }).length
+      : 0;
+    const unresolvedAttributes =
+      unresolved && unresolvedSeriesCount > 0
+        ? {
+            concepts: unresolved.concepts,
+            series_count: unresolvedSeriesCount,
+            guidance: unresolvedGuidance(unresolved),
+          }
+        : undefined;
+
     ctx.log.info('Data query completed', {
       dataflowId,
       key,
@@ -1310,6 +1865,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       ...(lastN !== undefined ? { last_n_observations: lastN } : {}),
       series_attributes: seriesAttributes,
       ...(seriesMetadata ? { series_metadata: seriesMetadata } : {}),
+      ...(unresolvedAttributes ? { unresolved_attributes: unresolvedAttributes } : {}),
+      ...(missing ? { missing_series: missing.listed, missing_series_count: missing.count } : {}),
       observation_count: selectedObservations.length,
       source,
     };
@@ -1323,14 +1880,14 @@ export const imfQueryDataset = tool('imf_query_dataset', {
 
     // Canvas stage/spill path
     const canvas = getCanvas();
-    if (input.output_mode === 'canvas' && !canvas) {
+    const explicit = input.output_mode === 'canvas';
+    if (explicit && !canvas) {
       throw ctx.fail(
         'canvas_unavailable',
         'output_mode="canvas" requires DataCanvas, but no canvas provider is configured',
       );
     }
-    const explicit = input.output_mode === 'canvas';
-    if (!explicit && serializedResultChars(inlineResult, periodNotice) <= RESPONSE_BUDGET_CHARS) {
+    if (!explicit && serializedResultChars(inlineResult, notice) <= RESPONSE_BUDGET_CHARS) {
       return inlineResult;
     }
 
@@ -1360,7 +1917,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           };
         },
         selectedObservations.length,
-        periodNotice,
+        notice,
       );
       if ('fixedChars' in fitted) {
         throw tooLarge(fitted.fixedChars, "The result's full series metadata requires");
@@ -1387,7 +1944,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         truncated: count < selectedObservations.length,
       }),
       selectedObservations.length,
-      periodNotice,
+      notice,
     );
     if ('fixedChars' in fitted) {
       throw tooLarge(
@@ -1412,6 +1969,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       { name: 'unit', type: 'VARCHAR' },
       { name: 'scale', type: 'VARCHAR' },
       { name: 'decimals', type: 'INTEGER' },
+      { name: 'series_reference_period', type: 'VARCHAR' },
+      { name: 'reference_period', type: 'VARCHAR' },
     ];
     const rows = selectedObservations.map((obs) => {
       const attrs = attributesFor(obs.series_key);
@@ -1424,6 +1983,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         unit: attrs.unit,
         scale: attrs.scale,
         decimals: attrs.decimals,
+        series_reference_period: attrs.reference_period ?? null,
+        reference_period: obs.reference_period ?? null,
       };
     });
     await instance.registerTable(tableName, rows, { schema, signal: ctx.signal });

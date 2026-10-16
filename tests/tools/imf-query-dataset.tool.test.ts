@@ -17,6 +17,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { captureMcpError, contractError, recoveryHint } from '../helpers/errors.js';
+import { rowCells } from '../helpers/markdown-table.js';
 
 vi.mock('@/services/imf-sdmx/imf-sdmx-service.js', () => ({
   getImfSdmxService: vi.fn(),
@@ -129,10 +130,16 @@ describe('imfQueryDataset', () => {
     fetchDataflowStructure: ReturnType<typeof vi.fn>;
     fetchData: ReturnType<typeof vi.fn>;
     fetchAvailabilityConstraint: ReturnType<typeof vi.fn>;
+    describeDataflowMiss: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
     mockSvc = {
+      describeDataflowMiss: vi
+        .fn()
+        .mockImplementation((dataflowId: string) =>
+          Promise.resolve({ message: `Dataflow '${dataflowId}' not found` }),
+        ),
       // Resolves whichever id was asked for, in the catalog's upper-case spelling —
       // the tool carries the catalog's id, not its input, into every later call.
       findDataflow: vi
@@ -694,6 +701,48 @@ describe('imfQueryDataset', () => {
     expect(text).toContain(structured.notice);
   });
 
+  it('#63 composes the dropped-member and period-label notices into one notice inside the budget', async () => {
+    const series = ['USA.NGDP_RPCH.A', 'GBR.NGDP_RPCH.A', 'DEU.NGDP_RPCH.A'];
+    const observations = Array.from({ length: 1_800 }, (_, period) =>
+      series.map((series_key, s) => ({
+        series_key,
+        time_period: `${1850 + Math.floor(period / 12)}-M${String((period % 12) + 1).padStart(2, '0')}`,
+        value: period + s / 10 + 0.123456,
+        status: null,
+      })),
+    )
+      .flat()
+      .concat({ series_key: series[0]!, time_period: '2000-W07', value: 1, status: null });
+    mockSvc.fetchData.mockResolvedValue({
+      ...MOCK_QUERY_RESULT,
+      observations,
+      seriesAttributesByKey: Object.fromEntries(series.map((key) => [key, NGDP_RPCH_ATTRS])),
+    });
+
+    const result = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA++GBR+DEU+.NGDP_RPCH+NGDP_RPCH.A+',
+      end_period: '2100',
+    });
+    const structured = result.structuredContent as TruncatedInline & { key: string };
+    const text = (result.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
+
+    expect(mockSvc.fetchData.mock.calls.map((call) => call[3])).toEqual([
+      'USA+GBR+DEU.NGDP_RPCH.A',
+    ]);
+    expect(structured.key).toBe('USA+GBR+DEU.NGDP_RPCH.A');
+    expect(structured.truncated).toBe(true);
+    // Both texts in the one notice slot, on both channels.
+    expect(structured.notice).toContain('2000-W07');
+    expect(structured.notice).toContain('position 1 (COUNTRY)');
+    expect(structured.notice).toContain('position 2 (INDICATOR)');
+    expect(structured.notice).toContain('position 3 (FREQUENCY)');
+    expect(text).toContain(structured.notice);
+    // The composed notice is measured with the rest of the envelope.
+    expect(envelopeChars(result)).toBeLessThanOrEqual(100_000);
+    expect(envelopeChars(result)).toBeGreaterThan(99_000);
+  });
+
   it('#50 cuts one long series the same way, with no per-series list to carry', async () => {
     const observations = Array.from({ length: 1_500 }, (_, index) => ({
       series_key: 'USA.NGDP_RPCH.A',
@@ -827,30 +876,6 @@ describe('imfQueryDataset', () => {
     expect(lines).toContain('| USA.NGDP_RPCH.A | 2021 | 5.1 | E |');
   });
 
-  /**
-   * GFM cells of one rendered table row. A backslash escapes the character after
-   * it, so only an unescaped `|` divides cells — the rule a markdown renderer
-   * applies, and the one a status carrying a `|` has to survive.
-   */
-  const rowCells = (row: string): string[] => {
-    const cells: string[] = [];
-    let cell = '';
-    for (let i = 0; i < row.length; i++) {
-      const ch = row[i];
-      if (ch === '\\' && i + 1 < row.length) {
-        cell += ch + row[i + 1];
-        i++;
-      } else if (ch === '|') {
-        cells.push(cell.trim());
-        cell = '';
-      } else {
-        cell += ch;
-      }
-    }
-    cells.push(cell.trim());
-    return cells.slice(1, -1);
-  };
-
   it('escapes a status that would split, restyle, or break its table row', () => {
     const statuses = ['a|b', '`', '/temporarily removed 148118', 'end\\|', 'first line\nsecond'];
     const output = {
@@ -904,12 +929,17 @@ describe('imfQueryDataset', () => {
     };
     const rows = (imfQueryDataset.format!(output)[0] as { text: string }).text
       .split('\n')
-      .filter((line) => line.startsWith('| ') && !line.startsWith('| Series Key |'));
+      .filter(
+        (line) =>
+          line.startsWith('| ') &&
+          !line.startsWith('| Series Key |') &&
+          !line.startsWith('| Unit |'),
+      );
 
     // Each row keeps exactly its four cells, and unescaping gives back the upstream text.
     expect(rows.map((row) => rowCells(row).map((cell) => cell.replace(/\\(.)/g, '$1')))).toEqual([
-      ['A|B.X.A', 'USD|EUR', 'published in units of 10^9|x', '2'],
-      ['C.X.A', '—', '—', '—'],
+      ['USD|EUR', 'published in units of 10^9|x', '2', 'A|B.X.A'],
+      ['—', '—', '—', 'C.X.A'],
       ['A|B.X.A', '2020|S1', '1', '—'],
       ['C.X.A', '2020', '2', '—'],
     ]);
@@ -2325,8 +2355,8 @@ describe('imfQueryDataset', () => {
     expect(
       Object.fromEntries(structured.series_metadata.map((s) => [s.series_key, s.unit])),
     ).toEqual({ 'USA.NGDPD.A': 'USD', 'USA.NGDP_RPCH.A': 'PT' });
-    expect(text).toMatch(/\|\s*USA\.NGDPD\.A\s*\|\s*USD\s*\|/);
-    expect(text).toMatch(/\|\s*USA\.NGDP_RPCH\.A\s*\|\s*PT\s*\|/);
+    expect(cellsByKey(text).get('USA.NGDPD.A')?.[0]).toBe('USD');
+    expect(cellsByKey(text).get('USA.NGDP_RPCH.A')?.[0]).toBe('PT');
   });
 
   it('#15 lists one metadata entry per distinct series, not one per observation', async () => {
@@ -2412,14 +2442,16 @@ describe('imfQueryDataset', () => {
     });
     const text = (result.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
 
-    expect(text).toMatch(
-      /\|\s*USA\.NGDPD\.A\s*\|\s*US Dollar\s*\|\s*published in units of 10\^9\s*\|/,
-    );
-    expect(text).toMatch(/\|\s*USA\.NGDP_RPCH\.A\s*\|\s*—\s*\|\s*published in units\s*\|/);
+    expect(cellsByKey(text).get('USA.NGDPD.A')).toEqual([
+      'US Dollar',
+      'published in units of 10^9',
+      '3',
+    ]);
+    expect(cellsByKey(text).get('USA.NGDP_RPCH.A')).toEqual(['—', 'published in units', '3']);
   });
 
-  it('#15 caps the rendered series table and says so, keeping every entry in structuredContent', async () => {
-    // A `*` key resolves to hundreds of series; the table is bounded, the data is not.
+  it('#15 renders every series of a 40-series key, grouped so the table stays short', async () => {
+    // A `*` key resolves to hundreds of series; series sharing their attributes share a row.
     const many = Array.from({ length: 40 }, (_, i) => `C${String(i).padStart(3, '0')}.NGDPD.A`);
     mockSvc.fetchData.mockResolvedValue({
       ...TWO_SERIES_RESULT,
@@ -2439,12 +2471,16 @@ describe('imfQueryDataset', () => {
     const text = (result.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
 
     expect(structured.series_metadata).toHaveLength(40);
-    expect(text).toContain('20 of 40 series shown');
-    // Attribute rows carry unit/scale/decimals; observation rows carry values,
-    // so counting the attribute shape is what measures the rendered table.
-    const attributeRows = text.match(/\|\s*C\d{3}\.NGDPD\.A\s*\|\s*US Dollar\s*\|/g) ?? [];
-    expect(attributeRows).toHaveLength(20);
-    expect(text).toContain('every entry remains in structuredContent');
+    expect(text).not.toMatch(/\d+ of 40 series shown/);
+    // Every key once, beside the one combination all 40 share.
+    expect([...cellsByKey(text).keys()]).toEqual(many);
+    expect(attributeTable(text)?.rows).toHaveLength(1);
+    expect(cellsByKey(text).get('C039.NGDPD.A')).toEqual([
+      'US Dollar',
+      'published in units of 10^9',
+      '3',
+    ]);
+    expect(text).not.toContain('structuredContent');
     expect(text).not.toContain('canvas');
   });
 
@@ -2655,6 +2691,64 @@ describe('imfQueryDataset', () => {
     expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
     expect(recoveryHint(err)).toContain('Retry');
     expect(mockSvc.fetchData).not.toHaveBeenCalled();
+  });
+
+  it('declares structure_unavailable retryable, as its recovery says, and fails with it', async () => {
+    const entry = imfQueryDataset.errors?.find((e) => e.reason === 'structure_unavailable');
+    expect(entry).toMatchObject({ retryable: true });
+    expect(entry?.recovery).toMatch(/retry/i);
+
+    mockSvc.fetchDataflowStructure.mockRejectedValue(new Error('connection reset'));
+    const response = await runToolContract(imfQueryDataset, {
+      dataflow_id: 'WEO',
+      key: 'USA.NGDP_RPCH.A',
+    });
+
+    expect(contractError(response)).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'structure_unavailable', retryable: true },
+    });
+  });
+
+  describe('caller cancellation', () => {
+    /** A service read that the caller cancels while it runs. */
+    const cancelledRead = (caller: AbortController) => () => {
+      caller.abort();
+      return Promise.reject(
+        new McpError(JsonRpcErrorCode.RequestCancelled, 'Request was cancelled.'),
+      );
+    };
+    const cancellable = (caller: AbortController) =>
+      createMockContext({
+        tenantId: 'test',
+        errors: imfQueryDataset.errors,
+        signal: caller.signal,
+      });
+
+    it('keeps a cancelled structure read as RequestCancelled, never structure_unavailable', async () => {
+      const caller = new AbortController();
+      mockSvc.fetchDataflowStructure.mockImplementation(cancelledRead(caller));
+      const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.NGDP_RPCH.A' });
+
+      const err = await captureMcpError(() => imfQueryDataset.handler(input, cancellable(caller)));
+
+      expect(err.code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(err.data?.reason).toBeUndefined();
+      expect(mockSvc.fetchData).not.toHaveBeenCalled();
+    });
+
+    it('keeps a cancelled availability lookup on the no-data path as RequestCancelled, never no_data', async () => {
+      const caller = new AbortController();
+      mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations: [] });
+      mockSvc.fetchAvailabilityConstraint.mockImplementation(cancelledRead(caller));
+      const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'ZZZ.NGDP_RPCH.A' });
+
+      const err = await captureMcpError(() => imfQueryDataset.handler(input, cancellable(caller)));
+
+      expect(err.code).toBe(JsonRpcErrorCode.RequestCancelled);
+      expect(err.data?.reason).toBeUndefined();
+      expect(mockSvc.fetchAvailabilityConstraint).toHaveBeenCalledTimes(1);
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -2899,22 +2993,22 @@ describe('imfQueryDataset', () => {
       expect(mockSvc.fetchData).not.toHaveBeenCalled();
     });
 
-    it('keeps wildcards, + lists, empty + members, and blank positions behaving as before', async () => {
-      for (const key of [
-        '*.NGDP_RPCH.A',
-        'USA+GBR.NGDP_RPCH.A',
-        'USA.NGDP_RPCH+NGDPD.A',
-        'USA+.NGDP_RPCH.A',
-      ]) {
+    it('keeps wildcards, + lists, and blank positions behaving as before, and drops an empty + member', async () => {
+      for (const [key, queried] of [
+        ['*.NGDP_RPCH.A', '*.NGDP_RPCH.A'],
+        ['USA+GBR.NGDP_RPCH.A', 'USA+GBR.NGDP_RPCH.A'],
+        ['USA.NGDP_RPCH+NGDPD.A', 'USA.NGDP_RPCH+NGDPD.A'],
+        ['USA+.NGDP_RPCH.A', 'USA.NGDP_RPCH.A'],
+      ] as const) {
         const response = await query(key);
         expect(response.isError).toBeFalsy();
-        expect((response.structuredContent as { key: string }).key).toBe(key);
+        expect((response.structuredContent as { key: string }).key).toBe(queried);
       }
       expect(fetchedKeys()).toEqual([
         '*.NGDP_RPCH.A',
         'USA+GBR.NGDP_RPCH.A',
         'USA.NGDP_RPCH+NGDPD.A',
-        'USA+.NGDP_RPCH.A',
+        'USA.NGDP_RPCH.A',
       ]);
 
       const blank = contractError(await query('USA..A'));
@@ -3026,6 +3120,172 @@ describe('imfQueryDataset', () => {
         expect(entry?.recovery.split(/\s+/).length).toBeGreaterThanOrEqual(5);
       }
     });
+
+    describe('#63/#69 empty and duplicate + members', () => {
+      const noticeOf = (response: Awaited<ReturnType<typeof runToolContract>>) =>
+        (response.structuredContent as { notice?: string }).notice;
+
+      it('carries no notice for a key with no empty or duplicate + member', async () => {
+        for (const key of [
+          'USA+GBR.NGDP_RPCH.A',
+          '*.NGDP_RPCH.A',
+          ' usa + gbr . ngdp_rpch . a ',
+          'USA.NGDP_RPCH+NGDPD.A',
+        ]) {
+          const response = await query(key);
+          expect(response.isError).toBeFalsy();
+          expect(response.structuredContent).not.toHaveProperty('notice');
+        }
+        expect(fetchedKeys()).toEqual([
+          'USA+GBR.NGDP_RPCH.A',
+          '*.NGDP_RPCH.A',
+          'USA+GBR.NGDP_RPCH.A',
+          'USA.NGDP_RPCH+NGDPD.A',
+        ]);
+        expect(contractError(await query('USA..A')).data).toMatchObject({
+          reason: 'empty_key_segment',
+          emptyPositions: [2],
+        });
+      });
+
+      it.each([
+        ['USA+.NGDP_RPCH.A', 'USA.NGDP_RPCH.A', 'position 1 (COUNTRY)', 'empty'],
+        ['+USA.NGDP_RPCH.A', 'USA.NGDP_RPCH.A', 'position 1 (COUNTRY)', 'empty'],
+        ['USA+ .NGDP_RPCH.A', 'USA.NGDP_RPCH.A', 'position 1 (COUNTRY)', 'empty'],
+        ['USA.NGDP_RPCH+.A', 'USA.NGDP_RPCH.A', 'position 2 (INDICATOR)', 'empty'],
+        ['USA.NGDP_RPCH.A+', 'USA.NGDP_RPCH.A', 'position 3 (FREQUENCY)', 'empty'],
+        ['USA++GBR.NGDP_RPCH.A', 'USA+GBR.NGDP_RPCH.A', 'position 1 (COUNTRY)', 'empty'],
+        ['*+.NGDP_RPCH.A', '*.NGDP_RPCH.A', 'position 1 (COUNTRY)', 'empty'],
+        ['USA+USA+GBR.NGDP_RPCH.A', 'USA+GBR.NGDP_RPCH.A', 'position 1 (COUNTRY)', 'duplicate'],
+        ['usa+USA.NGDP_RPCH.A', 'USA.NGDP_RPCH.A', 'position 1 (COUNTRY)', 'duplicate'],
+        ['USA.NGDPD+ngdpd+NGDPD.A', 'USA.NGDPD.A', 'position 2 (INDICATOR)', 'duplicate'],
+      ])(
+        'queries %j as %j, with a notice naming %s and the %s member',
+        async (key, queried, position, kind) => {
+          const response = await query(key);
+          const notice = noticeOf(response) ?? '';
+          const text = contentText(response);
+
+          expect(response.isError).toBeFalsy();
+          expect(fetchedKeys()).toEqual([queried]);
+          expect((response.structuredContent as { key: string }).key).toBe(queried);
+          expect(text).toContain(`## IMF Data: WEO — \`${queried}\``);
+          expect(notice).toContain(position);
+          expect(notice).toContain(kind);
+          expect(notice).toContain(queried);
+          expect(text).toContain(notice);
+        },
+      );
+
+      it('names every position that lost a member in one notice', async () => {
+        const notice = noticeOf(await query('USA++GBR.NGDP_RPCH+NGDP_RPCH.A+')) ?? '';
+
+        expect(fetchedKeys()).toEqual(['USA+GBR.NGDP_RPCH.A']);
+        for (const position of [
+          'position 1 (COUNTRY)',
+          'position 2 (INDICATOR)',
+          'position 3 (FREQUENCY)',
+        ]) {
+          expect(notice).toContain(position);
+        }
+      });
+
+      it.each([
+        ['+.NGDP_RPCH.A', [1]],
+        ['++.NGDP_RPCH.A', [1]],
+        [' + .NGDP_RPCH.A', [1]],
+        ['USA.NGDP_RPCH.+', [3]],
+      ])(
+        'fails %j as empty_key_segment at %j before any data request',
+        async (key, emptyPositions) => {
+          const response = await query(key);
+          const error = contractError(response);
+
+          expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
+          expect(error.data).toMatchObject({ reason: 'empty_key_segment', emptyPositions });
+          expect(error.message).toContain('*');
+          expect(contentText(response)).toContain(contractRecovery('empty_key_segment'));
+          expect(mockSvc.fetchData).not.toHaveBeenCalled();
+          expect(mockSvc.fetchAvailabilityConstraint).not.toHaveBeenCalled();
+        },
+      );
+
+      it('still rejects * in a + list and an unknown + member once empty members are dropped', async () => {
+        expect(contractError(await query('USA+*.NGDP_RPCH.A')).data).toMatchObject({
+          reason: 'wildcard_in_code_list',
+          positions: [1],
+        });
+        expect(contractError(await query('USA++*.NGDP_RPCH.A')).data).toMatchObject({
+          reason: 'wildcard_in_code_list',
+          positions: [1],
+        });
+        expect(contractError(await query('USA+US.NGDP_RPCH.A')).data).toMatchObject({
+          reason: 'invalid_key_code',
+          invalidCodes: [expect.objectContaining({ position: 1, code: 'US' })],
+        });
+        expect(mockSvc.fetchData).not.toHaveBeenCalled();
+      });
+
+      it('advertises key in tools/list as a plain string with no pattern', () => {
+        const key = z.toJSONSchema(imfQueryDataset.input).properties?.key as Record<
+          string,
+          unknown
+        >;
+
+        expect(key.type).toBe('string');
+        expect(key).not.toHaveProperty('pattern');
+      });
+
+      it('#69 fails key_too_long naming the longest position when the portal refuses the URL length', async () => {
+        mockSvc.fetchData.mockRejectedValue(
+          new McpError(
+            JsonRpcErrorCode.InvalidParams,
+            'The IMF portal refused the data request because its URL is too long.',
+            { reason: 'key_too_long', status: 400 },
+          ),
+        );
+
+        const response = await query('USA+GBR+DEU+TUR.NGDP_RPCH+NGDPD.A');
+        const error = contractError(response);
+        const text = contentText(response);
+
+        expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(error.data).toMatchObject({
+          reason: 'key_too_long',
+          position: 1,
+          dimension: 'COUNTRY',
+          memberCount: 4,
+        });
+        expect(error.message).toContain('position 1 (COUNTRY)');
+        expect(error.message).toContain('4 codes');
+        expect(error.data?.recovery).toEqual({ hint: contractRecovery('key_too_long') });
+        expect(text).toContain(contractRecovery('key_too_long'));
+        expect(mockSvc.fetchData).toHaveBeenCalledTimes(1);
+      });
+
+      it('#69 counts a single code at the longest position in the singular', async () => {
+        mockSvc.fetchData.mockRejectedValue(
+          new McpError(
+            JsonRpcErrorCode.InvalidParams,
+            'The IMF portal refused the data request because its URL is too long.',
+            { reason: 'key_too_long', status: 414 },
+          ),
+        );
+
+        const error = contractError(await query('GBR.NGDP_RPCH.A'));
+
+        expect(error.data).toMatchObject({ reason: 'key_too_long', memberCount: 1 });
+        expect(error.message).toMatch(/lists 1 code\./);
+      });
+
+      it('#69 declares key_too_long as an InvalidParams whose recovery names * and splitting the call', () => {
+        const entry = imfQueryDataset.errors?.find((e) => e.reason === 'key_too_long');
+
+        expect(entry).toMatchObject({ code: JsonRpcErrorCode.InvalidParams, severity: 'warning' });
+        expect(entry?.recovery).toContain('*');
+        expect(entry?.recovery).toMatch(/split/i);
+      });
+    });
   });
 
   describe('#56 staged tables declare their column types', () => {
@@ -3038,6 +3298,9 @@ describe('imfQueryDataset', () => {
       unit: 'VARCHAR',
       scale: 'VARCHAR',
       decimals: 'INTEGER',
+      // Registered on every table, NULL when nothing is published (#64).
+      series_reference_period: 'VARCHAR',
+      reference_period: 'VARCHAR',
     };
     const GTM = 'GTM.XDC_USD.PA_RT.M';
 
@@ -3253,7 +3516,7 @@ describe('imfQueryDataset', () => {
       ).observations.map((obs) => `${obs.series_key.slice(0, 3)} ${obs.time_period}`);
 
     describe('input bounds', () => {
-      it('accepts 1 and 10,000, and treats a blank as unset', () => {
+      it('accepts 1, 10,000, and the 1,000,000 hard ceiling, and treats a blank as unset', () => {
         const base = { dataflow_id: 'CPI', key: USA };
         expect(
           imfQueryDataset.input.parse({ ...base, last_n_observations: 1 }).last_n_observations,
@@ -3262,15 +3525,25 @@ describe('imfQueryDataset', () => {
           imfQueryDataset.input.parse({ ...base, last_n_observations: 10_000 }).last_n_observations,
         ).toBe(10_000);
         expect(
+          imfQueryDataset.input.parse({ ...base, last_n_observations: 1_000_000 })
+            .last_n_observations,
+        ).toBe(1_000_000);
+        expect(
           imfQueryDataset.input.parse({ ...base, last_n_observations: '' }).last_n_observations,
         ).toBeUndefined();
+      });
+
+      it('advertises 1,000,000 as the last_n_observations maximum', () => {
+        expect(z.toJSONSchema(imfQueryDataset.input).properties?.last_n_observations).toMatchObject(
+          { maximum: 1_000_000 },
+        );
       });
 
       it.each([
         [0, 'too_small'],
         [-1, 'too_small'],
         [1.5, 'invalid_type'],
-        [10_001, 'too_big'],
+        [1_000_001, 'too_big'],
         [true, 'invalid_type'],
       ])('rejects %s as %s before any upstream call', async (value, issueCode) => {
         const error = contractError(
@@ -3394,6 +3667,89 @@ describe('imfQueryDataset', () => {
         'USA 2026-M07',
         'USA 2026-M08',
       ]);
+    });
+
+    it('#65 does not re-fetch when every padded series came back shorter than N', async () => {
+      // N exceeds every series, so the forwarded response is the whole key,
+      // padding included: dropping it loses nothing, and one request suffices.
+      serveRows(CPI_TAIL);
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'CPI',
+        key: 'USA+JAM+SLB.CPI._T.IX.M',
+        last_n_observations: 10_000,
+      });
+
+      expect(forwardedN()).toEqual([10_000]);
+      expect(periods(response)).toEqual([
+        'SLB 2026-M02',
+        'SLB 2026-M03',
+        'JAM 2026-M06',
+        'USA 2026-M06',
+        'JAM 2026-M07',
+        'USA 2026-M07',
+        'USA 2026-M08',
+      ]);
+    });
+
+    it.each([10_001, 1_000_000])(
+      '#65 forwards N=%s upstream and returns the whole series',
+      async (n) => {
+        serveRows(WEO_TAIL);
+
+        const response = await runToolContract(imfQueryDataset, {
+          dataflow_id: 'WEO',
+          key: 'USA.NGDP_RPCH.A',
+          last_n_observations: n,
+        });
+
+        expect(forwardedN()).toEqual([n]);
+        expect(periods(response)).toEqual(WEO_TAIL.map((obs) => `USA ${obs.time_period}`));
+        expect(response.structuredContent).toMatchObject({
+          last_n_observations: n,
+          observation_count: 7,
+          truncated: false,
+        });
+        expect(contentText(response)).toContain(`**Last observations:** ${n} per series`);
+      },
+    );
+
+    it('#65 still selects each series’ last N locally above 10,000', async () => {
+      /** Two daily series of 10,005 days each, time-sorted across series. */
+      const daily = (seriesKey: string) =>
+        Array.from({ length: 10_005 }, (_, i) =>
+          row(seriesKey, new Date(Date.UTC(1990, 0, 1 + i)).toISOString().slice(0, 10), i),
+        );
+      serveRows(
+        [...daily('USA.X.D'), ...daily('GBR.X.D')].sort((a, b) =>
+          a.time_period.localeCompare(b.time_period),
+        ),
+      );
+      let staged: Array<Record<string, unknown>> = [];
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+        acquire: vi.fn().mockResolvedValue({
+          canvasId: 'canvas-last-n',
+          registerTable: vi.fn(async (_name: string, rows: Array<Record<string, unknown>>) => {
+            staged = rows;
+            return { tableName: 'imf_last_n', rowCount: rows.length, columns: [] };
+          }),
+        }),
+      });
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: 'USA+GBR.X.D',
+        last_n_observations: 10_001,
+      });
+
+      expect(forwardedN()).toEqual([10_001]);
+      expect(response.structuredContent).toMatchObject({ observation_count: 20_002 });
+      for (const seriesKey of ['USA.X.D', 'GBR.X.D']) {
+        const values = staged.filter((r) => r.series_key === seriesKey).map((r) => r.value);
+        expect(values).toHaveLength(10_001);
+        expect(values[0]).toBe(4);
+        expect(values.at(-1)).toBe(10_004);
+      }
     });
 
     it('never forwards N with end_period, and selects the last N inside the window', async () => {
@@ -3548,6 +3904,1578 @@ describe('imfQueryDataset', () => {
         expect(values[0]).toBe(500);
         expect(values.at(-1)).toBe(1999);
       }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #67: a blank optional input is unset
+  // -------------------------------------------------------------------------
+
+  describe('#67 blank optional inputs', () => {
+    const base = { dataflow_id: 'WEO', key: 'USA.NGDP_RPCH.A' };
+    const contractRecoveryFor = (reason: string) =>
+      imfQueryDataset.errors?.find((entry) => entry.reason === reason)?.recovery ?? '';
+    /** Everything the call sent upstream: the dataflow lookup, the DSD lookup, the data request. */
+    const upstreamCalls = () => ({
+      find: mockSvc.findDataflow.mock.calls.map((call) => call.slice(0, 3)),
+      structure: mockSvc.fetchDataflowStructure.mock.calls.map((call) => call.slice(0, 3)),
+      data: mockSvc.fetchData.mock.calls.map((call) => [...call.slice(0, 6), call[8]]),
+    });
+    const callAndCapture = async (args: typeof base & Record<string, unknown>) => {
+      mockSvc.findDataflow.mockClear();
+      mockSvc.fetchDataflowStructure.mockClear();
+      mockSvc.fetchData.mockClear();
+      const response = await runToolContract(imfQueryDataset, args);
+      return { response, calls: upstreamCalls() };
+    };
+
+    it.each(
+      [
+        'agency_id',
+        'version',
+        'start_period',
+        'end_period',
+        'last_n_observations',
+        'canvas_id',
+        'output_mode',
+      ].flatMap((field) => ['', '   '].map((blank) => [field, blank])),
+    )('reads %s: %j exactly as if it were omitted', async (field, blank) => {
+      const omitted = await callAndCapture(base);
+      const sent = await callAndCapture({ ...base, [field]: blank });
+
+      expect(sent.response.isError).toBeFalsy();
+      expect(sent.response.structuredContent).toEqual(omitted.response.structuredContent);
+      expect(sent.response.content).toEqual(omitted.response.content);
+      expect(sent.calls).toEqual(omitted.calls);
+      expect(sent.calls.find).toEqual([['WEO', undefined, undefined]]);
+    });
+
+    it('reads last_n_observations "1" as 1, forwarded and echoed', async () => {
+      const { response, calls } = await callAndCapture({ ...base, last_n_observations: '1' });
+
+      expect(response.isError).toBeFalsy();
+      expect(calls.data.map((call) => call.at(-1))).toEqual([1]);
+      expect(response.structuredContent).toMatchObject({ last_n_observations: 1 });
+    });
+
+    it.each(['01', '1e3', '1.0'])(
+      'still rejects last_n_observations %j before any upstream call',
+      async (sent) => {
+        const { response, calls } = await callAndCapture({ ...base, last_n_observations: sent });
+
+        expect(contractError(response).code).toBe(JsonRpcErrorCode.InvalidParams);
+        expect(calls.find).toEqual([]);
+        expect(calls.data).toEqual([]);
+      },
+    );
+
+    it('validates a non-blank value as before', async () => {
+      const period = contractError(
+        (await callAndCapture({ ...base, start_period: '2023-13' })).response,
+      );
+      const mode = contractError(
+        (await callAndCapture({ ...base, output_mode: 'inline' })).response,
+      );
+      const canvas = contractError(
+        (await callAndCapture({ ...base, canvas_id: 'not a canvas id' })).response,
+      );
+
+      expect(period.data).toMatchObject({ reason: 'invalid_period_format' });
+      expect(mode.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(canvas.code).toBe(JsonRpcErrorCode.InvalidParams);
+    });
+
+    it('resolves the DSD and data under the catalog agency and version, not the input spelling', async () => {
+      const { response, calls } = await callAndCapture({
+        ...base,
+        agency_id: ' imf.res ',
+        version: ' 9.0.0 ',
+      });
+
+      expect(response.isError).toBeFalsy();
+      expect(calls.find).toEqual([['WEO', ' imf.res ', ' 9.0.0 ']]);
+      expect(calls.structure).toEqual([['WEO', 'IMF.RES', '9.0.0']]);
+      expect(calls.data[0]?.slice(0, 3)).toEqual(['IMF.RES', 'WEO', '9.0.0']);
+    });
+
+    it('fails dataflow_not_found with the message naming where the id exists', async () => {
+      mockSvc.findDataflow.mockResolvedValue(undefined);
+      const miss =
+        "Dataflow 'WEO' not found under version '9.0.1'. It exists under IMF.RES 9.0.0 — omit agency_id and version to use it.";
+      const hint = 'Keep dataflow_id as it is; only agency_id and version missed.';
+      mockSvc.describeDataflowMiss.mockResolvedValue({ message: miss, hint });
+
+      const response = await runToolContract(imfQueryDataset, { ...base, version: '9.0.1' });
+      const error = contractError(response);
+      const text = (response.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('');
+
+      expect(error.data).toMatchObject({ reason: 'dataflow_not_found' });
+      expect(error.message).toBe(miss);
+      // The message already carries the fix, so the static recovery is not appended to it.
+      expect(error.data?.recovery).toEqual({ hint });
+      expect(text).toContain(miss);
+      expect(text).not.toContain(contractRecoveryFor('dataflow_not_found'));
+      expect(text.split('omit agency_id and version')).toHaveLength(2);
+      expect(mockSvc.describeDataflowMiss).toHaveBeenCalledWith(
+        'WEO',
+        undefined,
+        '9.0.1',
+        expect.anything(),
+      );
+      expect(mockSvc.fetchData).not.toHaveBeenCalled();
+    });
+
+    it('keeps the declared dataflow_not_found recovery when the id exists nowhere', async () => {
+      mockSvc.findDataflow.mockResolvedValue(undefined);
+
+      const response = await runToolContract(imfQueryDataset, { ...base, dataflow_id: 'NOPE' });
+      const error = contractError(response);
+      const text = (response.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('');
+
+      expect(error.message).toBe("Dataflow 'NOPE' not found");
+      expect(error.data?.recovery).toEqual({ hint: contractRecoveryFor('dataflow_not_found') });
+      expect(text).toContain(contractRecoveryFor('dataflow_not_found'));
+    });
+
+    it('trims a padded start_period and end_period before the format check, as the key is trimmed', async () => {
+      const padded = await callAndCapture({
+        ...base,
+        start_period: ' 2021 ',
+        end_period: '\t2022\n',
+      });
+      const plain = await callAndCapture({ ...base, start_period: '2021', end_period: '2022' });
+
+      expect(padded.response.isError).toBeFalsy();
+      expect(padded.response.structuredContent).toEqual(plain.response.structuredContent);
+      expect(padded.response.content).toEqual(plain.response.content);
+      expect(padded.calls).toEqual(plain.calls);
+      expect(padded.response.structuredContent).toMatchObject({
+        start_period: '2021',
+        end_period: '2022',
+      });
+    });
+
+    it('offers no blank as an input in any field description', () => {
+      for (const [field, schema] of Object.entries(imfQueryDataset.input.shape)) {
+        expect(schema.description ?? '', field).not.toMatch(/blank|empty string|''|""/i);
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #60: a requested series that returned nothing is named, not dropped
+  // -------------------------------------------------------------------------
+
+  describe('#60 missing_series', () => {
+    interface MissingShape {
+      key: string;
+      missing_series?: Array<{
+        series_key: string;
+        reason: string;
+        available_range?: { first: string; last: string };
+      }>;
+      missing_series_count?: number;
+      observations: Array<{ series_key: string; time_period: string }>;
+      staged: boolean;
+      truncated: boolean;
+    }
+
+    const obs = (series_key: string, time_period: string, value: number | null = 1.5) => ({
+      series_key,
+      time_period,
+      value,
+      status: null,
+    });
+
+    const serveRows = (observations: ReturnType<typeof obs>[]) =>
+      mockSvc.fetchData.mockResolvedValue({
+        ...MOCK_QUERY_RESULT,
+        observations,
+        seriesAttributesByKey: Object.fromEntries(
+          observations.map((row) => [row.series_key, NGDP_RPCH_ATTRS]),
+        ),
+      });
+
+    const call = async (input: { key: string } & Record<string, unknown>) => {
+      const response = await runToolContract(imfQueryDataset, { dataflow_id: 'WEO', ...input });
+      return {
+        response,
+        structured: response.structuredContent as MissingShape,
+        text: (response.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n'),
+      };
+    };
+
+    it('names a + member the portal omitted as no_data, keeping every returned observation', async () => {
+      // Live: WEO answers USA+ASM.NGDP_RPCH.A with USA's series alone, HTTP 200.
+      serveRows([
+        obs('USA.NGDP_RPCH.A', '2023', 2.9),
+        obs('USA.NGDP_RPCH.A', '2024', 2.951816),
+        obs('USA.NGDP_RPCH.A', '2031', 2.1),
+      ]);
+
+      const { structured, text } = await call({
+        key: 'USA+ASM.NGDP_RPCH.A',
+        end_period: '2024',
+        last_n_observations: 1,
+      });
+
+      expect(structured.observations).toEqual([obs('USA.NGDP_RPCH.A', '2024', 2.951816)]);
+      expect(structured.truncated).toBe(false);
+      expect(structured.missing_series).toEqual([
+        { series_key: 'ASM.NGDP_RPCH.A', reason: 'no_data' },
+      ]);
+      expect(structured.missing_series_count).toBe(1);
+      expect(text.split('\n')).toContain('| ASM.NGDP_RPCH.A | no_data | — |');
+    });
+
+    it('names a series whose data lies outside the window as no_data_in_range, with its span', async () => {
+      serveRows([
+        obs('VEN.PCPI.M', '2011-M01'),
+        obs('VEN.PCPI.M', '2014-M06'),
+        obs('VEN.PCPI.M', '2016-M12'),
+        obs('USA.PCPI.M', '2020-M01'),
+        obs('USA.PCPI.M', '2020-M02'),
+        obs('USA.PCPI.M', '2020-M03'),
+      ]);
+
+      const { structured, text } = await call({
+        key: 'USA+VEN.PCPI.M',
+        start_period: '2020',
+        end_period: '2020-03',
+      });
+
+      expect(structured.observations.map((row) => row.series_key)).toEqual([
+        'USA.PCPI.M',
+        'USA.PCPI.M',
+        'USA.PCPI.M',
+      ]);
+      expect(structured.missing_series).toEqual([
+        {
+          series_key: 'VEN.PCPI.M',
+          reason: 'no_data_in_range',
+          available_range: { first: '2011-M01', last: '2016-M12' },
+        },
+      ]);
+      expect(structured.missing_series_count).toBe(1);
+      expect(text.split('\n')).toContain('| VEN.PCPI.M | no_data_in_range | 2011-M01 – 2016-M12 |');
+    });
+
+    it('reads a series whose only in-range cell is padding as no_data_in_range, and one of padding alone as no_data', async () => {
+      serveRows([
+        obs('VEN.PCPI.M', '2015-M01'),
+        obs('VEN.PCPI.M', '2020-M02', null),
+        obs('GBR.PCPI.M', '2020-M02', null),
+        obs('USA.PCPI.M', '2020-M02'),
+      ]);
+
+      const { structured } = await call({
+        key: 'USA+VEN+GBR.PCPI.M',
+        start_period: '2020',
+        end_period: '2020-03',
+      });
+
+      expect(structured.missing_series).toEqual([
+        {
+          series_key: 'VEN.PCPI.M',
+          reason: 'no_data_in_range',
+          available_range: { first: '2015-M01', last: '2015-M01' },
+        },
+        { series_key: 'GBR.PCPI.M', reason: 'no_data' },
+      ]);
+      expect(structured.missing_series_count).toBe(2);
+    });
+
+    it('keeps a * position as * in the requested series it names', async () => {
+      serveRows([obs('USA.NGDP_RPCH.A', '2024'), obs('USA.NGDP_RPCH.Q', '2024-Q1')]);
+
+      const { structured } = await call({ key: 'USA+ASM.NGDP_RPCH.*' });
+
+      expect(structured.missing_series).toEqual([
+        { series_key: 'ASM.NGDP_RPCH.*', reason: 'no_data' },
+      ]);
+      expect(structured.missing_series_count).toBe(1);
+    });
+
+    it('lists the cells in key order, every position combined', async () => {
+      serveRows([obs('GBR.NGDPD.A', '2024')]);
+
+      const { structured } = await call({ key: 'USA+GBR.NGDP_RPCH+NGDPD.A' });
+
+      expect(structured.missing_series?.map((entry) => entry.series_key)).toEqual([
+        'USA.NGDP_RPCH.A',
+        'USA.NGDPD.A',
+        'GBR.NGDP_RPCH.A',
+      ]);
+      expect(structured.missing_series_count).toBe(3);
+    });
+
+    it('names a lowercase member by its canonical spelling', async () => {
+      mockSvc.fetchDataflowStructure.mockResolvedValue({
+        ...MOCK_STRUCTURE,
+        dimensions: [
+          {
+            ...MOCK_STRUCTURE.dimensions[0]!,
+            codelist: [
+              { id: 'USA', name: 'United States' },
+              { id: 'ASM', name: 'American Samoa' },
+            ],
+          },
+          MOCK_STRUCTURE.dimensions[1]!,
+          MOCK_STRUCTURE.dimensions[2]!,
+        ],
+      });
+      serveRows([obs('USA.NGDP_RPCH.A', '2024')]);
+
+      const { structured } = await call({ key: 'usa+asm.NGDP_RPCH.A' });
+
+      expect(structured.key).toBe('USA+ASM.NGDP_RPCH.A');
+      expect(structured.missing_series).toEqual([
+        { series_key: 'ASM.NGDP_RPCH.A', reason: 'no_data' },
+      ]);
+    });
+
+    it('adds no requested series for a dropped empty or repeated + member', async () => {
+      serveRows([obs('USA.NGDP_RPCH.A', '2024'), obs('GBR.NGDP_RPCH.A', '2024')]);
+
+      const { structured } = await call({ key: 'USA++GBR+USA+.NGDP_RPCH.A' });
+
+      expect(structured.key).toBe('USA+GBR.NGDP_RPCH.A');
+      expect(structured).not.toHaveProperty('missing_series');
+      expect(structured).not.toHaveProperty('missing_series_count');
+    });
+
+    /** `count` country codes `C00`…, all at the COUNTRY position of one key. */
+    const countries = (count: number) =>
+      Array.from({ length: count }, (_, index) => `C${String(index).padStart(2, '0')}`);
+
+    it('lists every missing series up to the cap of 20, with no "of" count', async () => {
+      const codes = countries(21);
+      serveRows([obs(`${codes[0]}.NGDPD.A`, '2024')]);
+
+      const { structured, text } = await call({ key: `${codes.join('+')}.NGDPD.A` });
+
+      expect(structured.missing_series).toHaveLength(20);
+      expect(structured.missing_series_count).toBe(20);
+      expect(structured.missing_series?.at(-1)?.series_key).toBe('C20.NGDPD.A');
+      expect(text).not.toMatch(/\d+ of \d+ listed/);
+    });
+
+    it('lists the first 20 in key order past the cap, and states both numbers', async () => {
+      const codes = countries(31);
+      serveRows([obs('C05.NGDPD.A', '2024')]);
+
+      const { structured, text } = await call({ key: `${codes.join('+')}.NGDPD.A` });
+
+      expect(structured.missing_series).toHaveLength(20);
+      expect(structured.missing_series_count).toBe(30);
+      expect(structured.missing_series?.map((entry) => entry.series_key)).toEqual(
+        codes
+          .filter((code) => code !== 'C05')
+          .slice(0, 20)
+          .map((code) => `${code}.NGDPD.A`),
+      );
+      expect(text).toContain('20 of 30');
+      expect(text).toContain('C20.NGDPD.A');
+      expect(text).not.toContain('C21.NGDPD.A');
+    });
+
+    it('counts a wide key without expanding its cells', async () => {
+      // 300 × 300 × 300 = 27,000,000 requested series: expanding them would not
+      // finish, and walking stops at the cap once the returned cells are passed.
+      const members = (prefix: string) =>
+        Array.from({ length: 300 }, (_, index) => `${prefix}${index}`).join('+');
+      serveRows([obs('A0.B0.C0', '2024'), obs('A0.B0.C1', '2024')]);
+
+      const { structured } = await call({ key: `${members('A')}.${members('B')}.${members('C')}` });
+
+      expect(structured.missing_series_count).toBe(27_000_000 - 2);
+      expect(structured.missing_series?.map((entry) => entry.series_key).slice(0, 3)).toEqual([
+        'A0.B0.C2',
+        'A0.B0.C3',
+        'A0.B0.C4',
+      ]);
+      expect(structured.missing_series).toHaveLength(20);
+    });
+
+    it('returns output identical to the pre-#60 shape when every requested series returned', async () => {
+      serveRows([obs('USA.NGDPD.A', '2024'), obs('USA.NGDP_RPCH.A', '2024')]);
+
+      const { structured, text } = await call({ key: 'USA.NGDPD+NGDP_RPCH.A' });
+
+      expect(structured).not.toHaveProperty('missing_series');
+      expect(structured).not.toHaveProperty('missing_series_count');
+      expect(text).not.toContain('no observations');
+    });
+
+    it('returns no missing_series for a key without +, whatever the response holds', async () => {
+      serveRows([obs('USA.NGDP_RPCH.A', '2024')]);
+
+      const { structured } = await call({ key: 'USA.NGDP_RPCH.A' });
+
+      expect(structured).not.toHaveProperty('missing_series');
+      expect(structured).not.toHaveProperty('missing_series_count');
+    });
+
+    it('never lists a series because last_n_observations selected', async () => {
+      serveRows([
+        obs('USA.NGDP_RPCH.A', '2023'),
+        obs('GBR.NGDP_RPCH.A', '2023'),
+        obs('USA.NGDP_RPCH.A', '2024'),
+      ]);
+
+      const { structured } = await call({ key: 'USA+GBR.NGDP_RPCH.A', last_n_observations: 1 });
+
+      expect(structured.observations.map((row) => row.series_key).sort()).toEqual([
+        'GBR.NGDP_RPCH.A',
+        'USA.NGDP_RPCH.A',
+      ]);
+      expect(structured).not.toHaveProperty('missing_series');
+    });
+
+    it('still fails no_data unchanged when every requested series is missing', async () => {
+      serveRows([]);
+
+      const { response } = await call({ key: 'USA+ASM.NGDP_RPCH.A' });
+
+      expect(contractError(response).data).toMatchObject({ reason: 'no_data' });
+    });
+
+    it('still fails no_data_in_range unchanged when the window excludes every series', async () => {
+      serveRows([obs('USA.NGDP_RPCH.A', '2010'), obs('GBR.NGDP_RPCH.A', '2011')]);
+
+      const { response } = await call({ key: 'USA+GBR+ASM.NGDP_RPCH.A', start_period: '2020' });
+
+      expect(contractError(response).data).toMatchObject({
+        reason: 'no_data_in_range',
+        available_range: { first: '2010', last: '2011' },
+      });
+    });
+
+    it('lists only series absent from the full result on a canvas-off cut, never one the cut removed', async () => {
+      // USA spans the whole long history; GBR appears only at its end, so the
+      // budget-cut prefix leaves GBR out while GBR is still in the result.
+      const usa = Array.from({ length: 3_000 }, (_, period) =>
+        obs('USA.NGDP_RPCH.A', `${1000 + period}`, period + 0.123456),
+      );
+      serveRows([...usa, obs('GBR.NGDP_RPCH.A', '3999')]);
+
+      const { structured, text, response } = await call({ key: 'USA+GBR+ASM.NGDP_RPCH.A' });
+
+      expect(structured.truncated).toBe(true);
+      expect(structured.staged).toBe(false);
+      expect(structured.observations.some((row) => row.series_key === 'GBR.NGDP_RPCH.A')).toBe(
+        false,
+      );
+      expect(structured.missing_series).toEqual([
+        { series_key: 'ASM.NGDP_RPCH.A', reason: 'no_data' },
+      ]);
+      expect(structured.missing_series_count).toBe(1);
+      expect(text.split('\n')).toContain('| ASM.NGDP_RPCH.A | no_data | — |');
+      expect(
+        JSON.stringify({ structuredContent: response.structuredContent, content: response.content })
+          .length,
+      ).toBeLessThanOrEqual(100_000);
+    });
+
+    it('carries the fields on a staged result, in both channels', async () => {
+      serveRows([obs('USA.NGDP_RPCH.A', '2024')]);
+      const registerTable = vi.fn().mockResolvedValue({ tableName: 'x', rowCount: 1, columns: [] });
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+        acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-60', registerTable }),
+      });
+
+      const { structured, text } = await call({
+        key: 'USA+ASM.NGDP_RPCH.A',
+        output_mode: 'canvas',
+      });
+
+      expect(structured.staged).toBe(true);
+      expect(structured.missing_series).toEqual([
+        { series_key: 'ASM.NGDP_RPCH.A', reason: 'no_data' },
+      ]);
+      expect(structured.missing_series_count).toBe(1);
+      expect(text.split('\n')).toContain('| ASM.NGDP_RPCH.A | no_data | — |');
+      expect(registerTable).toHaveBeenCalledOnce();
+    });
+
+    it('renders both fields in format(), with the span of an in-range miss', () => {
+      const [block] = imfQueryDataset.format!({
+        dataflow_id: 'WEO',
+        key: 'USA+VEN+ASM.PCPI.M',
+        observations: [],
+        series_attributes: { unit: null, scale: null, decimals: null },
+        observation_count: 0,
+        staged: false,
+        truncated: false,
+        source:
+          'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+        missing_series: [
+          {
+            series_key: 'VEN.PCPI.M',
+            reason: 'no_data_in_range',
+            available_range: { first: '2011-M01', last: '2016-M12' },
+          },
+          { series_key: 'ASM.PCPI.M', reason: 'no_data' },
+        ],
+        missing_series_count: 2,
+      });
+      const text = (block as { text: string }).text;
+
+      expect(text).toContain('| VEN.PCPI.M | no_data_in_range | 2011-M01 – 2016-M12 |');
+      expect(text).toContain('| ASM.PCPI.M | no_data | — |');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #62: a failed attribute recovery is disclosed, not read as no unit
+  // -------------------------------------------------------------------------
+
+  describe('#62 unresolved_attributes', () => {
+    const NULL_ATTRS = { unit: null, scale: '0', decimals: 3 };
+
+    /** The service result for WEO `USA.NGDPD+NGDP_RPCH.A` whose recovery probe failed. */
+    const unrecovered = (
+      unresolved: Record<string, unknown> | undefined,
+      observations = TWO_SERIES_RESULT.observations,
+    ) => ({
+      ...TWO_SERIES_RESULT,
+      observations,
+      seriesAttributes: NULL_ATTRS,
+      seriesAttributesByKey: { 'USA.NGDPD.A': NULL_ATTRS, 'USA.NGDP_RPCH.A': NULL_ATTRS },
+      ...(unresolved ? { unresolvedAttributes: unresolved } : {}),
+    });
+
+    const WIDENED = {
+      concepts: ['unit'],
+      widenedKey: 'USA.NGDPD+NGDP_RPCH.*',
+      widenedDimension: 'FREQUENCY',
+    };
+
+    interface UnresolvedShape {
+      observations: unknown[];
+      staged: boolean;
+      truncated: boolean;
+      unresolved_attributes?: { concepts: string[]; series_count: number; guidance: string };
+    }
+
+    const call = async (input: Record<string, unknown> = {}) => {
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: 'USA.NGDPD+NGDP_RPCH.A',
+        ...input,
+      });
+      return {
+        structured: response.structuredContent as UnresolvedShape,
+        text: (response.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n'),
+      };
+    };
+
+    it('names the unrecovered attributes, the series left null, and the widened key on both channels', async () => {
+      mockSvc.fetchData.mockResolvedValue(unrecovered(WIDENED));
+
+      const { structured, text } = await call();
+      const disclosure = structured.unresolved_attributes;
+
+      expect(structured.observations).toEqual(TWO_SERIES_RESULT.observations);
+      expect(disclosure?.concepts).toEqual(['unit']);
+      expect(disclosure?.series_count).toBe(2);
+      expect(disclosure?.guidance).toContain('USA.NGDPD+NGDP_RPCH.*');
+      expect(disclosure?.guidance).toContain('FREQUENCY');
+      expect(disclosure?.guidance).toMatch(/retry/i);
+      expect(text).toContain(disclosure!.guidance);
+      expect(text).toMatch(/\*\*Attributes not recovered:\*\* unit\b/);
+    });
+
+    it('counts only the series a listed attribute is still null on', async () => {
+      mockSvc.fetchData.mockResolvedValue({
+        ...unrecovered(WIDENED),
+        seriesAttributesByKey: { 'USA.NGDPD.A': NGDPD_ATTRS, 'USA.NGDP_RPCH.A': NULL_ATTRS },
+      });
+
+      const { structured } = await call();
+
+      expect(structured.unresolved_attributes?.series_count).toBe(1);
+    });
+
+    it('names no key when the probe could not build one', async () => {
+      mockSvc.fetchData.mockResolvedValue(unrecovered({ concepts: ['unit', 'scale'] }));
+
+      const { structured, text } = await call();
+      const disclosure = structured.unresolved_attributes;
+
+      expect(disclosure?.concepts).toEqual(['unit', 'scale']);
+      expect(disclosure?.guidance).toMatch(/retry/i);
+      expect(disclosure?.guidance).not.toContain('USA.NGDPD+NGDP_RPCH');
+      expect(text).toContain(disclosure!.guidance);
+      expect(text).toContain('unit, scale');
+    });
+
+    it('stays absent when the service reports nothing unresolved', async () => {
+      mockSvc.fetchData.mockResolvedValue(unrecovered(undefined));
+
+      const { structured, text } = await call();
+
+      expect(structured).not.toHaveProperty('unresolved_attributes');
+      expect(text).not.toContain('not recovered');
+    });
+
+    it('carries the disclosure on a staged result, in both channels', async () => {
+      mockSvc.fetchData.mockResolvedValue(unrecovered(WIDENED));
+      const registerTable = vi.fn().mockResolvedValue({ tableName: 'x', rowCount: 4, columns: [] });
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+        acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-62', registerTable }),
+      });
+
+      const { structured, text } = await call({ output_mode: 'canvas' });
+
+      expect(structured.staged).toBe(true);
+      expect(structured.unresolved_attributes?.series_count).toBe(2);
+      expect(text).toContain(structured.unresolved_attributes!.guidance);
+    });
+
+    it('carries the disclosure on a canvas-off truncated result, in both channels, inside the budget', async () => {
+      const observations = Array.from({ length: 3_000 }, (_, period) => ({
+        series_key: period % 2 === 0 ? 'USA.NGDPD.A' : 'USA.NGDP_RPCH.A',
+        time_period: `${1000 + Math.floor(period / 2)}`,
+        value: period + 0.123456,
+        status: null,
+      }));
+      mockSvc.fetchData.mockResolvedValue(unrecovered(WIDENED, observations));
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: 'USA.NGDPD+NGDP_RPCH.A',
+      });
+      const structured = response.structuredContent as UnresolvedShape;
+      const text = (response.content as Array<{ text?: string }>)
+        .map((b) => b.text ?? '')
+        .join('\n');
+
+      expect(structured).toMatchObject({ staged: false, truncated: true });
+      expect(structured.unresolved_attributes?.series_count).toBe(2);
+      expect(text).toContain(structured.unresolved_attributes!.guidance);
+      expect(
+        JSON.stringify({ structuredContent: response.structuredContent, content: response.content })
+          .length,
+      ).toBeLessThanOrEqual(100_000);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Shared by #61 and #64: reading the rendered series-attribute table
+  // -------------------------------------------------------------------------
+
+  interface AttributeEntry {
+    decimals: number | null;
+    reference_period?: string;
+    scale: string | null;
+    series_key: string;
+    unit: string | null;
+  }
+
+  /** The text of every block a contract call returned, joined. */
+  const textOf = (response: Awaited<ReturnType<typeof runToolContract>>) =>
+    (response.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
+
+  /** The rendered series-attribute block: its heading line, column names, and rows of cells. */
+  const attributeTable = (text: string) => {
+    const lines = text.split('\n');
+    const start = lines.findIndex((line) => line.startsWith('**Series attributes**'));
+    if (start < 0) return;
+    const tableLines: string[] = [];
+    for (const line of lines.slice(start + 1)) {
+      if (line === '' && tableLines.length === 0) continue;
+      if (!line.startsWith('|')) break;
+      tableLines.push(line);
+    }
+    const [header = '', , ...rows] = tableLines;
+    return { heading: lines[start] ?? '', columns: rowCells(header), rows: rows.map(rowCells) };
+  };
+
+  /** Each rendered series key → the unescaped attribute cells of the row naming it. */
+  const cellsByKey = (text: string) => {
+    const table = attributeTable(text);
+    const byKey = new Map<string, string[]>();
+    for (const row of table?.rows ?? []) {
+      const keys = (row.at(-1) ?? '').split(', ');
+      for (const key of keys) {
+        expect(byKey.has(key), `${key} rendered twice`).toBe(false);
+        byKey.set(
+          key.replace(/\\(.)/g, '$1'),
+          row.slice(0, -1).map((cell) => cell.replace(/\\(.)/g, '$1')),
+        );
+      }
+    }
+    return byKey;
+  };
+
+  /** A five-position CPI-shaped structure whose empty codelists let any code through. */
+  const serveCpiStructure = () =>
+    mockSvc.fetchDataflowStructure.mockResolvedValue({
+      ...MOCK_STRUCTURE,
+      dataflowId: 'CPI',
+      keyFormat: 'COUNTRY.INDEX_TYPE.COICOP_1999.TYPE_OF_TRANSFORMATION.FREQUENCY',
+      dimensions: [
+        'COUNTRY',
+        'INDEX_TYPE',
+        'COICOP_1999',
+        'TYPE_OF_TRANSFORMATION',
+        'FREQUENCY',
+      ].map((id, position) => ({ id, name: id, position, codelist: [] })),
+    });
+
+  /** One observation per series, each series with its own attributes. */
+  const serveSeries = (
+    entries: AttributeEntry[],
+    observation: (entry: AttributeEntry, index: number) => Record<string, unknown> = () => ({}),
+  ) => {
+    const byKey = Object.fromEntries(
+      entries.map(({ series_key, ...attrs }) => [series_key, attrs]),
+    );
+    mockSvc.fetchData.mockResolvedValue({
+      ...MOCK_QUERY_RESULT,
+      observations: entries.map((entry, index) => ({
+        series_key: entry.series_key,
+        time_period: '2024',
+        value: index + 0.5,
+        status: null,
+        ...observation(entry, index),
+      })),
+      seriesAttributes: byKey[entries[0]!.series_key],
+      seriesAttributesByKey: byKey,
+    });
+  };
+
+  // -------------------------------------------------------------------------
+  // #61: content[] carries every series' unit, scale, and decimals
+  // -------------------------------------------------------------------------
+
+  describe('#61 series attributes in content[]', () => {
+    const REPRO_COUNTRIES = ['USA', 'GBR', 'DEU', 'FRA', 'CAN', 'AUS', 'JPN', 'CHN', 'IND', 'BRA'];
+
+    /** WEO's two indicators per country: the dollar level at 10^9, the growth rate at units. */
+    const weoEntries = (countries: string[]): AttributeEntry[] =>
+      countries.flatMap((country) => [
+        { series_key: `${country}.NGDPD.A`, unit: 'USD', scale: '9', decimals: 3 },
+        { series_key: `${country}.NGDP_RPCH.A`, unit: 'PT', scale: '0', decimals: 3 },
+      ]);
+
+    it('renders all 22 series of a + key beside their own unit, scale, and decimals', async () => {
+      const entries = weoEntries([...REPRO_COUNTRIES, 'MEX']);
+      serveSeries(entries);
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: `${[...REPRO_COUNTRIES, 'MEX'].join('+')}.NGDPD+NGDP_RPCH.A`,
+        end_period: '2024',
+        last_n_observations: 1,
+      });
+      const text = textOf(response);
+      const byKey = cellsByKey(text);
+
+      expect(response.structuredContent).toMatchObject({ staged: false, truncated: false });
+      expect(byKey.size).toBe(22);
+      for (const entry of entries) {
+        expect(byKey.get(entry.series_key)).toEqual(
+          entry.unit === 'USD'
+            ? ['USD', 'published in units of 10^9', '3']
+            : ['PT', 'published in units', '3'],
+        );
+      }
+      expect(byKey.has('USA.NGDPD.A')).toBe(true);
+      expect(text).not.toMatch(/\d+ of \d+ series/);
+      // One row per distinct combination, in order of first appearance.
+      expect(attributeTable(text)?.rows).toHaveLength(2);
+      expect(attributeTable(text)?.columns).toEqual(['Unit', 'Scale', 'Decimals', 'Series']);
+    });
+
+    it('renders every one of 420 series with all observations inline and inside the budget', async () => {
+      const countries = Array.from({ length: 210 }, (_, i) => `C${String(i).padStart(2, '0')}`);
+      serveSeries(weoEntries(countries));
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: '*.NGDPD+NGDP_RPCH.A',
+        end_period: '2024',
+        last_n_observations: 1,
+      });
+      const structured = response.structuredContent as {
+        observations: unknown[];
+        series_metadata: AttributeEntry[];
+        truncated: boolean;
+      };
+
+      expect(structured.truncated).toBe(false);
+      expect(structured.observations).toHaveLength(420);
+      expect(cellsByKey(textOf(response)).size).toBe(420);
+      expect(envelopeChars(response)).toBeLessThanOrEqual(100_000);
+    });
+
+    it('renders a null fact as — in its row rather than dropping it', () => {
+      const [block] = imfQueryDataset.format!({
+        dataflow_id: 'WEO',
+        key: 'USA.NGDPD+NGDP_RPCH.A',
+        observations: [],
+        series_attributes: { unit: null, scale: null, decimals: null },
+        series_metadata: [
+          { series_key: 'USA.NGDPD.A', unit: null, scale: null, decimals: null },
+          { series_key: 'USA.NGDP_RPCH.A', unit: 'PT', scale: '0', decimals: 1 },
+        ],
+        observation_count: 0,
+        staged: false,
+        truncated: false,
+        source:
+          'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+      });
+
+      expect(cellsByKey((block as { text: string }).text).get('USA.NGDPD.A')).toEqual([
+        '—',
+        '—',
+        '—',
+      ]);
+    });
+
+    it('sets the observation-count line apart from the attribute table it follows', () => {
+      const text = (
+        imfQueryDataset.format!({
+          dataflow_id: 'WEO',
+          key: 'USA.NGDPD+NGDP_RPCH.A',
+          observations: [],
+          series_attributes: { unit: null, scale: null, decimals: null },
+          series_metadata: [
+            { series_key: 'USA.NGDPD.A', unit: null, scale: null, decimals: null },
+            { series_key: 'USA.NGDP_RPCH.A', unit: 'PT', scale: '0', decimals: 1 },
+          ],
+          observation_count: 0,
+          staged: false,
+          truncated: false,
+          source:
+            'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+        })[0] as { text: string }
+      ).text;
+      const lines = text.split('\n');
+      const at = lines.findIndex((line) => line.startsWith('**Observations:**'));
+
+      // GFM reads a line straight after a table as one more row of it.
+      expect(lines[at - 2]).toBe('| PT | published in units | 1 | USA.NGDP_RPCH.A |');
+      expect(lines[at - 1]).toBe('');
+      expect(lines[at]).toBe('**Observations:** 0 | **Staged:** false | **Truncated:** false');
+    });
+
+    /**
+     * `count` series whose full rendering does not fit beside their metadata: a
+     * PI-shaped `*` key with one observation per series and five attribute
+     * combinations, so the grouped table stays short while the key list is long.
+     */
+    const overflowingEntries = (count: number): AttributeEntry[] =>
+      Array.from({ length: count }, (_, i) => ({
+        series_key: `C${String(i).padStart(4, '0')}.PPI.IX.M`,
+        unit: i % 5 === 0 ? null : 'IX',
+        scale: '0',
+        decimals: i % 5,
+      }));
+
+    it('falls back to the first 20 entries when every entry would overflow, naming the narrower-key path', async () => {
+      const entries = overflowingEntries(1_250);
+      serveSeries(entries);
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: '*.NGDPD.A',
+        last_n_observations: 1,
+      });
+      const structured = response.structuredContent as {
+        series_metadata: AttributeEntry[];
+        truncated: boolean;
+      };
+      const text = textOf(response);
+      const table = attributeTable(text);
+
+      expect(structured.series_metadata).toHaveLength(1_250);
+      expect(envelopeChars(response)).toBeLessThanOrEqual(100_000);
+      expect(cellsByKey(text).size).toBe(20);
+      expect(new Set(cellsByKey(text).keys())).toEqual(
+        new Set(entries.slice(0, 20).map((entry) => entry.series_key)),
+      );
+      expect(table?.heading).toContain('20 of 1250 series shown');
+      expect(table?.heading).toContain('query fewer series per call');
+      expect(table?.heading).not.toContain('structuredContent');
+      expect(table?.heading).not.toContain('imf_dataframe');
+    });
+
+    it('names imf_dataframe_query and the staged table in a staged fallback', async () => {
+      serveSeries(overflowingEntries(1_250));
+      const registerTable = vi.fn().mockResolvedValue({ tableName: 'x', rowCount: 1, columns: [] });
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+        acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-61', registerTable }),
+      });
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: '*.NGDPD.A',
+        last_n_observations: 1,
+      });
+      const structured = response.structuredContent as { staged: boolean; table_name: string };
+      const heading = attributeTable(textOf(response))?.heading ?? '';
+
+      expect(structured.staged).toBe(true);
+      expect(heading).toContain('20 of 1250 series shown');
+      expect(heading).toContain('imf_dataframe_query');
+      expect(heading).toContain(structured.table_name);
+      expect(heading).not.toContain('structuredContent');
+      expect(envelopeChars(response)).toBeLessThanOrEqual(100_000);
+    });
+
+    /** The series-attribute block of the formatter that capped the table at 20 rows. */
+    const legacyCappedBlock = (result: {
+      series_attributes: { unit: string | null; scale: string | null; decimals: number | null };
+      series_metadata: AttributeEntry[];
+      staged: boolean;
+    }) => {
+      const scaleLabel = (scale: string | null) =>
+        scale == null
+          ? null
+          : scale === '0'
+            ? 'published in units'
+            : `published in units of 10^${scale}`;
+      const cell = (text: string | null) =>
+        text == null ? '—' : text.replace(/[\\|`]/g, '\\$&').replace(/\r\n|\r|\n/g, ' ');
+      const { unit, scale, decimals } = result.series_attributes;
+      const primaryMeta = [
+        unit,
+        scaleLabel(scale),
+        decimals != null ? `${decimals} decimals` : null,
+      ]
+        .filter(Boolean)
+        .join(' | ');
+      const shown = result.series_metadata.slice(0, 20);
+      const lines = [
+        `\n**Series attributes** — ${shown.length} of ${result.series_metadata.length} series shown; every entry remains in structuredContent${result.staged ? ', and every canvas row carries its own unit, scale, and decimals' : ''}\n`,
+        '| Series Key | Unit | Scale | Decimals |',
+        '|:-----------|:-----|:------|---------:|',
+        ...shown.map(
+          (entry) =>
+            `| ${cell(entry.series_key)} | ${cell(entry.unit)} | ${cell(scaleLabel(entry.scale))} | ${entry.decimals ?? '—'} |`,
+        ),
+      ];
+      if (primaryMeta) {
+        lines.push(
+          `\n\`series_attributes\` describes the first row (${shown[0]?.series_key ?? ''}): ${primaryMeta}\n`,
+        );
+      }
+      return lines.join('\n');
+    };
+
+    /** The rendered text from the attribute heading up to the Observations line. */
+    const renderedBlock = (text: string) =>
+      text.slice(text.indexOf('**Series attributes**'), text.indexOf('**Observations:**'));
+
+    it.each([
+      ['five shared combinations', overflowingEntries(1_250)],
+      [
+        'twenty distinct combinations with null scale and decimals',
+        Array.from({ length: 1_250 }, (_, i) => ({
+          series_key: `C${String(i).padStart(4, '0')}.PPI.IX.M`,
+          unit: `U${i}`,
+          scale: null,
+          decimals: null,
+        })),
+      ],
+      [
+        'twenty distinct combinations, the first with no attribute at all',
+        Array.from({ length: 1_250 }, (_, i) => ({
+          series_key: `C${String(i).padStart(4, '0')}.PPI.IX.M`,
+          unit: i === 0 ? null : `U${i}`,
+          scale: null,
+          decimals: null,
+        })),
+      ],
+    ])('costs no more in the fallback than the capped table did, for %s', (_label, entries) => {
+      for (const staged of [false, true]) {
+        const result = {
+          dataflow_id: 'PI',
+          key: '*.*.*.M',
+          observations: [],
+          series_attributes: {
+            unit: entries[0]!.unit,
+            scale: entries[0]!.scale,
+            decimals: entries[0]!.decimals,
+          },
+          series_metadata: entries,
+          observation_count: entries.length,
+          staged,
+          truncated: true,
+          ...(staged
+            ? { canvas_id: 'cv-1234567', table_name: 'imf_0123abcd' }
+            : { retrieval_guidance: 'Narrow the key.' }),
+          source: 'Source: International Monetary Fund, Prices, https://data.imf.org/',
+        };
+        const text = (imfQueryDataset.format!(result)[0] as { text: string }).text;
+        const fallback = renderedBlock(text);
+        const legacy = legacyCappedBlock(result);
+
+        expect(fallback).toContain('20 of 1250 series shown');
+        expect(JSON.stringify(fallback).length).toBeLessThanOrEqual(
+          JSON.stringify(renderedBlock(`${legacy}\n**Observations:**`)).length,
+        );
+      }
+    });
+
+    it('chooses the fallback when the missing_series and unresolved_attributes fields push full rendering over', () => {
+      // 1,100 series fit fully on their own; the #60 and #62 fields are part of
+      // the same fixed part, so adding them must tip the choice.
+      const entries = overflowingEntries(1_100);
+      const base = {
+        dataflow_id: 'WEO',
+        key: '*.NGDPD.A',
+        observations: [],
+        series_attributes: { unit: null, scale: '0', decimals: 0 },
+        series_metadata: entries,
+        observation_count: entries.length,
+        staged: false,
+        truncated: false,
+        source:
+          'Source: International Monetary Fund, World Economic Outlook, https://data.imf.org/',
+      };
+      const heading = (result: Parameters<NonNullable<typeof imfQueryDataset.format>>[0]) =>
+        attributeTable((imfQueryDataset.format!(result)[0] as { text: string }).text)?.heading ??
+        '';
+
+      expect(heading(base)).not.toMatch(/\d+ of \d+ series/);
+      const withExtras = {
+        ...base,
+        missing_series: Array.from({ length: 20 }, (_, i) => ({
+          series_key: `M${String(i).padStart(4, '0')}.PPI.IX.M`,
+          reason: 'no_data' as const,
+        })),
+        missing_series_count: 20,
+        unresolved_attributes: {
+          concepts: ['unit' as const],
+          series_count: 1_100,
+          guidance: 'Retry the query. '.repeat(400),
+        },
+      };
+      expect(heading(withExtras)).toContain('20 of 1100 series shown');
+    });
+
+    it('falls back rather than failing when the notice is what pushes the full table over', async () => {
+      /**
+       * Without its notice, the result for 1,153 of these series fits the budget
+       * with the full table and no observation; the duplicate NGDPD member adds a
+       * dropped-member notice to both channels, which the full table leaves no
+       * room for. The window spans that band on either side.
+       */
+      const responses = new Map<number, Awaited<ReturnType<typeof runToolContract>>>();
+      for (let count = 1_150; count <= 1_160; count++) {
+        serveSeries(overflowingEntries(count));
+        responses.set(
+          count,
+          await runToolContract(imfQueryDataset, {
+            dataflow_id: 'WEO',
+            key: '*.NGDPD+NGDPD.A',
+            last_n_observations: 1,
+          }),
+        );
+      }
+
+      const failed = [...responses].filter(([, response]) => response.isError);
+      expect(failed.map(([count]) => count)).toEqual([]);
+      for (const [count, response] of responses) {
+        const structured = response.structuredContent as { notice?: string; key?: string };
+        const text = textOf(response);
+
+        expect(structured.key).toBe('*.NGDPD.A');
+        expect(structured.notice).toContain('position 2 (INDICATOR): 1 duplicate + member');
+        expect(text).toContain(structured.notice);
+        expect(attributeTable(text)?.heading).toContain(`20 of ${count} series shown`);
+        expect(envelopeChars(response)).toBeLessThanOrEqual(100_000);
+      }
+    });
+
+    it('keeps the longest notice it can compose inside the budget on either side of the full-table boundary', async () => {
+      // Every position drops members and names a dimension id of characters JSON
+      // escapes six-fold, and every label is unparseable and as costly: the
+      // largest notice this key shape can carry, after clipping.
+      const escaped = '\u0001'.repeat(60);
+      mockSvc.fetchDataflowStructure.mockResolvedValue({
+        ...MOCK_STRUCTURE,
+        dimensions: MOCK_STRUCTURE.dimensions.map((dimension, index) => ({
+          ...dimension,
+          id: `${escaped}${index}`,
+        })),
+      });
+      const renderings = new Set<string>();
+      for (let count = 1_060; count <= 1_120; count += 2) {
+        serveSeries(overflowingEntries(count), (_entry, index) => ({
+          time_period: `${escaped}${index}`,
+        }));
+
+        const response = await runToolContract(imfQueryDataset, {
+          dataflow_id: 'WEO',
+          key: 'C0000++C0000.NGDPD+NGDPD+.A++A',
+          start_period: '2020',
+        });
+        const structured = response.structuredContent as { notice?: string };
+        const text = textOf(response);
+
+        expect(response.isError, `${count} series`).not.toBe(true);
+        expect(envelopeChars(response), `${count} series`).toBeLessThanOrEqual(100_000);
+        expect(structured.notice).toContain(`(${'\u0001'.repeat(40)}…)`);
+        expect(structured.notice).toContain(`observation(s) carry a period label`);
+        expect(text).toContain(structured.notice);
+        renderings.add(
+          /\d+ of \d+ series shown/.test(attributeTable(text)?.heading ?? '') ? 'fallback' : 'full',
+        );
+      }
+      // The window spans the point where the full table stops fitting beside the notice.
+      expect(renderings).toEqual(new Set(['full', 'fallback']));
+    });
+
+    it('clips a long dimension id and period label a notice quotes', async () => {
+      mockSvc.fetchDataflowStructure.mockResolvedValue({
+        ...MOCK_STRUCTURE,
+        dimensions: MOCK_STRUCTURE.dimensions.map((dimension, index) =>
+          index === 1 ? { ...dimension, id: `INDICATOR_${'X'.repeat(60)}` } : dimension,
+        ),
+      });
+      const label = `2023-W07-${'Y'.repeat(60)}`;
+      mockSvc.fetchData.mockResolvedValue({
+        ...MOCK_QUERY_RESULT,
+        observations: [
+          { series_key: 'USA.NGDP_RPCH.A', time_period: label, value: 1, status: null },
+          { series_key: 'USA.NGDP_RPCH.A', time_period: '2023', value: 2, status: null },
+        ],
+      });
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: 'USA.NGDP_RPCH+NGDP_RPCH.A',
+        end_period: '2023',
+      });
+      const notice = (response.structuredContent as { notice?: string }).notice ?? '';
+
+      expect(notice).toContain(`position 2 (INDICATOR_${'X'.repeat(30)}…): 1 duplicate + member`);
+      expect(notice).toContain(`(2023-W07-${'Y'.repeat(31)}…)`);
+      expect(notice).not.toContain('X'.repeat(31));
+      expect(notice).not.toContain('Y'.repeat(32));
+      expect(textOf(response)).toContain(notice);
+      // structuredContent keeps the label whole on the observation itself.
+      expect(
+        (response.structuredContent as { observations: Array<{ time_period: string }> })
+          .observations[0]?.time_period,
+      ).toBe(label);
+    });
+
+    it('still fails as response_too_large when the series metadata alone overflows', async () => {
+      const entries = Array.from({ length: 2_000 }, (_, i) => ({
+        series_key: `C${String(i).padStart(4, '0')}.B1GQ.S1.XDC.A`,
+        unit: 'XDC',
+        scale: '6',
+        decimals: 2,
+      }));
+      serveSeries(entries);
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: '*.NGDPD.A',
+        last_n_observations: 1,
+      });
+
+      expect(
+        (response.structuredContent as { error?: { data?: { reason?: string } } }).error?.data
+          ?.reason,
+      ).toBe('response_too_large');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #64: reference periods on series and observations
+  // -------------------------------------------------------------------------
+
+  describe('#64 reference periods', () => {
+    it('carries a series and an observation reference period through both channels', async () => {
+      serveCpiStructure();
+      serveSeries(
+        [
+          {
+            series_key: 'USA.CPI._T.IX.M',
+            unit: null,
+            scale: '0',
+            decimals: null,
+            reference_period: '2010A',
+          },
+        ],
+        () => ({ time_period: '2026-M08', reference_period: '2010A' }),
+      );
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'CPI',
+        key: 'USA.CPI._T.IX.M',
+        last_n_observations: 1,
+      });
+      const structured = response.structuredContent as {
+        series_attributes: { reference_period?: string };
+        observations: Array<{ reference_period?: string }>;
+      };
+      const text = textOf(response);
+
+      expect(structured.series_attributes.reference_period).toBe('2010A');
+      expect(structured.observations[0]?.reference_period).toBe('2010A');
+      expect(seriesLineCells(text)).toContain('reference period 2010A');
+      expect(text.split('\n')).toContain(
+        '| Series Key | Time Period | Value (base units) | Status | Reference Period |',
+      );
+      expect(text.split('\n')).toContain('| USA.CPI._T.IX.M | 2026-M08 | 0.5 | — | 2010A |');
+    });
+
+    it('adds no observation column when only the series carries one', async () => {
+      serveCpiStructure();
+      serveSeries([
+        {
+          series_key: 'USA.PPI._T.IX.M',
+          unit: 'IX',
+          scale: '0',
+          decimals: 2,
+          reference_period: '2010=100',
+        },
+      ]);
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'PPI',
+        key: 'USA.PPI._T.IX.M',
+        last_n_observations: 1,
+      });
+      const structured = response.structuredContent as {
+        series_attributes: { reference_period?: string };
+        observations: object[];
+      };
+      const text = textOf(response);
+
+      expect(structured.series_attributes.reference_period).toBe('2010=100');
+      expect(structured.observations[0]).not.toHaveProperty('reference_period');
+      expect(seriesLineCells(text)).toContain('reference period 2010=100');
+      expect(text).not.toContain('Reference Period');
+    });
+
+    it('adds nothing on any surface when no series or observation carries one', async () => {
+      serveSeries([
+        { series_key: 'USA.NGDP_RPCH.A', unit: 'PT', scale: '0', decimals: 3 },
+        { series_key: 'GBR.NGDP_RPCH.A', unit: 'PT', scale: '0', decimals: 3 },
+      ]);
+      const registerTable = vi.fn().mockResolvedValue({ tableName: 'x', rowCount: 2, columns: [] });
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+        acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-64', registerTable }),
+      });
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: 'USA+GBR.NGDP_RPCH.A',
+        output_mode: 'canvas',
+      });
+      const structured = response.structuredContent as {
+        series_attributes: object;
+        series_metadata: object[];
+        observations: object[];
+      };
+      const text = textOf(response);
+
+      expect(structured.series_attributes).not.toHaveProperty('reference_period');
+      for (const entry of [...structured.series_metadata, ...structured.observations]) {
+        expect(entry).not.toHaveProperty('reference_period');
+      }
+      expect(text).not.toMatch(/reference period/i);
+      const [, rows] = registerTable.mock.calls[0] as [string, Array<Record<string, unknown>>];
+      for (const row of rows) {
+        expect(row).toMatchObject({ series_reference_period: null, reference_period: null });
+      }
+    });
+
+    it('gives each series its own value, rendering — for one that has none', async () => {
+      serveCpiStructure();
+      const entries: AttributeEntry[] = [
+        {
+          series_key: 'USA.CPI._T.IX.M',
+          unit: null,
+          scale: '0',
+          decimals: null,
+          reference_period: '2010A',
+        },
+        {
+          series_key: 'KNA.CPI._T.IX.M',
+          unit: null,
+          scale: '0',
+          decimals: null,
+          reference_period: 'Multiple',
+        },
+        {
+          series_key: 'GBR.CPI._T.IX.M',
+          unit: null,
+          scale: '0',
+          decimals: null,
+          reference_period: '2015A',
+        },
+        { series_key: 'FRA.CPI._T.IX.M', unit: null, scale: '0', decimals: null },
+      ];
+      serveSeries(entries);
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'CPI',
+        key: '*.CPI._T.IX.M',
+        last_n_observations: 1,
+      });
+      const structured = response.structuredContent as { series_metadata: AttributeEntry[] };
+      const text = textOf(response);
+
+      expect(structured.series_metadata).toEqual(entries);
+      expect(structured.series_metadata[3]).not.toHaveProperty('reference_period');
+      expect(attributeTable(text)?.columns).toEqual([
+        'Unit',
+        'Scale',
+        'Decimals',
+        'Reference Period',
+        'Series',
+      ]);
+      const byKey = cellsByKey(text);
+      expect(byKey.get('USA.CPI._T.IX.M')?.[3]).toBe('2010A');
+      expect(byKey.get('KNA.CPI._T.IX.M')?.[3]).toBe('Multiple');
+      expect(byKey.get('GBR.CPI._T.IX.M')?.[3]).toBe('2015A');
+      expect(byKey.get('FRA.CPI._T.IX.M')?.[3]).toBe('—');
+    });
+
+    it('stages series_reference_period and reference_period on every row', async () => {
+      serveCpiStructure();
+      mockSvc.fetchData.mockResolvedValue({
+        ...MOCK_QUERY_RESULT,
+        observations: [
+          {
+            series_key: 'KNA.CPI._T.IX.M',
+            time_period: '2024-M09',
+            value: 112.3,
+            status: null,
+            reference_period: '2010M1',
+          },
+          {
+            series_key: 'KNA.CPI._T.IX.M',
+            time_period: '2024-M10',
+            value: 112.9,
+            status: null,
+            reference_period: '2010A',
+          },
+        ],
+        seriesAttributes: { unit: null, scale: '0', decimals: null, reference_period: 'Multiple' },
+        seriesAttributesByKey: {
+          'KNA.CPI._T.IX.M': {
+            unit: null,
+            scale: '0',
+            decimals: null,
+            reference_period: 'Multiple',
+          },
+        },
+      });
+      const registerTable = vi.fn().mockResolvedValue({ tableName: 'x', rowCount: 2, columns: [] });
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+        acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-64', registerTable }),
+      });
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'CPI',
+        key: 'KNA.CPI._T.IX.M',
+        start_period: '2024-09',
+        end_period: '2024-10',
+        output_mode: 'canvas',
+      });
+      const [, rows] = registerTable.mock.calls[0] as [string, Array<Record<string, unknown>>];
+
+      expect(
+        (response.structuredContent as { series_attributes: AttributeEntry }).series_attributes
+          .reference_period,
+      ).toBe('Multiple');
+      expect(
+        rows.map(({ time_period, series_reference_period, reference_period }) => [
+          time_period,
+          series_reference_period,
+          reference_period,
+        ]),
+      ).toEqual([
+        ['2024-M09', 'Multiple', '2010M1'],
+        ['2024-M10', 'Multiple', '2010A'],
+      ]);
+    });
+
+    it('escapes a | or backtick in a reference period on every rendered surface', () => {
+      const awkward = 'APRIL|2016 `x`';
+      const escaped = 'APRIL\\|2016 \\`x\\`';
+      const single = (
+        imfQueryDataset.format!({
+          dataflow_id: 'CPI',
+          key: 'USA.CPI._T.IX.M',
+          observations: [
+            {
+              series_key: 'USA.CPI._T.IX.M',
+              time_period: '2024-M01',
+              value: 1,
+              status: null,
+              reference_period: awkward,
+            },
+          ],
+          series_attributes: { unit: null, scale: null, decimals: null, reference_period: awkward },
+          observation_count: 1,
+          staged: false,
+          truncated: false,
+          source: 'Source: International Monetary Fund, CPI, https://data.imf.org/',
+        })[0] as { text: string }
+      ).text;
+      const multi = (
+        imfQueryDataset.format!({
+          dataflow_id: 'CPI',
+          key: 'USA+GBR.CPI._T.IX.M',
+          observations: [],
+          series_attributes: { unit: null, scale: null, decimals: null, reference_period: awkward },
+          series_metadata: [
+            {
+              series_key: 'USA.CPI._T.IX.M',
+              unit: null,
+              scale: null,
+              decimals: null,
+              reference_period: awkward,
+            },
+            { series_key: 'GBR.CPI._T.IX.M', unit: null, scale: null, decimals: null },
+          ],
+          observation_count: 0,
+          staged: false,
+          truncated: false,
+          source: 'Source: International Monetary Fund, CPI, https://data.imf.org/',
+        })[0] as { text: string }
+      ).text;
+
+      expect(single).toContain(`**Series:** reference period ${escaped}`);
+      const observationRow = single.split('\n').find((line) => line.startsWith('| USA.CPI'));
+      expect(rowCells(observationRow ?? '')).toHaveLength(5);
+      expect(rowCells(observationRow ?? '')[4]).toBe(escaped);
+      expect(cellsByKey(multi).get('USA.CPI._T.IX.M')).toEqual(['—', '—', '—', awkward]);
+      expect(multi).toContain(escaped);
+    });
+
+    it('describes each new field as present only when published', () => {
+      const schema = z.toJSONSchema(imfQueryDataset.output) as {
+        properties: Record<string, JsonSchemaNode & { required?: string[] }>;
+      };
+      const descriptions = [
+        schema.properties.series_attributes?.properties?.reference_period?.description,
+        schema.properties.series_metadata?.items?.properties?.reference_period?.description,
+        schema.properties.observations?.items?.properties?.reference_period?.description,
+      ];
+
+      for (const description of descriptions) {
+        expect(description).toMatch(/present only/i);
+      }
+      expect(schema.properties.series_attributes?.required).not.toContain('reference_period');
+    });
+  });
+
+  describe('#69/#70 declared data-path failures', () => {
+    const contractRecovery = (reason: string) =>
+      imfQueryDataset.errors?.find((entry) => entry.reason === reason)?.recovery ?? '';
+    const contentText = (response: Awaited<ReturnType<typeof runToolContract>>) =>
+      (response.content as Array<{ text?: string }>).map((block) => block.text ?? '').join('\n');
+
+    /** The errors ImfSdmxService.fetchData settles a transient failure to — no hint of their own. */
+    const SERVICE_FAILURES = [
+      {
+        reason: 'data_unavailable',
+        error: new McpError(
+          JsonRpcErrorCode.ServiceUnavailable,
+          'IMF data request did not finish within the 45-second budget for one call.',
+          { reason: 'data_unavailable', retryable: true, retryAttempts: 2 },
+        ),
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        extra: { retryAttempts: 2 },
+      },
+      {
+        reason: 'rate_limited',
+        error: new McpError(
+          JsonRpcErrorCode.RateLimited,
+          'IMF data request failed with HTTP 429.',
+          {
+            reason: 'rate_limited',
+            retryable: true,
+            status: 429,
+            retryAfter: '2',
+            retryAttempts: 4,
+          },
+        ),
+        code: JsonRpcErrorCode.RateLimited,
+        extra: { retryAfter: '2', status: 429 },
+      },
+    ];
+
+    it.each(SERVICE_FAILURES)(
+      'carries $reason with its code, retryable, and declared recovery on both channels',
+      async ({ reason, error, code, extra }) => {
+        mockSvc.fetchData.mockRejectedValue(error);
+
+        const response = await runToolContract(imfQueryDataset, {
+          dataflow_id: 'WEO',
+          key: 'USA.NGDP_RPCH.A',
+        });
+        const wire = contractError(response);
+        const text = contentText(response);
+
+        expect(wire.code).toBe(code);
+        expect(wire.message).toBe(error.message);
+        expect(wire.data).toMatchObject({ reason, retryable: true, ...extra });
+        expect(contractRecovery(reason)).not.toBe('');
+        expect(wire.data?.recovery).toEqual({ hint: contractRecovery(reason) });
+        expect(text).toContain(error.message);
+        expect(text).toContain(contractRecovery(reason));
+        expect(text).toContain(reason);
+        expect(text).toContain('retryable');
+      },
+    );
+
+    it('declares data_unavailable and rate_limited as retryable service-thrown reasons', () => {
+      const entry = (reason: string) => imfQueryDataset.errors?.find((e) => e.reason === reason);
+
+      expect(entry('data_unavailable')).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        retryable: true,
+        thrownBy: 'service',
+      });
+      expect(entry('data_unavailable')?.recovery).toMatch(/retry/i);
+      expect(entry('data_unavailable')?.recovery).toMatch(/narrow/i);
+      expect(entry('rate_limited')).toMatchObject({
+        code: JsonRpcErrorCode.RateLimited,
+        retryable: true,
+        thrownBy: 'service',
+      });
+      expect(entry('rate_limited')?.recovery).toContain('retryAfter');
+    });
+
+    it('runs the latest-N re-fetch in the same call, so a spent budget fails it as data_unavailable', async () => {
+      mockSvc.fetchData
+        .mockResolvedValueOnce({
+          ...MOCK_QUERY_RESULT,
+          observations: [
+            { series_key: 'USA.NGDP_RPCH.A', time_period: '2031', value: null, status: null },
+          ],
+        })
+        .mockRejectedValueOnce(SERVICE_FAILURES[0]?.error);
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: 'USA.NGDP_RPCH.A',
+        last_n_observations: 1,
+      });
+
+      expect(contractError(response)).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'data_unavailable', retryable: true },
+      });
+      const [first, second] = mockSvc.fetchData.mock.calls;
+      expect(first?.[8]).toBe(1);
+      expect(second?.[8]).toBeUndefined();
+      // The Context is what the service keys the call's budget on.
+      expect(second?.[6]).toBe(first?.[6]);
     });
   });
 });
