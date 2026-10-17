@@ -35,95 +35,74 @@ IMF macroeconomic data across 190 countries: World Economic Outlook projections,
 
 | Tool | Description |
 |:-----|:------------|
-| `imf_list_databases` | List IMF SDMX dataflows available on the portal, a page at a time, with an optional filter matching every word across ID, name, and description |
-| `imf_get_database` | Fetch a dataflow's dimensions and page either its codelists or the codes with published data — resolves human terms to SDMX codes before querying |
-| `imf_query_dataset` | Query a dataflow by dimension key over a time range; large result sets spill to DataCanvas when it is enabled, or return a bounded prefix with retrieval guidance |
-| `imf_dataframe_describe` | List DataCanvas tables and columns staged by a prior `imf_query_dataset` call |
-| `imf_dataframe_query` | Run a read-only SQL SELECT across staged DataCanvas tables for multi-country comparisons and aggregations |
-| `imf_dataframe_drop` | Remove one staged table or view without affecting other tables on the canvas; disabled by default |
+| `imf_list_databases` | List IMF SDMX dataflows, with an optional word filter |
+| `imf_get_database` | Fetch a dataflow's dimensions and codelists to resolve terms to SDMX codes |
+| `imf_query_dataset` | Query a dataflow by dimension key over a time range |
+| `imf_dataframe_describe` | List DataCanvas tables and columns staged by `imf_query_dataset` |
+| `imf_dataframe_query` | Run a read-only SQL SELECT across staged DataCanvas tables |
+| `imf_dataframe_drop` | Remove one staged table or view; disabled by default |
 
 ### Resources
 
 | Resource | Description |
 |:---|:---|
-| `imf://database/{dataflow_id}` | Bounded discovery metadata for one IMF SDMX dataflow — dimensions, codelist previews, `key_format`, and continuation guidance |
-
-Continuation beyond the resource's bounded codelist preview runs through `imf_get_database`.
+| `imf://database/{dataflow_id}` | Discovery metadata for one dataflow: dimensions, codelist previews, and `key_format` |
 
 ## Capability reference
 
 ### `imf_list_databases` <sub>tool</sub>
 
-- `filter` splits on spaces and commas and keeps a dataflow when every word appears, case-insensitively, in its ID, name, or description (`"WEO outlook"` finds WEO and the regional outlooks built on it), matched against the full text — not the shortened preview this tool returns
-- Vintage (historical snapshot) dataflows such as `WEO_2025_OCT_VINTAGE` are excluded by default; set `include_vintages=true` to include them
-- Paged: `limit` (default 50) and `offset`; a page holds at most 200, so a larger `limit` (up to 1,000) returns 200 and echoes `requested_limit`/`applied_limit`. `total_count` reports total matches, `returned_count` the page size, and a notice names the next `offset` while matches remain
-- Descriptions are cut to 200 characters here — `imf_get_database` and the `imf://database/{dataflow_id}` resource return the full text
+- `filter` keeps dataflows whose ID, name, or description contains every word (split on spaces and commas, case-insensitive); vintage snapshots such as `WEO_2025_OCT_VINTAGE` are excluded unless `include_vintages=true`
+- Paged with `limit` (default 50) and `offset`; a page holds at most 200, and a larger `limit` (up to 1,000) echoes `requested_limit`/`applied_limit`. `total_count` and `returned_count` report the match and page sizes
+- Descriptions are cut to 200 characters; `imf_get_database` returns the full text
 
 ---
 
 ### `imf_get_database` <sub>tool</sub>
 
-- Resolves human-readable terms to SDMX dimension codes (e.g. "United States" → `USA`) and returns each dimension's DSD concept-scheme label
-- Country codes are ISO 3-letter (`USA`, `GBR`, `DEU`), not ISO 2-letter (`US`, `GB`, `DE`)
-- `key_format` names the exact dot-separated dimension order `imf_query_dataset` requires
-- Codelist previews are capped at 50 entries by default; set `dimension_id` to page one dimension with `limit`/`offset`, and `codelist_filter` applies before paging. A page holds at most 200 codes: a larger `limit` (up to 50,000) returns 200, echoes `requested_limit`/`applied_limit`, and `next_offset` names the rest
-- `agency_id`/`version` are auto-detected when omitted and matched case-insensitively when given; a mismatch names the agency and version the dataflow exists under
-- `codelist_filter` keeps codes whose ID or name contains every word given, in any order — `"GDP constant prices"` finds `NGDP_RPCH` and its constant-price siblings in WEO
-- Set `available_only=true` to page codes the dataflow actually publishes, with series count and time coverage, instead of the full codelist
-- A `codelist_filter` that matches nothing is reported distinctly from a codelist that could not be resolved — the two need opposite next steps
+- Resolves terms to SDMX dimension codes (countries are ISO 3-letter: `USA`, not `US`) and returns `key_format`, the dot-separated dimension order `imf_query_dataset` requires
+- Codelist previews hold 50 entries; set `dimension_id` to page one dimension with `limit`/`offset` (at most 200 per page, `next_offset` names the rest), and `codelist_filter` to keep codes whose ID or name contains every word
+- `available_only=true` pages only the codes the dataflow publishes, with series count and time coverage; `agency_id`/`version` are auto-detected when omitted
 
 ---
 
 ### `imf_query_dataset` <sub>tool</sub>
 
-- Dot-separated key in DSD keyPosition order; `+` combines codes at one position, `*` matches every code there — every position needs a code or `*`, and a blank segment, or one whose `+` members are all blank, is rejected
-- Codes are trimmed and matched case-insensitively (`usa.ngdp_rpch.a` queries `USA.NGDP_RPCH.A`), as is `dataflow_id`; empty and repeated `+` members are dropped (`USA++GBR+USA` queries `USA+GBR`), and `notice` names each position that lost one. A code missing from its dimension's codelist fails before the query as `invalid_key_code`, naming the nearest valid codes (`US` → `USA`), and a `*` inside a `+` list fails as `wildcard_in_code_list`
-- A `+` list of a few hundred codes runs past the portal's URL limit and fails as `key_too_long`, naming the longest position — use `*` there or split the codes across calls
-- A data request that still fails after its retries reports `data_unavailable` (a 5xx, a body that is not JSON, an unreachable or timed-out portal, or the call's 45-second budget spent) or `rate_limited` (HTTP 429, with `retryAfter` when the portal sent one); both are retryable
-- `start_period`/`end_period` accept `YYYY`, `YYYY-SN`, `YYYY-QN`, `YYYY-MM`, or a calendar-valid `YYYY-MM-DD`, trimmed; each bound covers its whole period (`end_period: 2023` includes `2023-M12`)
-- `last_n_observations` (1–1,000,000) keeps each series' last N observations — `1` returns every series' latest value without downloading its history. "Latest" is per series, and a WEO series ends in projection years (`2031`); with a period bound, the last N inside the range
-- Returns `time_period`, `value`, `status`, and series attributes (`unit`, `scale`, `decimals`); a key resolving to multiple series carries one `series_metadata` entry per series, since attributes can differ between them. The formatted text lists every series beside its attributes, one row per shared combination; a result past a thousand series or so lists the first 20 and names the way to the rest
-- An index series carries its `reference_period` exactly as published (`2010A`, `2010=100`, `Multiple`), on the series and, where the dataflow publishes one per observation (`CPI`), on each observation; the field is present only when published, and staged tables carry it as `series_reference_period` and `reference_period`
-- `unit`/`scale` are upstream codes (`PT`, `USD`, `XDC`, `IX`, `NUM`); a `null` unit means the dataflow publishes none, unless `unresolved_attributes` lists it. The portal leaves a group's unit out of a `+` key on its dimension, and when the extra request that recovers it fails, that field names what stayed null and gives a retry or a `*` key that reports it. `value` is already in base units, and `scale` is the power of ten the IMF publishes the series in — `"9"` renders `published in units of 10^9`, `"0"` renders `published in units`
-- A response is held to 100,000 serialized characters. With DataCanvas, larger multi-country or long-range results spill to it (`output_mode: "canvas"` forces staging); `staged` reports storage, `truncated` reports only whether `observations` is an incomplete preview — a staged result can still be untruncated
-- Without DataCanvas, a larger result returns its earliest observations with `truncated: true`, full `series_metadata`, and `retrieval_guidance` naming the last `time_period` returned and how to narrow: a narrower key, `start_period`/`end_period`, `last_n_observations`, or `CANVAS_PROVIDER_TYPE=duckdb`. A key whose `series_metadata` alone overflows fails as `response_too_large`
-- `no_data` errors carry availability context naming codes that do have coverage; a key with data entirely outside the requested range fails as `no_data_in_range` and reports the range that does
-- A `+` key whose requested series partly return nothing keeps what returned and lists the rest in `missing_series` (up to 20, in key order; `missing_series_count` is the total), each with the reason a query for it alone gives: `no_data`, or `no_data_in_range` with the range its data spans
+- Dot-separated key in DSD order, where `+` combines codes at a position and `*` matches all of them; codes and `dataflow_id` are case-insensitive. `start_period`/`end_period` accept `YYYY`, `YYYY-SN`, `YYYY-QN`, `YYYY-MM`, or `YYYY-MM-DD`, and `last_n_observations` (1–1,000,000) keeps each series' last N observations
+- Returns `time_period`, `value`, `status`, and series attributes (`unit`, `scale`, `decimals`, `reference_period` where published), with one `series_metadata` entry per series. Responses are held to 100,000 characters: with DataCanvas, larger results spill to it (`output_mode: "canvas"` forces staging, and `staged` reports storage); without it, the earliest observations return with `truncated: true` and `retrieval_guidance`
+- Key and range errors are `invalid_key_code` (with the nearest valid codes), `wildcard_in_code_list`, `key_too_long`, `response_too_large`, `no_data`, and `no_data_in_range`; a `+` key that partly returns lists the rest in `missing_series`. Upstream failures are `data_unavailable` and `rate_limited`, both retryable within a 45-second call budget
 
 ---
 
 ### `imf_dataframe_describe` <sub>tool</sub>
 
-- Lists every table staged on a canvas, with row count and column schema (name + DuckDB type)
-- Requires `canvas_id` from a prior `imf_query_dataset` call that returned `staged: true`
-- Call before `imf_dataframe_query` to confirm table and column names
-- Listed only with `CANVAS_PROVIDER_TYPE=duckdb`, like the other dataframe tools; without it the landing page shows it disabled with that hint
+- Lists every staged table with row count and column names and DuckDB types
+- Requires `canvas_id` from an `imf_query_dataset` call that returned `staged: true`; call it before `imf_dataframe_query`
+- Listed only with `CANVAS_PROVIDER_TYPE=duckdb`, like the other dataframe tools
 
 ---
 
 ### `imf_dataframe_query` <sub>tool</sub>
 
-- One read-only SQL `SELECT` per call; a leading `WITH … SELECT` common table expression is accepted, DML and DDL are rejected
-- Results are capped first by the canvas row limit (default 10,000), then by a 100,000-character serialized response budget — `row_count` always equals the returned rows, and `truncated: true` means either cap trimmed the result
-- Page past a cap with a stable `ORDER BY` plus `LIMIT`/`OFFSET`. A single row too long for the budget comes back alone with its long cells and column names clipped in the text table (`… [clipped: N of M characters]`; read the rest with `SUBSTR`), while `structuredContent` keeps every value and column name whole. A row with too many columns for a table even clipped is listed as one `name: value` line per column in a code block, with nested values flattened to plain text (and a note saying so) when their JSON would not fit. A row that can't be listed either comes back in `structuredContent` with a one-line pointer to it as its text. `response_too_large` means the row's `structuredContent` alone exceeds the budget and asks for fewer columns or aggregation
-- The text table escapes `|`, backticks, and line breaks so each row keeps its columns, and shows STRUCT/LIST values as compact JSON; `structuredContent` carries the raw values
+- One read-only SQL `SELECT` per call; a leading `WITH … SELECT` is accepted, DML and DDL are rejected
+- Results are capped by the canvas row limit (default 10,000), then a 100,000-character response budget; `truncated: true` means either cap trimmed the result. Page with a stable `ORDER BY` plus `LIMIT`/`OFFSET`
+- Oversized cells are clipped in the text table while `structuredContent` keeps every value; `response_too_large` means a single row exceeds the budget even so
 - Listed only with `CANVAS_PROVIDER_TYPE=duckdb`
 
 ---
 
 ### `imf_dataframe_drop` <sub>tool</sub>
 
-- Removes one named table or view from a canvas without affecting the others; requires the exact name from `imf_dataframe_describe`
-- Idempotent — a repeated or absent drop returns `dropped: false` rather than an error
-- Disabled by default; set `IMF_ENABLE_DATAFRAME_DROP=true` alongside `CANVAS_PROVIDER_TYPE=duckdb` to register it in `tools/list`
+- Removes one named table or view from a canvas; requires the exact name from `imf_dataframe_describe`
+- A repeated or absent drop returns `dropped: false` rather than an error
+- Disabled by default; set `IMF_ENABLE_DATAFRAME_DROP=true` alongside `CANVAS_PROVIDER_TYPE=duckdb` to register it
 
 ---
 
 ### `imf://database/{dataflow_id}` <sub>resource</sub>
 
-- Bounded discovery metadata for one dataflow — every dimension with up to 50 codelist entries, counts, `key_format`, name, description
-- `dataflow_id` comes from `imf_list_databases`
-- Carries `continuation` metadata pointing to `imf_get_database` (with `dimension_id`/`limit`/`offset`) for a codelist beyond the preview
+- Every dimension with up to 50 codelist entries, plus counts, `key_format`, name, and description
+- `dataflow_id` comes from `imf_list_databases`; `continuation` metadata points to `imf_get_database` for codelists beyond the preview
 
 ## Features
 
@@ -131,18 +110,17 @@ Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): s
 
 IMF-specific:
 
-- Keyless access — no API key required; the IMF SDMX 3.0 portal is fully public
-- Type-safe SDMX 3.0 compact JSON client with dimension/codelist parsing and DSD validation
-- Key dimension count validated against the DSD before each query to catch format mismatches early
-- Dataflow catalog and full availability constraints cached in-session to minimize round trips on multi-step workflows
-- DuckDB-backed DataCanvas spill for large multi-country or long time-range observations
+- Keyless access to the public IMF SDMX 3.0 portal
+- Typed SDMX 3.0 client that validates the key's dimension count against the DSD before each query
+- Dataflow catalog and availability constraints cached in-session
+- DuckDB-backed DataCanvas spill for large multi-country or long time-range results
 
 Agent-friendly output:
 
-- Codelist entries carry both the machine code and human-readable label — agents can present meaningful names without a follow-up lookup
-- `key_format` field in every dataflow response explicitly states the dimension order, removing guesswork for key construction
-- Observations include each dataflow's own `status` flags (e.g. `T`, `C`, `NA`) so agents can communicate data quality caveats; a missing value flagged only as not available is dropped as padding
-- Canvas placement is explicit — `staged` distinguishes storage from `truncated` preview completeness, and staged results carry `canvas_id`, `table_name`, and retrieval guidance
+- Codelist entries carry both the machine code and the human-readable label
+- `key_format` in every dataflow response states the dimension order
+- Observations carry each dataflow's `status` flags (e.g. `T`, `C`, `NA`) for data-quality caveats
+- `staged` and `truncated` are reported separately, and staged results carry `canvas_id`, `table_name`, and retrieval guidance
 
 ## Getting started
 
@@ -262,13 +240,13 @@ cp .env.example .env
 
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `CANVAS_PROVIDER_TYPE` | Set to `duckdb` to enable DataCanvas spill for large result sets and register the dataframe tools. Unset, an over-budget query returns its earliest observations with `truncated: true`. | — |
-| `IMF_ENABLE_DATAFRAME_DROP` | Advertise and enable destructive table-level DataCanvas cleanup. | `false` |
-| `IMF_BASE_URL` | IMF SDMX 3.0 base URL. Override for testing or proxied environments. | `https://api.imf.org/external/sdmx/3.0` |
-| `IMF_REQUEST_TIMEOUT_MS` | Per-request timeout in milliseconds. Every request a tool call makes, retries included, also shares one 45-second budget, so a call settles before a client's default 60-second timeout. | `30000` |
+| `CANVAS_PROVIDER_TYPE` | Set to `duckdb` to enable DataCanvas spill and the dataframe tools. | — |
+| `IMF_ENABLE_DATAFRAME_DROP` | Register `imf_dataframe_drop`. | `false` |
+| `IMF_BASE_URL` | IMF SDMX 3.0 base URL. | `https://api.imf.org/external/sdmx/3.0` |
+| `IMF_REQUEST_TIMEOUT_MS` | Per-request timeout in milliseconds. | `30000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
-| `MCP_SESSION_MODE` | HTTP session handling: `stateful`, `stateless`, or `auto` (the schema default, which resolves to stateful). This server declares `stateless` in `src/index.ts`, so a deployment that sets nothing still gets it; setting this to a meaningful value overrides the declaration. | `stateless` |
+| `MCP_SESSION_MODE` | HTTP session handling: `stateful`, `stateless`, or `auto`. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
