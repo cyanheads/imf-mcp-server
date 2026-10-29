@@ -6,8 +6,9 @@
  *
  * `./.env` is loaded here the way the framework loads it on its first config
  * parse (never overriding a variable already set), so a value set there wins
- * over the default. Nothing is validated here: `createApp()` parses the
- * framework config and reports an invalid variable with its startup banner.
+ * over the default. Nothing is validated or reported here: `createApp()` parses
+ * the framework config and reports an invalid variable, or a `.env` it cannot
+ * read, with its startup banner.
  * @module config/canvas-default
  */
 
@@ -15,9 +16,12 @@ import { normalizeEnv } from '@cyanheads/mcp-ts-core/config';
 
 try {
   process.loadEnvFile();
-} catch (error) {
-  // No .env in the working directory is the normal case.
-  if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+} catch {
+  /**
+   * No .env is the normal case. Any other failure is left to `createApp()`,
+   * whose own load of the same file stops startup with the banner — a throw
+   * here would print a raw stack before the banner can.
+   */
 }
 
 if (normalizeEnv(process.env).CANVAS_PROVIDER_TYPE === undefined) {

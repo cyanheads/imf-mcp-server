@@ -1,13 +1,15 @@
 /**
- * @fileoverview Startup of the built entry point under Node, from a working
+ * @fileoverview Startup of the built entry point under the runtime running the
+ * tests (Bun under `bun run test`, Node under a plain `vitest`), from a working
  * directory holding only a `.env`: the DataCanvas default and the dataframe
- * tool gates honor `.env` values, and an invalid value stops startup with the
- * framework's configuration banner rather than a raw stack.
+ * tool gates honor `.env` values, and an invalid value or an unreadable `.env`
+ * stops startup with the framework's configuration banner rather than a raw
+ * stack.
  * @module tests/startup.test
  */
 
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,9 +40,10 @@ type Startup =
   | { kind: 'exited'; code: number | null; stderr: string };
 
 /**
- * Starts `node dist/index.js` over stdio in `cwd` with only `PATH` inherited,
- * and returns the `tools/list` names once it answers, or its exit code and
- * stderr when it stops first.
+ * Starts `dist/index.js` on the test runtime over stdio in `cwd`, with only
+ * `PATH` and `MCP_TRANSPORT_TYPE` in its environment, and returns the
+ * `tools/list` names once it answers, or its exit code and stderr when it
+ * stops first.
  */
 function start(cwd: string): Promise<Startup> {
   const child: ChildProcess = spawn(process.execPath, [entry], {
@@ -93,7 +96,7 @@ function start(cwd: string): Promise<Startup> {
 
 const BASE_TOOLS = ['imf_list_databases', 'imf_get_database', 'imf_query_dataset'];
 
-describe('startup under Node', { timeout: 30_000 }, () => {
+describe('startup of the built entry point', { timeout: 30_000 }, () => {
   it('defaults DataCanvas on: the describe and query dataframe tools are listed', async () => {
     expect(await start(workDir())).toEqual({
       kind: 'listening',
@@ -129,6 +132,19 @@ describe('startup under Node', { timeout: 30_000 }, () => {
     expect(startup.code).toBe(1);
     expect(startup.stderr).toContain('Configuration error — server failed to start');
     expect(startup.stderr).toContain(`- ${name} (`);
+    expect(startup.stderr).not.toMatch(/^\s+at /m);
+  });
+
+  it('stops startup on an unreadable .env with the banner naming the file', async () => {
+    const dir = workDir();
+    mkdirSync(join(dir, '.env'));
+    const startup = await start(dir);
+
+    expect(startup.kind).toBe('exited');
+    if (startup.kind !== 'exited') return;
+    expect(startup.code).toBe(1);
+    expect(startup.stderr).toContain('Configuration error — server failed to start');
+    expect(startup.stderr).toContain('Failed to load .env from the working directory.');
     expect(startup.stderr).not.toMatch(/^\s+at /m);
   });
 });
