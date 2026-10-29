@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/imf-mcp-server</h1>
-  <p><b>Query IMF SDMX 3.0 macroeconomic data — hundreds of dataflows across 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP.</b>
-  <div>6 Tools • 1 Resource</div>
+  <p><b>Query IMF SDMX 3.0 macroeconomic data — 100+ dataflows across 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP.</b>
+  <div>6 Tools • 1 Resource • 1 Skill</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/imf-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/imf-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/imf-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-IMF macroeconomic data across 190 countries: World Economic Outlook projections, balance of payments, CPI, exchange rates, national accounts, and hundreds more datasets. Browse the catalog, resolve dimension codes, query time series, and run SQL over large multi-country results. No API key required.
+IMF macroeconomic data across 190 countries: World Economic Outlook projections, balance of payments, CPI, exchange rates, national accounts, and 100+ dataflows in all. Browse the catalog, resolve dimension codes, query time series, and run SQL over large multi-country results. No API key required.
 
 ### Tools
 
@@ -47,6 +47,12 @@ IMF macroeconomic data across 190 countries: World Economic Outlook projections,
 | Resource | Description |
 |:---|:---|
 | `imf://database/{dataflow_id}` | Discovery metadata for one dataflow: dimensions, codelist previews, and `key_format` |
+
+### Skill
+
+| Skill | Description |
+|:------|:------------|
+| [`imf-guide`](./skills/imf-guide/SKILL.md) | Routing a macro question to the dataflow that holds it, and reading results without mixing projections, group aggregates, or currency units. Served over MCP at `skill://imf-guide/SKILL.md` |
 
 ## Capability reference
 
@@ -78,7 +84,7 @@ IMF macroeconomic data across 190 countries: World Economic Outlook projections,
 
 - Lists every staged table with row count and column names and DuckDB types
 - Requires `canvas_id` from an `imf_query_dataset` call that returned `staged: true`; call it before `imf_dataframe_query`
-- Listed only with `CANVAS_PROVIDER_TYPE=duckdb`, like the other dataframe tools
+- Not listed when `CANVAS_PROVIDER_TYPE=none`, like the other dataframe tools
 
 ---
 
@@ -87,7 +93,7 @@ IMF macroeconomic data across 190 countries: World Economic Outlook projections,
 - One read-only SQL `SELECT` per call; a leading `WITH … SELECT` is accepted, DML and DDL are rejected
 - Results are capped by the canvas row limit (default 10,000), then a 100,000-character response budget; `truncated: true` means either cap trimmed the result. Page with a stable `ORDER BY` plus `LIMIT`/`OFFSET`
 - Oversized cells are clipped in the text table while `structuredContent` keeps every value; `response_too_large` means a single row exceeds the budget even so
-- Listed only with `CANVAS_PROVIDER_TYPE=duckdb`
+- Not listed when `CANVAS_PROVIDER_TYPE=none`
 
 ---
 
@@ -95,7 +101,7 @@ IMF macroeconomic data across 190 countries: World Economic Outlook projections,
 
 - Removes one named table or view from a canvas; requires the exact name from `imf_dataframe_describe`
 - A repeated or absent drop returns `dropped: false` rather than an error
-- Disabled by default; set `IMF_ENABLE_DATAFRAME_DROP=true` alongside `CANVAS_PROVIDER_TYPE=duckdb` to register it
+- Disabled by default; set `IMF_ENABLE_DATAFRAME_DROP=true` (DataCanvas must not be `none`) to register it
 
 ---
 
@@ -195,7 +201,7 @@ Or with Docker:
 }
 ```
 
-To enable SQL analytics over large result sets, add `CANVAS_PROVIDER_TYPE=duckdb` to the `env` block. Add `IMF_ENABLE_DATAFRAME_DROP=true` only when agents should be able to remove staged tables.
+DataCanvas is on by default, so large result sets spill to tables the dataframe tools query with SQL; add `CANVAS_PROVIDER_TYPE=none` to the `env` block to turn it off. Add `IMF_ENABLE_DATAFRAME_DROP=true` only when agents should be able to remove staged tables.
 
 For Streamable HTTP, set the transport and start the server:
 
@@ -240,10 +246,10 @@ cp .env.example .env
 
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `CANVAS_PROVIDER_TYPE` | Set to `duckdb` to enable DataCanvas spill and the dataframe tools. | — |
+| `CANVAS_PROVIDER_TYPE` | DataCanvas spill and the dataframe tools. `none` disables both. | `duckdb` |
 | `IMF_ENABLE_DATAFRAME_DROP` | Register `imf_dataframe_drop`. | `false` |
 | `IMF_BASE_URL` | IMF SDMX 3.0 base URL. | `https://api.imf.org/external/sdmx/3.0` |
-| `IMF_REQUEST_TIMEOUT_MS` | Per-request timeout in milliseconds. | `30000` |
+| `IMF_REQUEST_TIMEOUT_MS` | Per-request timeout in milliseconds (integer, 1–2147483647). | `30000` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_SESSION_MODE` | HTTP session handling: `stateful`, `stateless`, or `auto`. | `stateless` |
@@ -290,10 +296,12 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 |:-----|:--------|
 | `src/index.ts` | `createApp()` entry point — registers tools/resources and inits services. |
 | `src/config/server-config.ts` | Server-specific env var parsing and validation with Zod. |
+| `src/config/canvas-default.ts` | Defaults `CANVAS_PROVIDER_TYPE` to `duckdb`; the entry point's first import. |
 | `src/mcp-server/tools/definitions/` | Tool definitions (`*.tool.ts`). |
 | `src/mcp-server/resources/definitions/` | Resource definitions (`*.resource.ts`). |
 | `src/services/canvas/` | DataCanvas accessor — wraps the framework canvas instance. |
 | `src/services/imf-sdmx/` | IMF SDMX 3.0 API client — dataflow catalog, DSD fetching, data queries. |
+| `skills/` | The published `imf-guide` agent skill, served over MCP and shipped to plugin installs and the `.mcpb` bundle. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 | `docs/` | Design notes and directory tree. |
 

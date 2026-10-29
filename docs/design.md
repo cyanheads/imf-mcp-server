@@ -279,7 +279,7 @@ None — this is a pure data server; no reusable message templates warranted.
 
 ## Overview
 
-Global macroeconomic and financial statistics from the International Monetary Fund, accessed via the IMF's SDMX 3.0 portal (`api.imf.org`). Covers hundreds of dataflows including WEO projections, balance of payments, exchange rates, price indices, international liquidity, government finance, and national accounts for ~190 member countries.
+Global macroeconomic and financial statistics from the International Monetary Fund, accessed via the IMF's SDMX 3.0 portal (`api.imf.org`). Covers 100+ dataflows including WEO projections, balance of payments, exchange rates, price indices, international liquidity, government finance, and national accounts for ~190 member countries.
 
 The server follows the **discover → describe → query** workflow: `imf_list_databases` to find a dataflow id, `imf_get_database` to resolve dimension codes, `imf_query_dataset` to fetch observations. With DataCanvas enabled, large analytical pulls spill automatically and smaller pulls can be staged explicitly; without it, a pull over the response budget returns its earliest observations with guidance on narrowing. A staged handle is consumed through `imf_dataframe_describe` before `imf_dataframe_query`, then its table can be reclaimed through opt-in `imf_dataframe_drop`.
 
@@ -299,7 +299,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 - Country codes are ISO 3-letter (USA, GBR, DEU, …), not ISO 2-letter
 - Observations returned in compact SDMX-JSON format: indexed by position (e.g. `"0":["-0.257"]`) requiring resolution against `structures[0].dimensions.observation[0].values` for time labels
 - Attribute data carried per-series (SCALE, DECIMALS_DISPLAYED, UNIT, IFS_FLAG) and per-observation (STATUS, PRECISION) — the series-level ids are not uniform across the catalog (see decision 15)
-- DataCanvas (DuckDB) for large analytical result sets — opt-in via `CANVAS_PROVIDER_TYPE=duckdb`; table-level cleanup is separately opt-in via `IMF_ENABLE_DATAFRAME_DROP=true`
+- DataCanvas (DuckDB) for large analytical result sets — on by default, off with `CANVAS_PROVIDER_TYPE=none`; table-level cleanup is opt-in via `IMF_ENABLE_DATAFRAME_DROP=true`
 
 ---
 
@@ -316,7 +316,7 @@ The server follows the **discover → describe → query** workflow: `imf_list_d
 
 | Env Var | Required | Description |
 |:--------|:---------|:------------|
-| `CANVAS_PROVIDER_TYPE` | No (default: `none`) | Set to `duckdb` to enable DataCanvas for large query result spill and register the dataframe tools. Requires `@duckdb/node-api` peer dep. Unset, an over-budget query returns a time-ascending prefix of its observations. |
+| `CANVAS_PROVIDER_TYPE` | No (default: `duckdb`) | DataCanvas for large query result spill; registers the dataframe tools. `src/config/canvas-default.ts` sets the default before any tool module loads. Requires the `@duckdb/node-api` dependency. Set to `none`, an over-budget query returns a time-ascending prefix of its observations. |
 | `IMF_ENABLE_DATAFRAME_DROP` | No (default: `false`) | Set to `true` to register the destructive `imf_dataframe_drop` table-cleanup tool. |
 | `IMF_BASE_URL` | No (default: `https://api.imf.org/external/sdmx/3.0`) | Override base URL for testing or proxied environments. |
 | `IMF_REQUEST_TIMEOUT_MS` | No (default: `30000`) | Per-request timeout in milliseconds. IMF SDMX 3.0 responses can be slow on large dataflows. A request never runs past what is left of its call's 45-second budget (decision 30). |
@@ -387,7 +387,7 @@ The `api.imf.org` portal does not require registration for data queries. All dat
 
 ### 2. DataCanvas: adopted
 
-IMF macro data is inherently analytical — multi-country GDP comparisons, BOP time series, WEO cross-country projections. An agent querying 30 countries × 5 indicators × 20 years = 3,000 observations is exactly the "agent would run `GROUP BY country`" shape that earns a canvas. DataCanvas is adopted. Automatic placement measures the actual MCP success result (`structuredContent` plus rendered `content[]`, including enrichment trailers) and stages only when that result exceeds 100,000 serialized characters. Series metadata, handles, attribution, guidance, and truthful `observation_count` are fixed; the observation preview is reduced to meet the cap. If those fixed fields alone exceed the budget, the tool returns `response_too_large` and asks the caller to narrow the series key rather than silently dropping metadata. The canvas is opt-in, and the same budget and assembly hold without it, minus the handle (decision 23).
+IMF macro data is inherently analytical — multi-country GDP comparisons, BOP time series, WEO cross-country projections. An agent querying 30 countries × 5 indicators × 20 years = 3,000 observations is exactly the "agent would run `GROUP BY country`" shape that earns a canvas. DataCanvas is adopted. Automatic placement measures the actual MCP success result (`structuredContent` plus rendered `content[]`, including enrichment trailers) and stages only when that result exceeds 100,000 serialized characters. Series metadata, handles, attribution, guidance, and truthful `observation_count` are fixed; the observation preview is reduced to meet the cap. If those fixed fields alone exceed the budget, the tool returns `response_too_large` and asks the caller to narrow the series key rather than silently dropping metadata. The canvas is on by default and can be turned off with `CANVAS_PROVIDER_TYPE=none`; the same budget and assembly hold without it, minus the handle (decision 23).
 
 The `canvas_id` from `imf_query_dataset` is reachable via `imf_dataframe_query` and `imf_dataframe_describe`; opt-in `imf_dataframe_drop` reclaims one completed table without deleting unrelated tables or invalidating the canvas.
 
@@ -596,9 +596,9 @@ Rejected:
 
 ### 23. Without a canvas, the response budget still holds
 
-With `CANVAS_PROVIDER_TYPE` unset — the default, and the only mode the `.mcpb` bundle runs — the budget check was skipped: `WEO` `*.NGDPD+NGDP_RPCH.A` returned all 19,979 observations in a 2.6-million-character envelope, and `*.*.A` in 46 million. An over-budget result without a canvas now goes through the assembly the staged path uses, minus the handle. The whole envelope is measured (decision 2), full `series_metadata` and the true `observation_count` stay, and `observations` is the longest time-ascending prefix that fits, with `staged: false` and `truncated: true`. `retrieval_guidance` names the last `time_period` returned and each way to the rest: a narrower key, `start_period` from that period, a `start_period`/`end_period` window, `last_n_observations`, or `CANVAS_PROVIDER_TYPE=duckdb`. It names no dataframe tool. The fixed part every prefix is measured on carries the `content[]` series-attribute table too, rendered whole or as its 20-entry fallback (decision 13). When `series_metadata` alone overflows (`*.*.A`, `ANEA` `*.*.*.*.A`), `response_too_large` fires as it does when staging.
+With `CANVAS_PROVIDER_TYPE=none` — the only mode the `.mcpb` bundle runs — the budget check was skipped: `WEO` `*.NGDPD+NGDP_RPCH.A` returned all 19,979 observations in a 2.6-million-character envelope, and `*.*.A` in 46 million. An over-budget result without a canvas now goes through the assembly the staged path uses, minus the handle. The whole envelope is measured (decision 2), full `series_metadata` and the true `observation_count` stay, and `observations` is the longest time-ascending prefix that fits, with `staged: false` and `truncated: true`. `retrieval_guidance` names the last `time_period` returned and each way to the rest: a narrower key, `start_period` from that period, a `start_period`/`end_period` window, `last_n_observations`, or `CANVAS_PROVIDER_TYPE=duckdb`. It names no dataframe tool. The fixed part every prefix is measured on carries the `content[]` series-attribute table too, rendered whole or as its 20-entry fallback (decision 13). When `series_metadata` alone overflows (`*.*.A`, `ANEA` `*.*.*.*.A`), `response_too_large` fires as it does when staging.
 
-The dataframe tools are gated on canvas presence with `disabledTool()`. Without a canvas nothing is staged, so `imf_dataframe_describe` and `imf_dataframe_query` could only fail with `canvas_not_found`. All three leave `tools/list` and stay in the landing inventory with `CANVAS_PROVIDER_TYPE=duckdb` as the hint, and `imf_dataframe_drop` keeps its own flag on top. The gate reads `CANVAS_PROVIDER_TYPE` from the framework config at module load, because tools register before `setup()` wires the canvas instance.
+The dataframe tools are gated on canvas presence with `disabledTool()`. Without a canvas nothing is staged, so `imf_dataframe_describe` and `imf_dataframe_query` could only fail with `canvas_not_found`. All three leave `tools/list` and stay in the landing inventory with `CANVAS_PROVIDER_TYPE=duckdb` as the hint, and `imf_dataframe_drop` keeps its own flag on top. The gate reads `CANVAS_PROVIDER_TYPE` at module load, because tools register before `setup()` wires the canvas instance; the `duckdb` default therefore lives in `src/config/canvas-default.ts`, the entry point's first import, which loads `./.env` first so a value set there wins, and sets the default before any tool module is evaluated. Both gates read their one variable through its schema field and never throw: a full config parse at module load would surface an invalid variable as a raw stack trace ahead of `createApp()`. An invalid value leaves the gated tool off, and startup then stops on it with the framework's banner — `createApp()` parses the framework config, `setup()` the server config.
 
 Rejected:
 - Whole series as the truncation unit: the commonest single-series overflow, one long monthly series, would still need a prefix, so it adds a second mode instead of replacing the first. A prefix also has a continuation the existing inputs express.
@@ -724,7 +724,7 @@ No authentication required. No API key header needed.
 | Balance of Payments | `BOP` | `IMF.STA` | `DSD_BOP` | `COUNTRY.BOP_ACCOUNTING_ENTRY.INDICATOR.UNIT.FREQUENCY` | Current/capital/financial accounts |
 | International Investment Position | `IIP` | `IMF.STA` | `DSD_BOP` (shared) | `COUNTRY.BOP_ACCOUNTING_ENTRY.INDICATOR.UNIT.FREQUENCY` | Shares DSD with BOP |
 | Exchange Rates | `ER` | `IMF.STA` | `DSD_ER_PUB` | varies | Bilateral and effective |
-| Consumer Price Index | `CPI` | `IMF.STA` | `DSD_CPI` | `COUNTRY.INDEX_TYPE.COICOP_1999.TYPE_OF_TRANSFORMATION.FREQUENCY` | ~90 countries; HICP for EU |
+| Consumer Price Index | `CPI` | `IMF.STA` | `DSD_CPI` | `COUNTRY.INDEX_TYPE.COICOP_1999.TYPE_OF_TRANSFORMATION.FREQUENCY` | About 200 economies plus the Euro Area (`G163`); other group aggregates in `CPI_WCA` |
 | International Liquidity (Reserves) | `IL` | `IMF.STA` | `DSD_IL` | varies | Gold, SDRs, FX reserves |
 | GFS Statement of Operations | `GFS_SOO` | `IMF.STA` | varies | varies | Revenue, expenditure by government level |
 | Monetary Aggregates | `MFS_MA` | `IMF.STA` | varies | varies | M1, M2, broad money |

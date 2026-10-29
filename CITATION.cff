@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: imf-mcp-server
-abstract: "Query IMF SDMX 3.0 macroeconomic data — 193 dataflows, 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP."
+abstract: "Query IMF SDMX 3.0 macroeconomic data — 100+ dataflows, 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP."
 type: software
 authors:
   - family-names: Hand
