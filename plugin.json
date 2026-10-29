@@ -1,0 +1,33 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "imf-mcp-server",
+  "version": "0.4.4",
+  "description": "Query IMF SDMX 3.0 macroeconomic data — 100+ dataflows across 190 countries, WEO projections, BOP, CPI, exchange rates, and national accounts via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "Casey Hand",
+    "email": "casey@caseyjhand.com",
+    "url": "https://caseyjhand.com"
+  },
+  "homepage": "https://github.com/cyanheads/imf-mcp-server#readme",
+  "repository": "git+https://github.com/cyanheads/imf-mcp-server.git",
+  "license": "Apache-2.0",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "imf",
+    "sdmx",
+    "macroeconomics",
+    "world-economic-outlook",
+    "weo",
+    "balance-of-payments",
+    "exchange-rates",
+    "economic-data",
+    "international-monetary-fund",
+    "typescript",
+    "bun",
+    "stdio",
+    "streamable-http",
+    "ai-agent"
+  ]
+}
