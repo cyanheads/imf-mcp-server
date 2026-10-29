@@ -1,8 +1,18 @@
 /**
- * @fileoverview Shared test helpers for reading rendered GFM table rows and
- * fenced code blocks.
+ * @fileoverview Shared test helpers for reading rendered GFM table rows,
+ * fenced code blocks, and backslash-escaped inline text.
  * @module tests/helpers/markdown-table
  */
+
+/**
+ * `text` as a CommonMark renderer shows it once backslash escapes are read
+ * (spec §2.4): a backslash before ASCII punctuation drops and leaves the
+ * punctuation literal; before anything else it stays. Error and trailer text in
+ * `content[]` escapes caller-visible punctuation this way.
+ */
+export function unescapeMarkdown(text: string): string {
+  return text.replace(/\\([!-/:-@[-`{-~])/g, '$1');
+}
 
 /**
  * The first backtick-fenced code block in `text`, read by the CommonMark rules

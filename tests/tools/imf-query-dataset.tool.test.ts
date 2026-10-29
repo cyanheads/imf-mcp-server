@@ -17,7 +17,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { captureMcpError, contractError, recoveryHint } from '../helpers/errors.js';
-import { rowCells } from '../helpers/markdown-table.js';
+import { rowCells, unescapeMarkdown } from '../helpers/markdown-table.js';
 
 vi.mock('@/services/imf-sdmx/imf-sdmx-service.js', () => ({
   getImfSdmxService: vi.fn(),
@@ -2962,7 +2962,7 @@ describe('imfQueryDataset', () => {
     it('rejects * inside a + list as wildcard_in_code_list naming the position, with no data request', async () => {
       const response = await query('USA+*.NGDP_RPCH.A');
       const error = contractError(response);
-      const text = contentText(response);
+      const text = unescapeMarkdown(contentText(response));
 
       expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
       expect(error.data).toMatchObject({
@@ -3204,7 +3204,9 @@ describe('imfQueryDataset', () => {
           expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
           expect(error.data).toMatchObject({ reason: 'empty_key_segment', emptyPositions });
           expect(error.message).toContain('*');
-          expect(contentText(response)).toContain(contractRecovery('empty_key_segment'));
+          expect(unescapeMarkdown(contentText(response))).toContain(
+            contractRecovery('empty_key_segment'),
+          );
           expect(mockSvc.fetchData).not.toHaveBeenCalled();
           expect(mockSvc.fetchAvailabilityConstraint).not.toHaveBeenCalled();
         },
@@ -3247,7 +3249,7 @@ describe('imfQueryDataset', () => {
 
         const response = await query('USA+GBR+DEU+TUR.NGDP_RPCH+NGDPD.A');
         const error = contractError(response);
-        const text = contentText(response);
+        const text = unescapeMarkdown(contentText(response));
 
         expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
         expect(error.data).toMatchObject({
@@ -5419,7 +5421,7 @@ describe('imfQueryDataset', () => {
           key: 'USA.NGDP_RPCH.A',
         });
         const wire = contractError(response);
-        const text = contentText(response);
+        const text = unescapeMarkdown(contentText(response));
 
         expect(wire.code).toBe(code);
         expect(wire.message).toBe(error.message);
