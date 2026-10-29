@@ -406,6 +406,7 @@ const imfDataframeQueryDefinition = tool('imf_dataframe_query', {
       reason: 'response_too_large',
       code: JsonRpcErrorCode.SerializationError,
       when: 'The first result row alone exceeds the response budget as structured content, even with the formatted text reduced to a one-line pointer to it',
+      severity: 'warning',
       recovery:
         'Select fewer columns, aggregate the result, or return shorter values and column aliases so one complete row fits the response budget.',
     },

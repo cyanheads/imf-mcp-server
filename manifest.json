@@ -19,6 +19,7 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
+        "CANVAS_PROVIDER_TYPE": "none",
         "IMF_ENABLE_DATAFRAME_DROP": "${user_config.imf_enable_dataframe_drop}",
         "NODE_ENV": "production"
       }

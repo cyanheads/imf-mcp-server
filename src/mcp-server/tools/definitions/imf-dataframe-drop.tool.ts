@@ -6,7 +6,7 @@
 import { disabledTool, tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getServerConfig, isCanvasConfigured } from '@/config/server-config.js';
+import { isCanvasConfigured, isDataframeDropEnabled } from '@/config/server-config.js';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 
 const INVALID_IDENTIFIER_REASONS = new Set([
@@ -122,7 +122,7 @@ const imfDataframeDropDefinition = tool('imf_dataframe_drop', {
  * setting still missing, so enabling the canvas alone is not a dead end.
  */
 function gateDrop() {
-  const { enableDataframeDrop } = getServerConfig();
+  const enableDataframeDrop = isDataframeDropEnabled();
   if (!isCanvasConfigured()) {
     return disabledTool(imfDataframeDropDefinition, {
       reason: 'DataCanvas is not configured in this deployment.',

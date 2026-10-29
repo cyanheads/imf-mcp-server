@@ -3,15 +3,20 @@
 #
 # This stage installs all dependencies (including dev), builds the TypeScript
 # source code into JavaScript, and prepares the production assets.
+#
+# Pinned to $BUILDPLATFORM rather than the target platform: `bun run build` emits
+# JavaScript, and only `dist/` crosses into the production stage. Built for the
+# target instead, the non-native leg of a `--platform linux/amd64,linux/arm64`
+# build runs under QEMU, where bun >= 1.4 aborts with a JavaScriptCore allocator
+# assertion and fails the multi-arch push.
+#
+# The constraint this assumes: the build stage produces platform-independent
+# output. A stage that compiles a native addon needs the target-arch toolchain
+# and cannot cross-compile this way — drop the flag there.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.4 AS build
 
 WORKDIR /usr/src/app
-
-# Install build tools required for native modules (@duckdb/node-api uses node-gyp)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 make g++ && \
-    rm -rf /var/lib/apt/lists/*
 
 # Copy dependency manifests for optimized layer caching
 COPY package.json bun.lock ./
@@ -24,6 +29,11 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 # Copy the rest of the source code
 COPY . .
 
+# The skills a server publishes (`createApp({ skills: 'skills' })`) are read at
+# runtime from the application root. Created when the project has none, so the
+# production stage's copy below holds with or without one.
+RUN mkdir -p skills
+
 # Build the application
 RUN bun run build
 
@@ -33,15 +43,15 @@ RUN bun run build
 #
 # Installs the production dependency tree for the target platform. Every step
 # here can run JavaScript — bunfig.toml's security scanner runs as a Bun
-# program, and so does the OTel script — so the stage runs on $BUILDPLATFORM
-# and cross-installs with `--os`/`--cpu`, which pick each platform-specific
-# optional dependency (native bindings such as DuckDB's) for the target. Only
-# `node_modules` leaves this stage.
+# program, and so do the OTel and musl-prune scripts — so the stage runs on
+# $BUILDPLATFORM and cross-installs with `--os`/`--cpu`, which pick each
+# platform-specific optional dependency (native bindings such as DuckDB's) for
+# the target. Only `node_modules` leaves this stage.
 #
 # A clean image rather than `FROM build`: the build stage's node_modules holds
 # devDependencies.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS deps
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.4 AS deps
 
 WORKDIR /usr/src/app
 
@@ -109,7 +119,7 @@ RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
 # dependencies and build artifacts. Its only Bun invocations are HEALTHCHECK
 # and CMD, which run on the real target at container start.
 # ==============================================================================
-FROM oven/bun:1.4.3-slim AS production
+FROM oven/bun:1.4.4-slim AS production
 
 WORKDIR /usr/src/app
 
@@ -119,7 +129,7 @@ ENV NODE_ENV=production
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
 ARG APP_VERSION
 LABEL org.opencontainers.image.title="imf-mcp-server"
-LABEL org.opencontainers.image.description="Query IMF SDMX 3.0 macroeconomic data — 193 dataflows, WEO, BOP, CPI, exchange rates, 190 countries."
+LABEL org.opencontainers.image.description="Query IMF SDMX 3.0 macroeconomic data — 100+ dataflows, WEO, BOP, CPI, exchange rates, 190 countries."
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.version="${APP_VERSION}"
 LABEL org.opencontainers.image.source="https://github.com/cyanheads/imf-mcp-server"
@@ -131,6 +141,7 @@ COPY --from=deps /usr/src/app/node_modules ./node_modules
 
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist
+COPY --from=build /usr/src/app/skills ./skills
 
 # The 'oven/bun' image already provides a non-root user named 'bun'.
 # We will use this existing user for enhanced security.
