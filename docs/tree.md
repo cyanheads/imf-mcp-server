@@ -1,6 +1,6 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-10-16 16:09:53
+Generated on: 2026-10-29 08:53:24
 
 ```text
 imf-mcp-server/
@@ -28,6 +28,7 @@ imf-mcp-server/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
+│   ├── 0.5.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -40,6 +41,8 @@ imf-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -137,9 +140,13 @@ imf-mcp-server/
 │   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
+├── skills/
+│   └── imf-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   ├── cache-hints.ts
+│   │   ├── canvas-default.ts
 │   │   └── server-config.ts
 │   ├── mcp-server/
 │   │   ├── prompts/
@@ -177,6 +184,8 @@ imf-mcp-server/
 │   ├── prompts/
 │   ├── resources/
 │   │   └── imf-database.resource.test.ts
+│   ├── scripts/
+│   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   └── imf-sdmx/
 │   │       └── imf-sdmx-service.test.ts
@@ -189,7 +198,8 @@ imf-mcp-server/
 │   │   ├── imf-list-databases.tool.test.ts
 │   │   └── imf-query-dataset.tool.test.ts
 │   ├── cache-hints.test.ts
-│   └── markdown-table.test.ts
+│   ├── markdown-table.test.ts
+│   └── startup.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes
@@ -206,7 +216,9 @@ imf-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

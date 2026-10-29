@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-10-29
+
+Publishes the imf-guide Agent Skill over MCP (skill://imf-guide/SKILL.md), turns DataCanvas on by default (CANVAS_PROVIDER_TYPE=none turns it off), stops startup with the variable named on an invalid IMF_REQUEST_TIMEOUT_MS or other bad setting, and moves to mcp-ts-core 0.13.18.
+
 ## [0.4.4](changelog/0.4.x/0.4.4.md) — 2026-10-16
 
 imf_query_dataset names requested series that returned nothing, reports unrecovered attributes and classified upstream failures, adds reference periods, and settles within a 45-second call budget; limits above a page cap are served up to it; imf_dataframe_query escapes table cells.
