@@ -14,7 +14,11 @@
 import { z } from '@cyanheads/mcp-ts-core';
 import { CanvasRegistry, DataCanvas, DuckdbProvider } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createMockContext,
+  type MockContextLogger,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { captureMcpError, contractError, recoveryHint } from '../helpers/errors.js';
 import { rowCells, unescapeMarkdown } from '../helpers/markdown-table.js';
@@ -30,6 +34,7 @@ vi.mock('@/services/canvas/canvas-accessor.js', () => ({
 import { imfQueryDataset } from '@/mcp-server/tools/definitions/imf-query-dataset.tool.js';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
+import { constraintTimeRange, sortByPeriod } from '@/services/imf-sdmx/time-period.js';
 
 const MOCK_DATAFLOW = {
   id: 'WEO',
@@ -107,6 +112,28 @@ const TWO_SERIES_RESULT = {
     'USA.NGDP_RPCH.A': NGDP_RPCH_ATTRS,
   },
 };
+
+/**
+ * 800 annual series sharing two periods, in result order: one period's rows do
+ * not fit the response budget beside the series inventory, so an over-budget
+ * result not staged is cut inside 2020 and every row it returns overlaps 2020.
+ */
+const SHARED_PERIOD_RESULT = (() => {
+  const series = Array.from({ length: 800 }, (_, i) => `C${String(i).padStart(4, '0')}.NGDPD.A`);
+  return {
+    ...MOCK_QUERY_RESULT,
+    key: '*.NGDPD.A',
+    observations: ['2020', '2021'].flatMap((time_period, p) =>
+      series.map((series_key, s) => ({
+        series_key,
+        time_period,
+        value: s + p / 10 + 0.123456,
+        status: null,
+      })),
+    ),
+    seriesAttributesByKey: {},
+  };
+})();
 
 /**
  * The controlled error ImfSdmxService throws when the dataflow catalog fetch fails
@@ -310,7 +337,7 @@ describe('imfQueryDataset', () => {
     expect(text).toContain('Retry the data request.');
   });
 
-  it('stages an over-budget automatic result with a budget-limited preview', async () => {
+  it('stages an over-budget automatic result with a preview of its first rows', async () => {
     const observations = Array.from({ length: 1_500 }, (_, index) => ({
       series_key: 'USA.NGDP_RPCH.A',
       time_period: `PERIOD_WITH_A_LONG_LABEL_${String(index).padStart(4, '0')}`,
@@ -512,107 +539,6 @@ describe('imfQueryDataset', () => {
     expect(JSON.stringify(result).length).toBeLessThanOrEqual(100_000);
     expect(structured.staged).toBe(false);
     expect(acquire).not.toHaveBeenCalled();
-  });
-
-  it('#48 budgets the serialized whole staged MCP result without dropping series metadata', async () => {
-    const series = Array.from(
-      { length: 210 },
-      (_, index) => `C${String(index).padStart(3, '0')}.INDICATOR_WITH_A_LONG_IDENTIFIER.A`,
-    );
-    const observations = Array.from({ length: 800 }, (_, index) => ({
-      series_key: series[index % series.length]!,
-      time_period: `${1950 + (index % 74)}`,
-      value: index + 0.123456,
-      status: null,
-    })).concat({
-      series_key: series[0]!,
-      time_period: '2023-W07',
-      value: 999.123456,
-      status: null,
-    });
-    mockSvc.fetchData.mockResolvedValue({
-      ...MOCK_QUERY_RESULT,
-      observations,
-      seriesAttributesByKey: Object.fromEntries(series.map((key) => [key, NGDPD_ATTRS])),
-    });
-    const registerTable = vi.fn().mockResolvedValue({
-      tableName: 'imf_budget',
-      rowCount: observations.length,
-      columns: [],
-    });
-    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
-      acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-budget', registerTable }),
-    });
-
-    const result = await runToolContract(imfQueryDataset, {
-      dataflow_id: 'WEO',
-      key: '*.INDICATOR_WITH_A_LONG_IDENTIFIER.A',
-      end_period: '2023',
-    });
-    const structured = result.structuredContent as {
-      notice: string;
-      observation_count: number;
-      observations: unknown[];
-      retrieval_guidance: string;
-      series_metadata: unknown[];
-      staged: boolean;
-      truncated: boolean;
-    };
-    const text = (result.content as Array<{ text?: string }>)
-      .map((block) => block.text ?? '')
-      .join('\n');
-
-    const serializedChars = JSON.stringify(result).length;
-    expect(serializedChars).toBeGreaterThan(99_000);
-    expect(serializedChars).toBeLessThanOrEqual(100_000);
-    expect(structured).toMatchObject({ observation_count: 801, staged: true, truncated: true });
-    expect(structured.observations.length).toBeLessThan(801);
-    expect(structured.series_metadata).toHaveLength(210);
-    expect(structured.retrieval_guidance).toContain('imf_dataframe_describe');
-    expect(structured.notice).toContain('2023-W07');
-    expect(text).toContain(structured.retrieval_guidance);
-    expect(text).toContain(structured.notice);
-  });
-
-  it('#48 returns an actionable error when fixed staged metadata alone exceeds the budget', async () => {
-    const series = Array.from(
-      { length: 1_200 },
-      (_, index) => `C${String(index).padStart(4, '0')}.${'LONG_INDICATOR_'.repeat(8)}.A`,
-    );
-    const observations = series.map((series_key, index) => ({
-      series_key,
-      time_period: '2023',
-      value: index,
-      status: null,
-    }));
-    mockSvc.fetchData.mockResolvedValue({
-      ...MOCK_QUERY_RESULT,
-      observations,
-      seriesAttributesByKey: Object.fromEntries(series.map((key) => [key, NGDPD_ATTRS])),
-    });
-    const registerTable = vi.fn();
-    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
-      acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-too-large', registerTable }),
-    });
-
-    const result = await runToolContract(imfQueryDataset, {
-      dataflow_id: 'WEO',
-      key: '*.NGDPD.A',
-      output_mode: 'canvas',
-    });
-    const error = (
-      result.structuredContent as { error: { code: number; data: Record<string, unknown> } }
-    ).error;
-    const text = (result.content as Array<{ text?: string }>)
-      .map((block) => block.text ?? '')
-      .join('\n');
-
-    expect(error.code).toBe(JsonRpcErrorCode.SerializationError);
-    expect(error.data).toMatchObject({ reason: 'response_too_large' });
-    expect((error.data.recovery as { hint: string }).hint).toContain('Narrow the dimension key');
-    expect(text).toContain("The staged result's full series metadata");
-    expect(text).toContain('Narrow the dimension key');
-    expect(registerTable).not.toHaveBeenCalled();
   });
 
   // -------------------------------------------------------------------------
@@ -1525,8 +1451,8 @@ describe('imfQueryDataset', () => {
         INDICATOR: { count: 2, codes: ['DISR_RT_PT_A_PT', 'MFS135_RT_PT_A_PT'] },
         FREQ: { count: 2, codes: ['A', 'M'] },
       },
-      time_period_start: '1964',
-      time_period_end: '2026-04',
+      time_period_start: '1964-01-01',
+      time_period_end: '2026-04-30',
     });
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({
@@ -2100,7 +2026,7 @@ describe('imfQueryDataset', () => {
       series_count: 150,
       available_codes: { FREQUENCY: { count: 3, codes: ['A', 'M', 'Q'] } },
       time_period_start: '1950-01-01',
-      time_period_end: '2026-07-01',
+      time_period_end: '2026-06-30',
     });
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({
@@ -2251,7 +2177,7 @@ describe('imfQueryDataset', () => {
       series_count: 8200,
       available_codes,
       time_period_start: '1980-01-01',
-      time_period_end: '2032-01-01',
+      time_period_end: '2031-12-31',
     });
     const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
     const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.ZZZ.A' });
@@ -2838,7 +2764,10 @@ describe('imfQueryDataset', () => {
         expect(error.message).toContain(
           `position 1 (COUNTRY) '${iso2}' — nearest COUNTRY codes: ${iso3}`,
         );
-        expect(text).toContain(`position 1 (COUNTRY) '${iso2}' — nearest COUNTRY codes: ${iso3}`);
+        // The codes render as code spans, as the caller sends them back.
+        expect(text).toContain(
+          `position 1 (COUNTRY) '\`${iso2}\`' — nearest COUNTRY codes: \`${iso3}\``,
+        );
         // The declared recovery reaches both surfaces without being forwarded by hand.
         expect(error.data?.recovery).toEqual({ hint: contractRecovery('invalid_key_code') });
         expect(text).toContain(contractRecovery('invalid_key_code'));
@@ -2859,8 +2788,9 @@ describe('imfQueryDataset', () => {
           suggestions: ['NGDP_RPCHMK', 'NGDP_RPCH'],
         },
       ]);
+      // NGDP_RPC and NGDP_RPCH each render once whole, never inside the longer code.
       expect(contentText(response)).toContain(
-        "position 2 (INDICATOR) 'NGDP_RPC' — nearest INDICATOR codes: NGDP_RPCHMK, NGDP_RPCH",
+        "position 2 (INDICATOR) '`NGDP_RPC`' — nearest INDICATOR codes: `NGDP_RPCHMK`, `NGDP_RPCH`",
       );
     });
 
@@ -2890,7 +2820,7 @@ describe('imfQueryDataset', () => {
         { position: 1, dimension: 'COUNTRY', code: 'ZZZZZ', suggestions: [] },
       ]);
       expect(contentText(far)).toContain(
-        "position 1 (COUNTRY) 'ZZZZZ' — no close match; page the COUNTRY codes with imf_get_database",
+        "position 1 (COUNTRY) '`ZZZZZ`' — no close match; page the COUNTRY codes with imf_get_database",
       );
     });
 
@@ -2910,9 +2840,9 @@ describe('imfQueryDataset', () => {
         { position: 2, dimension: 'INDICATOR', code: 'USA', suggestions: [], belongsTo: 'COUNTRY' },
       ]);
       expect(text).toContain(
-        "position 1 (COUNTRY) 'NGDP_RPCH' — belongs to INDICATOR, not COUNTRY",
+        "position 1 (COUNTRY) '`NGDP_RPCH`' — belongs to INDICATOR, not COUNTRY",
       );
-      expect(text).toContain("position 2 (INDICATOR) 'USA' — belongs to COUNTRY, not INDICATOR");
+      expect(text).toContain("position 2 (INDICATOR) '`USA`' — belongs to COUNTRY, not INDICATOR");
     });
 
     it('checks every + member at every position and reports only the members that fail', async () => {
@@ -2973,7 +2903,10 @@ describe('imfQueryDataset', () => {
       });
       expect(text).toContain('position 1 (COUNTRY)');
       expect(error.data?.recovery).toEqual({ hint: contractRecovery('wildcard_in_code_list') });
-      expect(text).toContain(contractRecovery('wildcard_in_code_list'));
+      // The * a caller sends back renders as a code span rather than the escape \*.
+      expect(text).toContain(
+        'Use `*` alone at that position to match every code there, or list the wanted codes joined with +.',
+      );
       expect(mockSvc.fetchData).not.toHaveBeenCalled();
 
       const both = contractError(await query(' * + usa .NGDP_RPCH+*.A'));
@@ -3121,6 +3054,138 @@ describe('imfQueryDataset', () => {
       }
     });
 
+    describe('key errors quote the values a caller sends back as code spans', () => {
+      /**
+       * A CPI-shaped key whose codelists hold `_T`, which escaping renders
+       * `\_T`. The FREQ_ dimension id stands for text an error quotes that the
+       * caller does not send back: it keeps its escape.
+       */
+      const CPI_CODED_STRUCTURE = {
+        ...MOCK_STRUCTURE,
+        dataflowId: 'CPI',
+        keyFormat: 'COUNTRY.INDEX_TYPE.COICOP_1999.TYPE_OF_TRANSFORMATION.FREQ_',
+        dimensions: [
+          { id: 'COUNTRY', codes: ['USA', 'GBR'] },
+          { id: 'INDEX_TYPE', codes: ['CPI'] },
+          { id: 'COICOP_1999', codes: ['_T', 'CP01'] },
+          { id: 'TYPE_OF_TRANSFORMATION', codes: ['IX', 'YOY_PCH_PA_PT'] },
+          { id: 'FREQ_', codes: ['M', 'A'] },
+        ].map(({ id, codes }, position) => ({
+          id,
+          name: id,
+          position,
+          codelist: codes.map((code) => ({ id: code, name: code })),
+        })),
+      };
+
+      const KEY_FORMAT_ESCAPED = 'COUNTRY.INDEX_TYPE.COICOP_1999.TYPE_OF_TRANSFORMATION.FREQ\\_';
+
+      it.each([
+        [
+          'USA.CPI.T+CP*1.IX.M',
+          'invalid_key_code',
+          "Key 'USA.CPI.T+CP*1.IX.M' uses 2 code(s) not in the codelist for their position: position 3 (COICOP_1999) 'T' — nearest COICOP_1999 codes: _T; position 3 (COICOP_1999) 'CP*1' — nearest COICOP_1999 codes: CP01. Key format: COUNTRY.INDEX_TYPE.COICOP_1999.TYPE_OF_TRANSFORMATION.FREQ_",
+          `Error: Key '\`USA.CPI.T+CP*1.IX.M\`' uses 2 code(s) not in the codelist for their position: position 3 (COICOP_1999) '\`T\`' — nearest COICOP_1999 codes: \`_T\`; position 3 (COICOP_1999) '\`CP*1\`' — nearest COICOP_1999 codes: \`CP01\`. Key format: ${KEY_FORMAT_ESCAPED}`,
+          "Recovery: Replace each named code with one from its dimension's codelist — a suggested code, or one found with imf_get_database using dimension_id and codelist_filter.",
+        ],
+        [
+          'USA+*.CPI._T.IX.M',
+          'wildcard_in_code_list',
+          "Key 'USA+*.CPI._T.IX.M' combines * with other codes at position 1 (COUNTRY). The portal ignores * inside a + list and returns only the listed codes — use * alone to match every code there, or list the codes. Key format: COUNTRY.INDEX_TYPE.COICOP_1999.TYPE_OF_TRANSFORMATION.FREQ_",
+          `Error: Key '\`USA+*.CPI._T.IX.M\`' combines \`*\` with other codes at position 1 (COUNTRY). The portal ignores \`*\` inside a + list and returns only the listed codes — use \`*\` alone to match every code there, or list the codes. Key format: ${KEY_FORMAT_ESCAPED}`,
+          'Recovery: Use `*` alone at that position to match every code there, or list the wanted codes joined with +.',
+        ],
+        [
+          '*.CPI..IX.M',
+          'empty_key_segment',
+          "Key '*.CPI..IX.M' leaves position 3 (COICOP_1999) empty. An empty position matches no series — use * to match every code there. Key format: COUNTRY.INDEX_TYPE.COICOP_1999.TYPE_OF_TRANSFORMATION.FREQ_",
+          `Error: Key '\`*.CPI..IX.M\`' leaves position 3 (COICOP_1999) empty. An empty position matches no series — use \`*\` to match every code there. Key format: ${KEY_FORMAT_ESCAPED}`,
+          'Recovery: Put `*` at that position to match every code there, or a code from imf_get_database to pin it.',
+        ],
+      ])(
+        'renders %j as %s with the key, codes, and * as code spans and the rest escaped',
+        async (key, reason, message, errorLine, recoveryLine) => {
+          mockSvc.fetchDataflowStructure.mockResolvedValue(CPI_CODED_STRUCTURE);
+
+          const response = await query(key);
+          const error = contractError(response);
+          const [renderedError, renderedRecovery] = contentText(response).split('\n\n');
+
+          expect(error.data?.reason).toBe(reason);
+          // structuredContent keeps the raw message; only content[] changes.
+          expect(error.message).toBe(message);
+          expect(renderedError).toBe(errorLine);
+          expect(renderedRecovery).toBe(recoveryLine);
+          for (const escaped of ['\\*', '\\_T', '\\`']) {
+            expect(contentText(response)).not.toContain(escaped);
+          }
+          expect(mockSvc.fetchData).not.toHaveBeenCalled();
+        },
+      );
+
+      /** `a+aa+aaa+…`, about `n` characters: each member a literal the next one starts with. */
+      const prefixes = (n: number) => {
+        const members: string[] = [];
+        for (let k = 1, length = 0; length < n; k++) {
+          members.push('a'.repeat(k));
+          length += k + 1;
+        }
+        return members.join('+');
+      };
+
+      it('renders those code spans in time linear in the key length', { timeout: 0 }, async () => {
+        /** Thread CPU microseconds one invalid_key_code call on `key` spends. */
+        const cpuMicros = async (key: string) => {
+          const start = process.threadCpuUsage();
+          const response = await query(key);
+          const spent = process.threadCpuUsage(start);
+          expect(contractError(response).data?.reason).toBe('invalid_key_code');
+          return spent.user + spent.system;
+        };
+        /**
+         * The least growth from `from` to `size` over three paired runs, each
+         * timing the baseline beside the larger size, and the least time the
+         * larger size took.
+         */
+        const growth = async (make: (n: number) => string, from: number, size: number) => {
+          let ratio = Number.POSITIVE_INFINITY;
+          let micros = Number.POSITIVE_INFINITY;
+          for (let run = 0; run < 3; run++) {
+            const small = await cpuMicros(make(from));
+            const large = await cpuMicros(make(size));
+            ratio = Math.min(ratio, large / Math.max(small, 1));
+            micros = Math.min(micros, large);
+          }
+          return { ratio, micros };
+        };
+        /**
+         * A digit run spans 5k → 320k (64×); the shapes that put a Markdown
+         * opener or a break on most characters span 1k → 64k (64×), below
+         * Bun's regex slow-mode switch near 80k.
+         */
+        const shapes: Array<[name: string, make: (n: number) => string, from: number]> = [
+          ['digit run', (n) => `${'7'.repeat(n)}.NGDP_RPCH.A`, 5_000],
+          ['backtick run, no closer', (n) => `${'`'.repeat(n)}.NGDP_RPCH.A`, 1_000],
+          ['nested openers', (n) => `${'<a'.repeat(n / 2)}.NGDP_RPCH.A`, 1_000],
+          ['overlapping prefixes', (n) => `${prefixes(n)}.NGDP_RPCH.A`, 1_000],
+          [
+            'one long line ending in a break',
+            (n) => `${'§1 x'.repeat(n / 4)}\ny.NGDP_RPCH.A`,
+            1_000,
+          ],
+          ['breaks throughout', (n) => `x${'  \r\n'.repeat(n / 4)}x.NGDP_RPCH.A`, 1_000],
+        ];
+        for (const [name, make, from] of shapes) {
+          // Doubling, with the bound checked at each size before the next is run.
+          for (let size = from * 2; size <= from * 64; size *= 2) {
+            const { ratio, micros } = await growth(make, from, size);
+            expect(ratio, `${name} at ${size}`).toBeLessThan(256);
+            expect(micros, `${name} at ${size}`).toBeLessThan(2_000_000);
+          }
+        }
+      });
+    });
+
     describe('#63/#69 empty and duplicate + members', () => {
       const noticeOf = (response: Awaited<ReturnType<typeof runToolContract>>) =>
         (response.structuredContent as { notice?: string }).notice;
@@ -3204,8 +3269,8 @@ describe('imfQueryDataset', () => {
           expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
           expect(error.data).toMatchObject({ reason: 'empty_key_segment', emptyPositions });
           expect(error.message).toContain('*');
-          expect(unescapeMarkdown(contentText(response))).toContain(
-            contractRecovery('empty_key_segment'),
+          expect(contentText(response)).toContain(
+            'Put `*` at that position to match every code there, or a code from imf_get_database to pin it.',
           );
           expect(mockSvc.fetchData).not.toHaveBeenCalled();
           expect(mockSvc.fetchAvailabilityConstraint).not.toHaveBeenCalled();
@@ -3418,7 +3483,8 @@ describe('imfQueryDataset', () => {
       expect(columns).toEqual(STAGED_COLUMNS);
       expect(structured.observation_count).toBe(rows.length);
       expect(staged.map((row) => row.value)).toEqual(rows.map((row) => row.value));
-      expect(staged.map((row) => row.value)).toEqual(
+      // The inline preview is the staged table's first rows (#76).
+      expect(staged.slice(0, structured.observations.length).map((row) => row.value)).toEqual(
         structured.observations.map((obs) => obs.value),
       );
       expect(staged.map((row) => row.decimals)).toEqual(Array(rows.length).fill(3));
@@ -3862,6 +3928,15 @@ describe('imfQueryDataset', () => {
         [JAM, '2026-M07'],
         [USA, '2026-M08'],
       ]);
+      // The inline preview is drawn from the selected rows too, not the fetched ones.
+      const { observations } = response.structuredContent as {
+        observations: Array<{ series_key: string; time_period: string }>;
+      };
+      expect(observations.map((obs) => [obs.series_key, obs.time_period])).toEqual([
+        [SLB, '2026-M03'],
+        [JAM, '2026-M07'],
+        [USA, '2026-M08'],
+      ]);
       expect(contentText(response)).toContain('**Last observations:** 1 per series');
     });
 
@@ -3906,6 +3981,13 @@ describe('imfQueryDataset', () => {
         expect(values[0]).toBe(500);
         expect(values.at(-1)).toBe(1999);
       }
+      // The preview is the staged table's first rows, never a row N left out.
+      const { observations } = response.structuredContent as {
+        observations: Array<{ series_key: string; time_period: string }>;
+      };
+      const identity = (r: Record<string, unknown>) => [r.series_key, r.time_period];
+      expect(observations).toHaveLength(100);
+      expect(observations.map(identity)).toEqual(staged.slice(0, 100).map(identity));
     });
   });
 
@@ -5091,6 +5173,900 @@ describe('imfQueryDataset', () => {
   });
 
   // -------------------------------------------------------------------------
+  // #76: a staged result carries a preview bounded by count, never by characters
+  // -------------------------------------------------------------------------
+
+  describe('#76 staged previews', () => {
+    interface StagedShape {
+      canvas_id: string;
+      notice?: string;
+      observation_count: number;
+      observations: Array<{ series_key: string; time_period: string; value: number | null }>;
+      retrieval_guidance: string;
+      series_attributes: Omit<AttributeEntry, 'series_key'>;
+      series_count?: number;
+      series_metadata?: AttributeEntry[];
+      staged: boolean;
+      table_name: string;
+      truncated: boolean;
+    }
+
+    /** The retrieval guidance every staged result carried before #76, word for word. */
+    const STAGE_GUIDANCE =
+      'The complete result is staged on DataCanvas. Call imf_dataframe_describe with canvas_id first to inspect tables and columns, then call imf_dataframe_query with canvas_id and SQL against table_name.';
+
+    /**
+     * The query the guidance of a cut list prints, for one staged table. Its
+     * ORDER BY gives imf_dataframe_query a stable order to page it in.
+     */
+    const distinctQuery = (tableName: string) =>
+      `SELECT DISTINCT series_key, unit, scale, decimals, series_reference_period FROM ${tableName} ORDER BY series_key`;
+
+    /**
+     * Each series' own attributes, varied on every axis (a reference period on
+     * every other series) so an entry can only equal its own series' rows.
+     */
+    const attrsOf = (seriesKey: string): Omit<AttributeEntry, 'series_key'> => {
+      const n = Number(seriesKey.slice(1, 5));
+      return {
+        unit: n % 3 === 0 ? null : `U${n % 7}`,
+        scale: String(n % 4),
+        decimals: n % 5 === 0 ? null : n % 3,
+        ...(n % 2 === 0 ? { reference_period: `${2000 + (n % 11)}A` } : {}),
+      };
+    };
+
+    /**
+     * `count` series of `periods` rows each, all of a series' rows together
+     * (`series`) or all of a period's (`period`, the shape a time-sorted
+     * `*` key arrives in).
+     */
+    const fixture = (
+      count: number,
+      periods: number,
+      layout: 'series' | 'period',
+      indicator = 'NGDPD',
+    ) => {
+      const keys = Array.from(
+        { length: count },
+        (_, i) => `C${String(i).padStart(4, '0')}.${indicator}.A`,
+      );
+      const row = (s: number, p: number) => ({
+        series_key: keys[s]!,
+        time_period: `${2000 + p}`,
+        value: p * 1_000 + s + 0.25,
+        status: null,
+      });
+      return layout === 'series'
+        ? keys.flatMap((_, s) => Array.from({ length: periods }, (_, p) => row(s, p)))
+        : Array.from({ length: periods }, (_, p) => keys.map((_, s) => row(s, p))).flat();
+    };
+
+    type Row = ReturnType<typeof fixture>[number];
+
+    const serve = (observations: Row[]) => {
+      const keys = [...new Set(observations.map((obs) => obs.series_key))];
+      mockSvc.fetchData.mockResolvedValue({
+        ...MOCK_QUERY_RESULT,
+        observations,
+        seriesAttributes: attrsOf(keys[0]!),
+        seriesAttributesByKey: Object.fromEntries(keys.map((key) => [key, attrsOf(key)])),
+      });
+    };
+
+    /** A canvas whose registrations record the rows they staged. */
+    const mockCanvas = () => {
+      const registered: Array<Array<Record<string, unknown>>> = [];
+      const registerTable = vi.fn(
+        async (tableName: string, rows: Array<Record<string, unknown>>) => {
+          registered.push(rows);
+          return { tableName, rowCount: rows.length, columns: [] };
+        },
+      );
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+        acquire: vi.fn().mockResolvedValue({ canvasId: 'canvas-76', registerTable }),
+      });
+      return registered;
+    };
+
+    const stage = async (input: Record<string, unknown> = {}, tenantId?: string) => {
+      const response = await runToolContract(
+        imfQueryDataset,
+        { dataflow_id: 'WEO', key: '*.NGDPD.A', ...input },
+        tenantId ? { context: { tenantId } } : undefined,
+      );
+      return {
+        response,
+        structured: response.structuredContent as StagedShape,
+        text: textOf(response),
+      };
+    };
+
+    /** The rendered observation table, as `[series_key, time_period]` per row. */
+    const renderedRows = (text: string) => {
+      const lines = text.split('\n');
+      const header = lines.findIndex((line) => line.startsWith('| Series Key | Time Period |'));
+      if (header < 0) return [];
+      const rows: string[][] = [];
+      for (const line of lines.slice(header + 2)) {
+        if (!line.startsWith('|')) break;
+        rows.push(rowCells(line).slice(0, 2));
+      }
+      return rows;
+    };
+
+    /** The first 20 distinct series of `observations`, in order of first appearance. */
+    const firstTwenty = (observations: Row[]) =>
+      [...new Set(observations.map((obs) => obs.series_key))].slice(0, 20);
+
+    /**
+     * Holds on every staged result: the entries are the first series in result
+     * order, `series_attributes` is entry 0, every inline row has its entry, the
+     * full result was registered, and `content[]` carries the same rows and keys.
+     */
+    const expectStagedPreview = (
+      observations: Row[],
+      { structured, text }: { structured: StagedShape; text: string },
+      registered: Array<Array<Record<string, unknown>>>,
+    ) => {
+      expect(structured.staged).toBe(true);
+      expect(structured.observation_count).toBe(observations.length);
+      expect(registered).toHaveLength(1);
+      expect(registered[0]?.map((row) => [row.series_key, row.time_period])).toEqual(
+        observations.map((obs) => [obs.series_key, obs.time_period]),
+      );
+      expect(renderedRows(text)).toEqual(
+        structured.observations.map((obs) => [obs.series_key, obs.time_period]),
+      );
+      if (!structured.series_metadata) return;
+      const listed = firstTwenty(observations);
+      expect(structured.series_metadata).toEqual(
+        listed.map((key) => ({ series_key: key, ...attrsOf(key) })),
+      );
+      expect(structured.series_attributes).toEqual(attrsOf(listed[0]!));
+      for (const obs of structured.observations) {
+        expect(listed).toContain(obs.series_key);
+      }
+      expect([...cellsByKey(text).keys()].sort()).toEqual([...listed].sort());
+    };
+
+    it.each([
+      // label, series, rows per series, layout, inline rows, truncated, series_count
+      ['one series at the 100-row cap', 1, 100, 'series', 100, false, undefined],
+      ['one series one row past the cap', 1, 101, 'series', 100, true, undefined],
+      ['20 series, one row each', 20, 1, 'period', 20, false, undefined],
+      ['21 series, one row each', 21, 1, 'period', 20, true, 21],
+      ['20 series past the row cap', 20, 6, 'series', 100, true, undefined],
+      ['21 series whose 21st starts at row 80', 21, 4, 'series', 80, true, 21],
+      ['21 series whose 21st starts at row 100', 21, 5, 'series', 100, true, 21],
+    ] as const)(
+      'previews %s: the first rows in result order, stopping before an unlisted series',
+      async (_label, count, periods, layout, inline, truncated, seriesCount) => {
+        const rows = fixture(count, periods, layout);
+        for (const observations of [rows, rows.toReversed()]) {
+          serve(observations);
+          const registered = mockCanvas();
+
+          const call = await stage({ output_mode: 'canvas' });
+          const { structured, text } = call;
+
+          expectStagedPreview(observations, call, registered);
+          expect(structured.observations).toEqual(observations.slice(0, inline));
+          expect(structured.truncated).toBe(truncated);
+          if (count === 1) expect(structured).not.toHaveProperty('series_metadata');
+          else expect(structured.series_metadata).toHaveLength(Math.min(count, 20));
+          if (seriesCount === undefined) {
+            expect(structured).not.toHaveProperty('series_count');
+            expect(structured.retrieval_guidance).toBe(STAGE_GUIDANCE);
+            expect(text).not.toMatch(/\d+ of \d+ series shown/);
+          } else {
+            expect(structured.series_count).toBe(seriesCount);
+            expect(structured.retrieval_guidance).toContain(STAGE_GUIDANCE);
+            expect(structured.retrieval_guidance).toContain(`first 20 of ${seriesCount} series`);
+            expect(structured.retrieval_guidance).toContain(distinctQuery(structured.table_name));
+            expect(text).toContain(structured.retrieval_guidance);
+            const heading = attributeTable(text)?.heading ?? '';
+            expect(heading).toContain(`20 of ${seriesCount} series shown`);
+            expect(heading).toContain(structured.table_name);
+          }
+        }
+      },
+    );
+
+    it('lists the first 20 of 210 series on an automatic spill and ends the preview before the 21st', async () => {
+      // Time-sorted across 210 series, with one label the range filter cannot read.
+      const observations = [
+        ...fixture(210, 4, 'period', 'INDICATOR_WITH_A_LONG_IDENTIFIER'),
+        {
+          series_key: 'C0000.INDICATOR_WITH_A_LONG_IDENTIFIER.A',
+          time_period: '2023-W07',
+          value: 999.123456,
+          status: null,
+        },
+      ];
+      serve(observations);
+      const registered = mockCanvas();
+
+      const call = await stage({ key: '*.INDICATOR_WITH_A_LONG_IDENTIFIER.A', end_period: '2023' });
+      const { structured, text } = call;
+
+      expectStagedPreview(observations, call, registered);
+      expect(structured).toMatchObject({
+        observation_count: 841,
+        truncated: true,
+        series_count: 210,
+      });
+      expect(structured.series_metadata).toHaveLength(20);
+      expect(structured.observations).toEqual(observations.slice(0, 20));
+      expect(structured.retrieval_guidance).toContain('imf_dataframe_describe');
+      expect(structured.retrieval_guidance).toContain(distinctQuery(structured.table_name));
+      expect(structured.notice).toContain('2023-W07');
+      expect(text).toContain(structured.retrieval_guidance);
+      expect(text).toContain(structured.notice);
+      expect(attributeTable(text)?.heading).toContain('20 of 210 series shown');
+    });
+
+    it.each(['auto', 'canvas'] as const)(
+      'stages, with output_mode %s, a key whose full series metadata alone would overflow the budget',
+      async (outputMode) => {
+        // WEO `*.*.A` with last_n_observations: 1 has this shape: one row per series.
+        const observations = fixture(1_200, 1, 'period', 'LONG_INDICATOR_'.repeat(8));
+        serve(observations);
+        const registered = mockCanvas();
+
+        const call = await stage({ output_mode: outputMode });
+        const { response, structured } = call;
+
+        expect(response.isError).toBeFalsy();
+        expectStagedPreview(observations, call, registered);
+        expect(structured).toMatchObject({ truncated: true, series_count: 1_200 });
+        expect(structured.series_metadata).toHaveLength(20);
+        expect(structured.observations).toEqual(observations.slice(0, 20));
+        expect(structured.retrieval_guidance).toContain(distinctQuery(structured.table_name));
+      },
+    );
+
+    it('advertises series_count as optional and response_too_large as a result that was not staged', () => {
+      const schema = z.toJSONSchema(imfQueryDataset.output) as {
+        properties: Record<string, JsonSchemaNode>;
+        required?: string[];
+      };
+      const tooLarge = imfQueryDataset.errors?.find((e) => e.reason === 'response_too_large');
+
+      expect(schema.properties.series_count?.description).toMatch(/present only/i);
+      expect(schema.properties.series_count?.description).toContain(
+        `${distinctQuery('<table_name>')} returns the attributes of every one.`,
+      );
+      expect(schema.required ?? []).not.toContain('series_count');
+      expect(tooLarge?.when).toMatch(/^The result is not staged — DataCanvas is not enabled/);
+    });
+
+    describe('on a DuckDB canvas', () => {
+      let canvas: DataCanvas;
+
+      beforeEach(() => {
+        const provider = new DuckdbProvider({
+          defaultRowLimit: 10_000,
+          exportRootPath: '.canvas-exports',
+          memoryLimitMb: 128,
+          schemaSniffRows: 100,
+        });
+        canvas = new DataCanvas(
+          provider,
+          new CanvasRegistry(provider, {
+            absoluteCapMs: 60_000,
+            maxCanvasesPerTenant: 10,
+            sweeperIntervalMs: 0,
+            ttlMs: 60_000,
+          }),
+        );
+        (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue(canvas);
+      });
+
+      afterEach(async () => {
+        await canvas.shutdown(createMockContext({ tenantId: 'test' }));
+      });
+
+      it('keeps every series reachable: series_count is the table’s, and the printed query returns each entry', async () => {
+        serve(fixture(45, 3, 'period'));
+
+        const { structured } = await stage({ output_mode: 'canvas' }, 'test');
+        const instance = await canvas.acquire(
+          structured.canvas_id,
+          createMockContext({ tenantId: 'test' }),
+        );
+        const {
+          rows: [counted],
+        } = await instance.query(
+          `SELECT COUNT(DISTINCT series_key) AS n FROM ${structured.table_name}`,
+        );
+        const printed = /SELECT DISTINCT .+? FROM imf_[0-9a-f]{8}(?: ORDER BY \w+)?/.exec(
+          structured.retrieval_guidance,
+        )?.[0];
+
+        expect(structured.series_count).toBe(45);
+        expect(Number(counted?.n)).toBe(structured.series_count);
+        expect(printed).toBe(distinctQuery(structured.table_name));
+
+        const { rows } = await instance.query(printed ?? '');
+        const byKey = new Map(rows.map((row) => [row.series_key, row]));
+        expect(rows).toHaveLength(45);
+        // An order imf_dataframe_query can page with LIMIT/OFFSET.
+        expect(rows.map((row) => row.series_key)).toEqual(
+          Array.from({ length: 45 }, (_, i) => `C${String(i).padStart(4, '0')}.NGDPD.A`),
+        );
+        expect(structured.series_metadata).toHaveLength(20);
+        for (const entry of structured.series_metadata ?? []) {
+          expect(byKey.get(entry.series_key)).toEqual({
+            series_key: entry.series_key,
+            unit: entry.unit,
+            scale: entry.scale,
+            decimals: entry.decimals,
+            series_reference_period: entry.reference_period ?? null,
+          });
+        }
+      });
+    });
+  });
+
+  describe('#74 the order observations follow, as the contract and the resume guidance state it', () => {
+    it('states the order on observations as the dates each period spans, earliest first', () => {
+      const schema = z.toJSONSchema(imfQueryDataset.output) as {
+        properties: Record<string, JsonSchemaNode>;
+      };
+      const description = schema.properties.observations?.description ?? '';
+
+      expect(description).toContain('dates each period spans');
+      expect(description).toContain('earliest');
+      expect(description).not.toContain('oldest period first');
+    });
+
+    it('warns that resuming a canvas-off cut returns again the rows that overlap the resume period', async () => {
+      mockSvc.fetchData.mockResolvedValue({
+        ...MOCK_QUERY_RESULT,
+        observations: Array.from({ length: 3_000 }, (_, period) => ({
+          series_key: 'USA.NGDP_RPCH.A',
+          time_period: `${1000 + period}`,
+          value: period + 0.123456,
+          status: null,
+        })),
+      });
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: 'USA.NGDP_RPCH.A',
+      });
+      const structured = response.structuredContent as TruncatedInline;
+      const last = structured.observations.at(-1)?.time_period;
+
+      expect(structured.truncated).toBe(true);
+      expect(structured.retrieval_guidance).toContain(`set start_period to ${last}`);
+      expect(structured.retrieval_guidance).toMatch(/already returned whose period overlaps it/);
+      expect(structured.retrieval_guidance).not.toContain('it is returned again in full');
+      expect(textOf(response)).toContain(structured.retrieval_guidance);
+    });
+
+    it('names no resume period when every row returned overlaps it, since resuming there returns the same rows', async () => {
+      mockSvc.fetchData.mockResolvedValue(SHARED_PERIOD_RESULT);
+
+      const first = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: '*.NGDPD.A',
+      });
+      const structured = first.structuredContent as TruncatedInline;
+      const shown = structured.observations;
+      const last = shown.at(-1)?.time_period;
+
+      expect(structured.truncated).toBe(true);
+      expect(shown.length).toBeGreaterThan(0);
+      expect(shown.every((obs) => obs.time_period === '2020')).toBe(true);
+
+      // The stall: start_period at that period reaches no row the first call did not return.
+      const resumed = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: '*.NGDPD.A',
+        start_period: last,
+      });
+      const again = (resumed.structuredContent as TruncatedInline).observations;
+      expect(again.length).toBeLessThanOrEqual(shown.length);
+      expect(again).toEqual(shown.slice(0, again.length));
+
+      for (const channel of [structured.retrieval_guidance, textOf(first)]) {
+        expect(channel).not.toContain('set start_period to');
+        expect(channel).toContain(`Every row returned overlaps time_period ${last}`);
+        expect(channel).toContain('narrow the key to fewer series');
+        expect(channel).toContain('CANVAS_PROVIDER_TYPE=duckdb');
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #75: a canvas the result cannot be staged on fails with this tool's own
+  // recovery, and an auto-mode call at the canvas cap returns inline
+  // -------------------------------------------------------------------------
+
+  describe('#75 canvas acquisition failures', () => {
+    /** One series of 1,500 annual rows: over the response budget, so an auto call stages. */
+    const OVER_BUDGET = Array.from({ length: 1_500 }, (_, index) => ({
+      series_key: 'USA.NGDP_RPCH.A',
+      time_period: String(1000 + index),
+      value: index + 0.123456,
+      status: null,
+    }));
+
+    /** Well-formed and never issued: the shape of an id past its TTL or lost on a restart. */
+    const STALE_ID = 'ZZZZZZZZZZ';
+
+    const NOT_FOUND_RECOVERY =
+      'Omit canvas_id to stage the result on a fresh canvas. The tables staged on the expired canvas went with it, so stage again each one you still need.';
+    const CAPACITY_RECOVERY =
+      'Pass a canvas_id you already hold to stage the result on it, or use output_mode="auto" to receive the result inline, cut to the response budget when it does not fit.';
+    const AT_CAP_TOO_LARGE_HINT =
+      'DataCanvas is at its canvas cap, so the result could not be staged. Pass a canvas_id you already hold to stage it there, or narrow the dimension key to fewer series so the full series_metadata fits in one response.';
+
+    /** The framework's own hints, which this tool's recovery replaces. */
+    const FRAMEWORK_NOT_FOUND_HINT = 'Re-run the tool that produced this canvas_id';
+    const FRAMEWORK_CAPACITY_HINT = 'retry once idle canvases pass their TTL';
+
+    type Trigger = 'auto over budget' | 'output_mode canvas';
+
+    /** The input that reaches canvas acquisition by `trigger`, and serves its data. */
+    const reach = (trigger: Trigger): Record<string, unknown> => {
+      if (trigger === 'output_mode canvas') return { output_mode: 'canvas' };
+      mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations: OVER_BUDGET });
+      return {};
+    };
+
+    let canvas: DataCanvas | undefined;
+    let heldId = '';
+
+    /**
+     * A DuckDB canvas whose tenant may hold `cap` canvases, one of them minted
+     * here and held: at cap 1 an omitted canvas_id is refused, at cap 2 it mints.
+     */
+    const realCanvas = async (cap: number) => {
+      const provider = new DuckdbProvider({
+        defaultRowLimit: 10_000,
+        exportRootPath: '.canvas-exports',
+        memoryLimitMb: 128,
+        schemaSniffRows: 100,
+      });
+      const live = new DataCanvas(
+        provider,
+        new CanvasRegistry(provider, {
+          absoluteCapMs: 60_000,
+          maxCanvasesPerTenant: cap,
+          sweeperIntervalMs: 0,
+          ttlMs: 60_000,
+        }),
+      );
+      canvas = live;
+      heldId = (await live.acquire(undefined, createMockContext({ tenantId: 'test' }))).canvasId;
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue(live);
+      return live;
+    };
+
+    afterEach(async () => {
+      await canvas?.shutdown(createMockContext({ tenantId: 'test' }));
+      canvas = undefined;
+    });
+
+    const call = (input: Record<string, unknown>) =>
+      runToolContract(
+        imfQueryDataset,
+        { dataflow_id: 'WEO', key: 'USA.NGDP_RPCH.A', ...input },
+        { context: { tenantId: 'test' } },
+      );
+
+    it.each([
+      ['auto over budget', 'held', 1],
+      ['auto over budget', 'omitted', 2],
+      ['output_mode canvas', 'held', 1],
+      ['output_mode canvas', 'omitted', 2],
+    ] as const)(
+      '%s with canvas_id %s stages when the canvas is acquired',
+      async (trigger, id, cap) => {
+        const live = await realCanvas(cap);
+
+        const response = await call({
+          ...reach(trigger),
+          ...(id === 'held' ? { canvas_id: heldId } : {}),
+        });
+        const structured = response.structuredContent as {
+          canvas_id: string;
+          staged: boolean;
+          table_name: string;
+        };
+
+        expect(response.isError).toBeFalsy();
+        expect(structured.staged).toBe(true);
+        if (id === 'held') expect(structured.canvas_id).toBe(heldId);
+        else expect(structured.canvas_id).not.toBe(heldId);
+        const instance = await live.acquire(
+          structured.canvas_id,
+          createMockContext({ tenantId: 'test' }),
+        );
+        expect((await instance.describe()).map((table) => table.name)).toEqual([
+          structured.table_name,
+        ]);
+      },
+    );
+
+    it.each(['auto over budget', 'output_mode canvas'] as const)(
+      '%s with an expired canvas_id fails as canvas_not_found with this tool’s recovery',
+      async (trigger) => {
+        await realCanvas(1);
+
+        const response = await call({ ...reach(trigger), canvas_id: STALE_ID });
+        const error = contractError(response);
+        const text = textOf(response);
+
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.NotFound,
+          message: `Canvas '${STALE_ID}' is not found or has expired, so the result could not be staged on it.`,
+          data: {
+            reason: 'canvas_not_found',
+            canvasId: STALE_ID,
+            recovery: { hint: NOT_FOUND_RECOVERY },
+          },
+        });
+        expect(text).toContain(`Recovery: ${NOT_FOUND_RECOVERY}`);
+        expect(text).toContain('(reason canvas_not_found');
+        expect(JSON.stringify(response)).not.toContain(FRAMEWORK_NOT_FOUND_HINT);
+      },
+    );
+
+    it('output_mode canvas with no canvas_id at the canvas cap fails as a retryable canvas_capacity_exhausted', async () => {
+      await realCanvas(1);
+
+      const response = await call({ output_mode: 'canvas' });
+      const error = contractError(response);
+      const text = textOf(response);
+
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.RateLimited,
+        message:
+          'DataCanvas is at its canvas cap, so output_mode="canvas" could not stage the result on a fresh canvas.',
+        data: {
+          reason: 'canvas_capacity_exhausted',
+          retryable: true,
+          recovery: { hint: CAPACITY_RECOVERY },
+        },
+      });
+      expect(text).toContain(`Recovery: ${CAPACITY_RECOVERY}`);
+      expect(text).toContain('(reason canvas_capacity_exhausted · retryable');
+      expect(JSON.stringify(response)).not.toContain(FRAMEWORK_CAPACITY_HINT);
+    });
+
+    it.each([
+      ['a prefix of the result', OVER_BUDGET],
+      [
+        'no observations, when not even the first one fits',
+        [
+          {
+            series_key: 'USA.NGDP_RPCH.A',
+            time_period: '2020',
+            value: null,
+            status: 'X'.repeat(60_000),
+          },
+          ...MOCK_OBSERVATIONS.slice(1),
+        ],
+      ],
+    ])(
+      'auto over budget with no canvas_id at the canvas cap returns %s inline, guided on both surfaces',
+      async (_label, observations) => {
+        mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations });
+        await realCanvas(1);
+
+        const response = await call({});
+        const structured = response.structuredContent as TruncatedInline;
+        const text = textOf(response);
+        const shown = structured.observations;
+        const last = shown.at(-1)?.time_period;
+        const extent = last
+          ? `observations holds the first ${shown.length} of ${observations.length} in time order, through time_period ${last}`
+          : `observations is empty: not even the first of ${observations.length} fits the response budget`;
+        const resume = last
+          ? `set start_period to ${last} to continue from that period (rows already returned whose period overlaps it come back again), `
+          : '';
+
+        expect(response.isError).toBeFalsy();
+        expect(structured).toMatchObject({
+          staged: false,
+          truncated: true,
+          observation_count: observations.length,
+        });
+        expect(structured).not.toHaveProperty('canvas_id');
+        expect(structured).not.toHaveProperty('table_name');
+        expect(shown).toEqual(observations.slice(0, shown.length));
+        expect(envelopeChars(response)).toBeLessThanOrEqual(100_000);
+        if (last) expect(envelopeChars(response)).toBeGreaterThan(99_000);
+        expect(structured.retrieval_guidance).toBe(
+          `${extent}. DataCanvas is at its canvas cap, so the rest was not staged. To reach it, pass a canvas_id you already hold to stage the full result there, narrow the key to fewer series, ${resume}bound the window with start_period/end_period, or use last_n_observations for each series' latest values.`,
+        );
+        expect(text).toContain(`\n> ${structured.retrieval_guidance}`);
+        expect(text).toContain('**Staged:** false | **Truncated:** true');
+        for (const channel of [structured.retrieval_guidance, text]) {
+          expect(channel).not.toContain('not enabled');
+          expect(channel).not.toContain('CANVAS_PROVIDER_TYPE');
+        }
+      },
+    );
+
+    it('at the canvas cap names only a held canvas_id and a narrower key when every row returned overlaps the last period', async () => {
+      mockSvc.fetchData.mockResolvedValue(SHARED_PERIOD_RESULT);
+      await realCanvas(1);
+
+      const response = await call({ key: '*.NGDPD.A' });
+      const structured = response.structuredContent as TruncatedInline;
+      const shown = structured.observations;
+      const last = shown.at(-1)?.time_period;
+      const extent = `observations holds the first ${shown.length} of ${SHARED_PERIOD_RESULT.observations.length} in time order, through time_period ${last}`;
+
+      expect(structured).toMatchObject({ staged: false, truncated: true });
+      expect(structured.retrieval_guidance).toBe(
+        `${extent}. DataCanvas is at its canvas cap, so the rest was not staged. Every row returned overlaps time_period ${last}, so start_period ${last} would return these same rows: that one period across this many series does not fit the response budget. To reach it, pass a canvas_id you already hold to stage the full result there, or narrow the key to fewer series.`,
+      );
+      expect(textOf(response)).toContain(`\n> ${structured.retrieval_guidance}`);
+    });
+
+    it('records the auto-mode fallback at warning, since nothing else shows the cap was hit', async () => {
+      mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations: OVER_BUDGET });
+      await realCanvas(1);
+      const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+
+      const result = await imfQueryDataset.handler(
+        imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.NGDP_RPCH.A' }),
+        ctx,
+      );
+      const warnings = (ctx.log as MockContextLogger).calls.filter(
+        (entry) => entry.level === 'warning',
+      );
+
+      expect(result).toMatchObject({ staged: false, truncated: true });
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.msg).toBe(
+        'DataCanvas is at its canvas cap; the over-budget result was returned inline, cut to the response budget',
+      );
+      expect(warnings[0]?.data).toMatchObject({
+        dataflowId: 'WEO',
+        key: 'USA.NGDP_RPCH.A',
+        cap: 1,
+        activeCount: 1,
+      });
+    });
+
+    it('fails as response_too_large naming a held canvas_id when the series metadata alone overflows at the canvas cap', async () => {
+      const series = Array.from(
+        { length: 1_200 },
+        (_, index) => `C${String(index).padStart(4, '0')}.${'LONG_INDICATOR_'.repeat(8)}.A`,
+      );
+      mockSvc.fetchData.mockResolvedValue({
+        ...MOCK_QUERY_RESULT,
+        observations: series.map((series_key, index) => ({
+          series_key,
+          time_period: '2023',
+          value: index,
+          status: null,
+        })),
+        seriesAttributesByKey: Object.fromEntries(series.map((key) => [key, NGDPD_ATTRS])),
+      });
+      await realCanvas(1);
+
+      const response = await call({ key: '*.NGDPD.A' });
+      const error = contractError(response);
+      const text = textOf(response);
+
+      expect(error.code).toBe(JsonRpcErrorCode.SerializationError);
+      expect(error.message).toMatch(
+        /^The result's full series metadata requires \d+ serialized characters before any observation \(budget 100000\)\.$/,
+      );
+      expect(error.data).toMatchObject({
+        reason: 'response_too_large',
+        seriesCount: 1_200,
+        budgetChars: 100_000,
+        recovery: { hint: AT_CAP_TOO_LARGE_HINT },
+      });
+      expect(text).toContain(`Recovery: ${AT_CAP_TOO_LARGE_HINT}`);
+      for (const wording of [error.message, text]) {
+        expect(wording).not.toContain('not enabled');
+        expect(wording).not.toContain('CANVAS_PROVIDER_TYPE');
+      }
+    });
+
+    /** A failure acquisition can raise that this tool must not translate or absorb. */
+    const untouched = (
+      kind: 'another McpError' | 'a cancellation' | 'an error that is not an McpError',
+      id: 'supplied' | 'omitted',
+    ): Error => {
+      // A provider failure opening the canvas, which carries no reason to read.
+      if (kind === 'an error that is not an McpError') {
+        return new Error('Failed to open the DuckDB canvas database.');
+      }
+      if (kind === 'a cancellation') {
+        return id === 'supplied'
+          ? new McpError(JsonRpcErrorCode.NotFound, 'Canvas not found or expired.', {
+              reason: 'canvas_not_found',
+              canvasId: EXISTING_CANVAS_ID,
+            })
+          : new McpError(
+              JsonRpcErrorCode.RateLimited,
+              'Tenant has reached the active canvas cap (1).',
+              {
+                reason: 'canvas_capacity_exhausted',
+                retryable: true,
+              },
+            );
+      }
+      // The same codes without the reasons, so neither is read off the code alone.
+      return id === 'supplied'
+        ? new McpError(JsonRpcErrorCode.NotFound, 'Canvas registry is shutting down.')
+        : new McpError(JsonRpcErrorCode.RateLimited, 'Too many requests.');
+    };
+
+    it.each([
+      ['auto over budget', 'supplied', 'another McpError'],
+      ['auto over budget', 'omitted', 'another McpError'],
+      ['auto over budget', 'supplied', 'a cancellation'],
+      ['auto over budget', 'omitted', 'a cancellation'],
+      ['output_mode canvas', 'supplied', 'another McpError'],
+      ['output_mode canvas', 'omitted', 'another McpError'],
+      ['output_mode canvas', 'supplied', 'a cancellation'],
+      ['output_mode canvas', 'omitted', 'a cancellation'],
+      ['auto over budget', 'supplied', 'an error that is not an McpError'],
+      ['auto over budget', 'omitted', 'an error that is not an McpError'],
+      ['output_mode canvas', 'supplied', 'an error that is not an McpError'],
+      ['output_mode canvas', 'omitted', 'an error that is not an McpError'],
+    ] as const)('%s with canvas_id %s rethrows %s untouched', async (trigger, id, kind) => {
+      const caller = new AbortController();
+      const error = untouched(kind, id);
+      const acquire = vi.fn(() => {
+        // The caller cancels while the canvas is being acquired.
+        if (kind === 'a cancellation') caller.abort();
+        return Promise.reject(error);
+      });
+      (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({ acquire });
+      const ctx = createMockContext({
+        tenantId: 'test',
+        errors: imfQueryDataset.errors,
+        signal: caller.signal,
+      });
+      const input = imfQueryDataset.input.parse({
+        dataflow_id: 'WEO',
+        key: 'USA.NGDP_RPCH.A',
+        ...reach(trigger),
+        ...(id === 'supplied' ? { canvas_id: EXISTING_CANVAS_ID } : {}),
+      });
+
+      await expect(imfQueryDataset.handler(input, ctx)).rejects.toBe(error);
+      expect(acquire).toHaveBeenCalledWith(id === 'supplied' ? EXISTING_CANVAS_ID : undefined, ctx);
+    });
+
+    /** The refusals acquisition raises, carrying the fields only the server's log keeps. */
+    const refusal = {
+      notFound: () =>
+        new McpError(JsonRpcErrorCode.NotFound, 'Canvas not found or expired.', {
+          reason: 'canvas_not_found',
+          canvasId: EXISTING_CANVAS_ID,
+        }),
+      atCap: () =>
+        new McpError(
+          JsonRpcErrorCode.RateLimited,
+          'Tenant has reached the active canvas cap (1).',
+          { reason: 'canvas_capacity_exhausted', retryable: true, activeCount: 1, cap: 1 },
+        ),
+    };
+
+    it.each([
+      ['canvas_not_found', 'an expired canvas_id', { canvas_id: EXISTING_CANVAS_ID }, 'notFound'],
+      ['canvas_capacity_exhausted', 'output_mode canvas at the cap', {}, 'atCap'],
+      ['response_too_large', 'auto mode at the cap, metadata overflowing', {}, 'atCap'],
+    ] as const)(
+      'keeps the acquisition refusal as the cause of %s (%s)',
+      async (reason, _label, id, kind) => {
+        const overflow = reason === 'response_too_large';
+        if (overflow) {
+          const series = Array.from(
+            { length: 1_200 },
+            (_, index) => `C${String(index).padStart(4, '0')}.${'LONG_INDICATOR_'.repeat(8)}.A`,
+          );
+          mockSvc.fetchData.mockResolvedValue({
+            ...MOCK_QUERY_RESULT,
+            observations: series.map((series_key, index) => ({
+              series_key,
+              time_period: '2023',
+              value: index,
+              status: null,
+            })),
+            seriesAttributesByKey: Object.fromEntries(series.map((key) => [key, NGDPD_ATTRS])),
+          });
+        }
+        const refused = refusal[kind]();
+        (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue({
+          acquire: vi.fn(() => Promise.reject(refused)),
+        });
+        const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+        const input = imfQueryDataset.input.parse({
+          dataflow_id: 'WEO',
+          key: overflow ? '*.NGDPD.A' : 'USA.NGDP_RPCH.A',
+          ...(overflow ? {} : { output_mode: 'canvas' }),
+          ...id,
+        });
+
+        const error = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+
+        expect(error.data?.reason).toBe(reason);
+        expect(error.cause).toBe(refused);
+      },
+    );
+
+    it.each(['supplied', 'omitted'] as const)(
+      'auto under budget with canvas_id %s returns inline at the canvas cap without acquiring',
+      async (id) => {
+        const live = await realCanvas(1);
+        const acquire = vi.spyOn(live, 'acquire');
+
+        const response = await call(id === 'supplied' ? { canvas_id: STALE_ID } : {});
+
+        expect(response.isError).toBeFalsy();
+        expect(response.structuredContent).toMatchObject({
+          staged: false,
+          truncated: false,
+          observation_count: 3,
+        });
+        expect(response.structuredContent).not.toHaveProperty('canvas_id');
+        expect(acquire).not.toHaveBeenCalled();
+      },
+    );
+
+    it('declares both canvas reasons with this tool’s recovery, and response_too_large for any unstaged result', () => {
+      const entry = (reason: string) => imfQueryDataset.errors?.find((e) => e.reason === reason);
+
+      expect(entry('canvas_not_found')).toEqual({
+        reason: 'canvas_not_found',
+        code: JsonRpcErrorCode.NotFound,
+        when: 'canvas_id names a canvas that has expired, was lost on a server restart, or belongs to another session, and the result was to be staged on it (it spilled, or output_mode="canvas")',
+        severity: 'warning',
+        recovery: NOT_FOUND_RECOVERY,
+      });
+      expect(entry('canvas_capacity_exhausted')).toEqual({
+        reason: 'canvas_capacity_exhausted',
+        code: JsonRpcErrorCode.RateLimited,
+        when: 'output_mode="canvas" was requested without canvas_id while DataCanvas holds as many canvases as it allows; an auto-mode call there returns the result inline instead',
+        retryable: true,
+        severity: 'warning',
+        recovery: CAPACITY_RECOVERY,
+      });
+      expect(entry('response_too_large')?.when).toBe(
+        'The result is not staged — DataCanvas is not enabled, or an auto-mode call without canvas_id found it at its canvas cap — and its fixed part, the full series_metadata, exceeds the response budget before any observation can be included; a staged result never fails this way',
+      );
+    });
+
+    it('says before the call how an expired canvas_id and the canvas cap behave', () => {
+      const schema = z.toJSONSchema(imfQueryDataset.output) as {
+        properties: Record<string, JsonSchemaNode>;
+      };
+      const canvasId = imfQueryDataset.input.shape.canvas_id.description ?? '';
+
+      expect(imfQueryDataset.description).toContain(
+        'Without DataCanvas, or with it at its canvas cap when an auto-mode call omits canvas_id, a larger result returns its earliest observations with truncated=true',
+      );
+      expect(canvasId).toContain(
+        'A canvas_id that has expired fails as canvas_not_found once the result is staged: omit it to stage onto a fresh canvas.',
+      );
+      expect(canvasId).toContain(
+        'At the canvas cap only a canvas_id you hold can stage; omitted there, auto mode returns the result inline and output_mode="canvas" fails as canvas_capacity_exhausted.',
+      );
+      expect(schema.properties.truncated?.description).toContain(
+        'staged=false and truncated=true when the full result exceeds the response budget and was not staged: DataCanvas is not enabled, or an auto-mode call without canvas_id found it at its canvas cap.',
+      );
+      expect(schema.properties.retrieval_guidance?.description).toContain(
+        'on a result truncated without staging, where it says why (DataCanvas is not enabled, or at its canvas cap)',
+      );
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // #64: reference periods on series and observations
   // -------------------------------------------------------------------------
 
@@ -5478,6 +6454,222 @@ describe('imfQueryDataset', () => {
       expect(second?.[8]).toBeUndefined();
       // The Context is what the service keys the call's budget on.
       expect(second?.[6]).toBe(first?.[6]);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #72: the availability end is the last day with data
+  // -------------------------------------------------------------------------
+
+  describe('#72 the availability end is the last day with data', () => {
+    /**
+     * The service's reading of WEO's live `USA` constraint, whose annotations are
+     * the half-open `[1980-01-01, 2032-01-01)` around 1980–2031.
+     */
+    const WEO_RANGE = constraintTimeRange('1980-01-01', '2032-01-01');
+    const WEO_YEARS = Array.from({ length: 52 }, (_, index) => ({
+      series_key: 'USA.NGDP_RPCH.A',
+      time_period: `${1980 + index}`,
+      value: index + 0.5,
+      status: null,
+    }));
+
+    it('reaches the last period with start_period set to the reported end', async () => {
+      mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations: WEO_YEARS });
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'WEO',
+        key: 'USA.NGDP_RPCH.A',
+        start_period: WEO_RANGE.time_period_end ?? 'absent',
+      });
+
+      expect(response.isError).toBeFalsy();
+      expect(
+        (
+          response.structuredContent as { observations: Array<{ time_period: string }> }
+        ).observations.map((obs) => obs.time_period),
+      ).toEqual(['2031']);
+    });
+
+    it('states the inclusive range in the no_data message, its recovery hint, and data', async () => {
+      mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations: [] });
+      mockSvc.fetchAvailabilityConstraint.mockResolvedValue({
+        series_count: 8200,
+        available_codes: { FREQUENCY: { count: 1, codes: ['A'] } },
+        ...WEO_RANGE,
+      });
+      const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+      const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'USA.ZZZ.A' });
+
+      const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+
+      const range = 'Available time range: 1980-01-01 – 2031-12-31.';
+      expect(err.data?.reason).toBe('no_data');
+      expect(err.message).toContain(range);
+      expect(recoveryHint(err)).toContain(range);
+      expect(err.data?.availability).toMatchObject({
+        time_period_start: '1980-01-01',
+        time_period_end: '2031-12-31',
+      });
+    });
+
+    it('carries the inclusive range on data.dataflow_availability for an uncovered code', async () => {
+      mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, observations: [] });
+      availabilityByScope(
+        availability(0),
+        availability(
+          8200,
+          { FREQUENCY: { count: 1, codes: ['A'] } },
+          {
+            start: WEO_RANGE.time_period_start,
+            end: WEO_RANGE.time_period_end,
+          },
+        ),
+      );
+      const ctx = createMockContext({ tenantId: 'test', errors: imfQueryDataset.errors });
+      const input = imfQueryDataset.input.parse({ dataflow_id: 'WEO', key: 'TUR.NGDP_RPCH.A' });
+
+      const err = await captureMcpError(() => imfQueryDataset.handler(input, ctx));
+
+      expect(err.data?.dataflow_availability).toMatchObject({ time_period_end: '2031-12-31' });
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // #74: following the canvas-off resume guidance reaches every row
+  // -------------------------------------------------------------------------
+
+  describe('#74 resuming a canvas-off cut reaches every row', () => {
+    const KEY = 'USA+GBR+DEU+FRA+JPN.CPI.*';
+    const YEARS = Array.from({ length: 16 }, (_, index) => 1990 + index);
+    const LABELS_OF: Record<string, (year: number) => string[]> = {
+      A: (year) => [`${year}`],
+      Q: (year) => [1, 2, 3, 4].map((quarter) => `${year}-Q${quarter}`),
+      M: (year) =>
+        Array.from({ length: 12 }, (_, month) => `${year}-M${String(month + 1).padStart(2, '0')}`),
+    };
+    /**
+     * Five economies at A, Q, and M over 1990–2005, in the order the service
+     * returns them: far past the inline budget, so each call is cut part-way
+     * through a year whose quarters are not all behind the cut.
+     */
+    const ROWS = sortByPeriod(
+      ['USA', 'GBR', 'DEU', 'FRA', 'JPN'].flatMap((economy) =>
+        Object.entries(LABELS_OF).flatMap(([frequency, labelsOf]) =>
+          YEARS.flatMap((year) =>
+            labelsOf(year).map((time_period, index) => ({
+              series_key: `${economy}.CPI.${frequency}`,
+              time_period,
+              value: year + index / 100,
+              status: null,
+            })),
+          ),
+        ),
+      ),
+    );
+
+    it('returns every row across the calls, each resuming from the last period returned', async () => {
+      mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, key: KEY, observations: ROWS });
+      const returned = new Set<string>();
+      const resumedFrom: string[] = [];
+      let start_period = '1990';
+      let complete = false;
+
+      for (let call = 0; call < 10 && !complete; call++) {
+        const response = await runToolContract(imfQueryDataset, {
+          dataflow_id: 'CPI',
+          key: KEY,
+          start_period,
+        });
+        const structured = response.structuredContent as {
+          observations: Array<{ series_key: string; time_period: string }>;
+          truncated: boolean;
+        };
+        for (const obs of structured.observations) {
+          returned.add(`${obs.series_key} ${obs.time_period}`);
+        }
+        const last = structured.observations.at(-1)?.time_period;
+        complete = !structured.truncated;
+        if (!complete && last) {
+          resumedFrom.push(last);
+          start_period = last;
+        }
+      }
+
+      expect(complete).toBe(true);
+      expect(resumedFrom.length).toBeGreaterThan(0);
+      expect(
+        ROWS.map((obs) => `${obs.series_key} ${obs.time_period}`).filter(
+          (row) => !returned.has(row),
+        ),
+      ).toEqual([]);
+    });
+
+    it('lists series_metadata by first appearance in that order, with series_attributes its first entry', async () => {
+      // A unit per frequency, so the series heading the list is visible in series_attributes.
+      const seriesAttributesByKey = Object.fromEntries(
+        [...new Set(ROWS.map((obs) => obs.series_key))].map((seriesKey) => [
+          seriesKey,
+          { unit: `unit ${seriesKey.slice(-1)}`, scale: '0', decimals: 2 },
+        ]),
+      );
+      mockSvc.fetchData.mockResolvedValue({
+        ...MOCK_QUERY_RESULT,
+        key: KEY,
+        observations: ROWS,
+        seriesAttributesByKey,
+      });
+
+      const response = await runToolContract(imfQueryDataset, { dataflow_id: 'CPI', key: KEY });
+      const structured = response.structuredContent as {
+        series_attributes: Record<string, unknown>;
+        series_metadata: Array<{ series_key: string } & Record<string, unknown>>;
+      };
+
+      // 1990-M01 opens the result, then 1990-Q1, then 1990.
+      expect(structured.series_metadata.map((entry) => entry.series_key)).toEqual(
+        ['M', 'Q', 'A'].flatMap((frequency) =>
+          ['USA', 'GBR', 'DEU', 'FRA', 'JPN'].map((economy) => `${economy}.CPI.${frequency}`),
+        ),
+      );
+      expect(structured.series_attributes).toEqual({ unit: 'unit M', scale: '0', decimals: 2 });
+      expect(structured.series_metadata[0]).toEqual({
+        series_key: 'USA.CPI.M',
+        ...structured.series_attributes,
+      });
+    });
+
+    it('keeps last_n_observations to each series’ last N periods, in the same order', async () => {
+      mockSvc.fetchData.mockResolvedValue({ ...MOCK_QUERY_RESULT, key: KEY, observations: ROWS });
+
+      const response = await runToolContract(imfQueryDataset, {
+        dataflow_id: 'CPI',
+        key: KEY,
+        last_n_observations: 2,
+      });
+
+      /** Each frequency's last two periods, in the order the dates they span run. */
+      const lastTwo = [
+        ['A', '2004'],
+        ['A', '2005'],
+        ['Q', '2005-Q3'],
+        ['Q', '2005-Q4'],
+        ['M', '2005-M11'],
+        ['M', '2005-M12'],
+      ];
+      expect(
+        (
+          response.structuredContent as {
+            observations: Array<{ series_key: string; time_period: string }>;
+          }
+        ).observations.map((obs) => `${obs.series_key} ${obs.time_period}`),
+      ).toEqual(
+        lastTwo.flatMap(([frequency, period]) =>
+          ['USA', 'GBR', 'DEU', 'FRA', 'JPN'].map(
+            (economy) => `${economy}.CPI.${frequency} ${period}`,
+          ),
+        ),
+      );
     });
   });
 });

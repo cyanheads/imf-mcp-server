@@ -10,8 +10,9 @@
  * whenever they fit the response budget. A requested series of a + key that
  * came back empty is named with its reason, and attributes a failed recovery
  * request left null are disclosed.
- * Large result sets spill to DataCanvas for SQL analysis; without a
- * canvas they are cut to the same response budget as a time-ascending prefix.
+ * Large result sets spill to DataCanvas for SQL analysis and return a preview
+ * bounded by count: the first 20 series and at most 100 observations. Without a
+ * canvas they are cut to the response budget as a prefix of the result order.
  * @module mcp-server/tools/definitions/imf-query-dataset.tool
  */
 
@@ -23,6 +24,7 @@ import { tableCell } from '@/mcp-server/markdown-table.js';
 import { blankAsUnset, blankAsUnsetNumber } from '@/mcp-server/optional-input.js';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
+import { type PeriodSpan, periodSpan } from '@/services/imf-sdmx/time-period.js';
 import type {
   AvailabilityResult,
   CodelistEntry,
@@ -32,7 +34,10 @@ import type {
   UnresolvedGroupAttributes,
 } from '@/services/imf-sdmx/types.js';
 
-/** Maximum serialized size of a staged tool result, across both MCP result channels. */
+/**
+ * Maximum serialized size of an inline tool result, across both MCP result
+ * channels: past it a result is staged, or without DataCanvas cut to fit.
+ */
 const RESPONSE_BUDGET_CHARS = 100_000;
 
 /** Framework-style random suffix for explicitly registered IMF canvas tables. */
@@ -60,8 +65,24 @@ const PUBLISHED_IN_UNITS = 'published in units';
  * first 20 entries and says where the rest are — and, a grouped row carrying the
  * same cells as the per-series row it replaced, costs no more than the 20-row
  * table did, beyond a reference-period cell on a result that publishes one.
+ * A staged result lists at most STAGED_PREVIEW_SERIES entries, so only an
+ * inline or canvas-off result reaches it.
  */
 const SERIES_METADATA_PREVIEW_ROWS = 20;
+
+/**
+ * The preview a staged result carries, bounded by count rather than by the
+ * response budget: `series_metadata` lists the first STAGED_PREVIEW_SERIES
+ * series in result order, and `observations` holds the first
+ * STAGED_PREVIEW_OBSERVATIONS rows, ending before the first row of a series the
+ * list leaves out, so every inline row has its entry. The staged table holds
+ * every series' attributes on its rows, so the inventory stays reachable through
+ * it, and `series_count` says how many there are when the list is cut. A
+ * staged reply is then bounded by design, never cut to fit: WEO `*.*.A` with
+ * `last_n_observations: 1` (8,199 series) stages instead of failing.
+ */
+const STAGED_PREVIEW_SERIES = 20;
+const STAGED_PREVIEW_OBSERVATIONS = 100;
 
 /**
  * Render a scale attribute for a reader as the publication magnitude it names:
@@ -141,8 +162,8 @@ function paddingHidesRows(observations: Observation[], n: number): boolean {
 
 /**
  * Each series' last `n` observations, in their original order. Rows arrive
- * time-sorted by label, and one series' labels share a format, so a series'
- * last rows here are its latest periods.
+ * ordered by the dates each period spans, earliest first, so a series' last
+ * rows here are its latest periods.
  */
 function lastNPerSeries(observations: Observation[], n: number): Observation[] {
   const taken = new Map<string, number>();
@@ -287,97 +308,6 @@ function unparseablePeriodNotice(count: number, samples: string[]): string {
   );
 }
 
-/** The inclusive span of dates a period label names. */
-interface PeriodSpan {
-  /** Last date of the span, as a date key. */
-  hi: number;
-  /** First date of the span, as a date key. */
-  lo: number;
-}
-
-/**
- * A calendar date as the comparable integer `YYYYMMDD`. Ordering is the only
- * operation period comparison needs, so the closing edge of a month, quarter,
- * half-year, or year can be day 31 without consulting the calendar: no real
- * date within that month sorts above it, and none in the next month sorts below.
- */
-function dateKey(year: number, month: number, day: number): number {
-  return year * 10_000 + month * 100 + day;
-}
-
-/** Day number closing any month-or-coarser span, and the largest a date may name. */
-const LAST_DAY = 31;
-
-/**
- * Resolve a period label to the span of dates it names.
- *
- * A period is an interval, not a point: `2023` names January–December 2023 and
- * `2023-Q1` names January–March. Comparing labels as strings instead conflates
- * the two ends of that interval, which is what made `end_period: "2023"` reject
- * `2023-M01` while `start_period: "2023"` admitted it.
- *
- * Recognized labels — every shape api.imf.org emits, since a label the parser
- * does not know is a label the range filter cannot apply:
- *   Annual:       `YYYY`         → January–December of that year
- *   Semi-annual:  `YYYY-SN`      → the half-year's six months (PIP)
- *   Quarterly:    `YYYY-QN`      → the quarter's three months
- *   Monthly:      `YYYY-MM`      → that month (input format)
- *   Monthly:      `YYYY-MNN`     → that month (upstream format, e.g. `1956-M01`)
- *   Daily:        `YYYY-MM-DD`   → that day (IRFCL, CCI)
- *
- * Returns null for anything else; callers decide whether null is fatal (input
- * validation) or a pass-through (per-observation filtering).
- */
-function periodSpan(period: string): PeriodSpan | null {
-  const annual = /^(\d{4})$/.exec(period);
-  if (annual) {
-    const year = Number(annual[1]);
-    return { lo: dateKey(year, 1, 1), hi: dateKey(year, 12, LAST_DAY) };
-  }
-
-  const semiAnnual = /^(\d{4})-S([12])$/.exec(period);
-  if (semiAnnual) {
-    const year = Number(semiAnnual[1]);
-    const half = Number(semiAnnual[2]);
-    return { lo: dateKey(year, half * 6 - 5, 1), hi: dateKey(year, half * 6, LAST_DAY) };
-  }
-
-  const quarterly = /^(\d{4})-Q([1-4])$/.exec(period);
-  if (quarterly) {
-    const year = Number(quarterly[1]);
-    const quarter = Number(quarterly[2]);
-    return { lo: dateKey(year, quarter * 3 - 2, 1), hi: dateKey(year, quarter * 3, LAST_DAY) };
-  }
-
-  const daily = /^(\d{4})-(\d{2})-(\d{2})$/.exec(period);
-  if (daily) {
-    const year = Number(daily[1]);
-    const month = Number(daily[2]);
-    const day = Number(daily[3]);
-    const calendarDate = new Date(Date.UTC(year, month - 1, day));
-    if (
-      calendarDate.getUTCFullYear() !== year ||
-      calendarDate.getUTCMonth() !== month - 1 ||
-      calendarDate.getUTCDate() !== day
-    ) {
-      return null;
-    }
-    const key = dateKey(year, month, day);
-    return { lo: key, hi: key };
-  }
-
-  // Monthly, in the input format (YYYY-MM) or the upstream one (YYYY-MNN).
-  const monthly = /^(\d{4})-(\d{2})$/.exec(period) ?? /^(\d{4})-M(\d{1,2})$/.exec(period);
-  if (monthly) {
-    const month = Number(monthly[2]);
-    if (month < 1 || month > 12) return null;
-    const year = Number(monthly[1]);
-    return { lo: dateKey(year, month, 1), hi: dateKey(year, month, LAST_DAY) };
-  }
-
-  return null;
-}
-
 /**
  * Return true if an observation's own period overlaps the requested window.
  *
@@ -426,7 +356,7 @@ function observedRange(observations: Observation[]): { first: string; last: stri
     }
   }
 
-  // No label parsed — fall back to the service's time-ascending ordering.
+  // No label parsed — fall back to the service's period-span ordering.
   return {
     first: first ?? observations[0]?.time_period ?? '',
     last: last ?? observations[observations.length - 1]?.time_period ?? '',
@@ -573,6 +503,8 @@ interface QueryDatasetResult {
   observations: Observation[];
   retrieval_guidance?: string;
   series_attributes: SeriesAttributes;
+  /** Distinct series in the result, present only when a staged `series_metadata` is cut. */
+  series_count?: number;
   series_metadata?: SeriesMetadata[];
   source: string;
   staged: boolean;
@@ -684,6 +616,7 @@ function formatQueryDataset(result: QueryDatasetResult) {
  * The formatted text, with the series-attribute table listing every entry or,
  * when `everySeries` is false, the first SERIES_METADATA_PREVIEW_ROWS entries
  * and where the rest are: the staged table's rows, or a call over fewer series.
+ * A staged list cut to its first entries counts against `series_count`.
  */
 function renderQueryDataset(result: QueryDatasetResult, everySeries: boolean): string {
   const lines: string[] = [];
@@ -706,7 +639,7 @@ function renderQueryDataset(result: QueryDatasetResult, everySeries: boolean): s
     .join(' | ');
 
   if (result.series_metadata) {
-    const total = result.series_metadata.length;
+    const total = result.series_count ?? result.series_metadata.length;
     const shown = everySeries
       ? result.series_metadata
       : result.series_metadata.slice(0, SERIES_METADATA_PREVIEW_ROWS);
@@ -817,9 +750,12 @@ function serializedResultChars(result: QueryDatasetResult, notice?: string): num
 /**
  * The result carrying the longest observation prefix whose whole envelope fits
  * the response budget — or, when not even the empty prefix fits, the size of
- * that fixed part. Observations arrive time-sorted, so a prefix is the earliest
- * periods across every series. `build(count)` assembles the result carrying the
- * first `count` observations.
+ * that fixed part. Used only without DataCanvas; a staged result carries the
+ * count-bounded `stagedPreview` instead. Observations arrive ordered by the
+ * dates each period spans, earliest first, so a prefix is the earliest periods
+ * across every series, and every row after it starts no earlier than the last
+ * row in it. `build(count)` assembles the result carrying the first `count`
+ * observations.
  */
 function fitToBudget(
   build: (count: number) => QueryDatasetResult,
@@ -839,24 +775,80 @@ function fitToBudget(
 }
 
 /**
- * Guidance for a result cut to the budget without DataCanvas: where the prefix
- * ends and each way to reach the rest. It names no dataframe tool, since none is
- * registered without a canvas.
+ * A staged result's inline observations (see STAGED_PREVIEW_SERIES): the first
+ * STAGED_PREVIEW_OBSERVATIONS rows in result order, ending before the first row
+ * of a series outside `listed`.
  */
-function inlineTruncationGuidance(shown: Observation[], total: number): string {
+function stagedPreview(observations: Observation[], listed: ReadonlySet<string>): Observation[] {
+  const preview: Observation[] = [];
+  for (const obs of observations) {
+    if (preview.length === STAGED_PREVIEW_OBSERVATIONS || !listed.has(obs.series_key)) break;
+    preview.push(obs);
+  }
+  return preview;
+}
+
+/**
+ * Why an over-budget result was returned cut to the budget instead of staged:
+ * no canvas is configured, or an auto-mode call found DataCanvas at its canvas
+ * cap with no `canvas_id` to stage onto.
+ */
+type Unstaged = 'canvas_off' | 'canvas_at_cap';
+
+/**
+ * Guidance for a result cut to the budget without staging: where the prefix
+ * ends, why the rest was not staged, and each way to reach it. Without a canvas
+ * it names no dataframe tool, since none is registered, and points at enabling
+ * one; at the cap it names the one reclaim path every caller has, a canvas_id
+ * already held, and never says DataCanvas is off. Resuming from the last period
+ * returns every row after the cut, since none starts before that period's first
+ * date, and again each row already returned whose period overlaps it: that
+ * period's own rows, and a coarser period around it (a quarter or year around
+ * a month). When every row returned overlaps it, resuming returns these same
+ * rows cut at the same place — one period across this many series overflows the
+ * budget — so neither a resume, a window, nor last_n_observations is named, only
+ * a narrower key and a canvas.
+ */
+function inlineTruncationGuidance(shown: Observation[], total: number, unstaged: Unstaged): string {
   const last = shown.at(-1)?.time_period;
   const extent = last
     ? `observations holds the first ${shown.length} of ${total} in time order, through time_period ${last}`
     : `observations is empty: not even the first of ${total} fits the response budget`;
+  const head = `${extent}. ${unstaged === 'canvas_off' ? 'DataCanvas is not enabled' : 'DataCanvas is at its canvas cap'}, so the rest was not staged.`;
+  const lastSpan = last ? periodSpan(last) : null;
+  if (
+    lastSpan &&
+    shown.every(
+      (obs) => (periodSpan(obs.time_period)?.hi ?? Number.NEGATIVE_INFINITY) >= lastSpan.lo,
+    )
+  ) {
+    const stalled = `Every row returned overlaps time_period ${last}, so start_period ${last} would return these same rows: that one period across this many series does not fit the response budget`;
+    switch (unstaged) {
+      case 'canvas_off':
+        return `${head} ${stalled}. To reach it, narrow the key to fewer series, or run the server with CANVAS_PROVIDER_TYPE=duckdb to stage the full result.`;
+      case 'canvas_at_cap':
+        return `${head} ${stalled}. To reach it, pass a canvas_id you already hold to stage the full result there, or narrow the key to fewer series.`;
+    }
+  }
   const resume = last
-    ? `set start_period to ${last} to continue from that period (it is returned again in full), `
+    ? `set start_period to ${last} to continue from that period (rows already returned whose period overlaps it come back again), `
     : '';
-  return (
-    `${extent}. DataCanvas is not enabled, so the rest was not staged. To reach it, narrow the key to fewer series, ` +
-    `${resume}bound the window with start_period/end_period, use last_n_observations for each series' latest values, ` +
-    'or run the server with CANVAS_PROVIDER_TYPE=duckdb to stage the full result.'
-  );
+  const narrow = `narrow the key to fewer series, ${resume}bound the window with start_period/end_period, `;
+  switch (unstaged) {
+    case 'canvas_off':
+      return `${head} To reach it, ${narrow}use last_n_observations for each series' latest values, or run the server with CANVAS_PROVIDER_TYPE=duckdb to stage the full result.`;
+    case 'canvas_at_cap':
+      return `${head} To reach it, pass a canvas_id you already hold to stage the full result there, ${narrow}or use last_n_observations for each series' latest values.`;
+  }
 }
+
+/**
+ * The `response_too_large` hint when DataCanvas is at its canvas cap: the
+ * contract's narrower key still works, and so does staging onto a canvas the
+ * caller already holds, which a staged result's fixed preview always fits.
+ */
+const AT_CAP_TOO_LARGE_HINT =
+  'DataCanvas is at its canvas cap, so the result could not be staged. Pass a canvas_id you already hold to stage it there, or narrow the dimension key to fewer series so the full series_metadata fits in one response.';
 
 export const imfQueryDataset = tool('imf_query_dataset', {
   description:
@@ -887,9 +879,11 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     'the cheap way to ask many countries for their latest figure. ' +
     'Values are in base units everywhere, staged canvas rows included: scale is the power of ten the IMF ' +
     'publishes a series in (value / 10^scale is the published figure), never a factor still to apply. ' +
-    'A response is held to 100,000 serialized characters. With DataCanvas enabled (CANVAS_PROVIDER_TYPE=duckdb), ' +
-    'a larger result (multi-country, long time range) spills to it: call imf_dataframe_describe first to inspect ' +
-    'staged tables and columns, then imf_dataframe_query for SQL analysis. Without DataCanvas, a larger result ' +
+    'An inline response is held to 100,000 serialized characters. With DataCanvas enabled (CANVAS_PROVIDER_TYPE=duckdb), ' +
+    'a larger result (multi-country, long time range) spills to it and returns a preview, the attributes of its first 20 series ' +
+    'and at most 100 observations: call imf_dataframe_describe first to inspect ' +
+    'staged tables and columns, then imf_dataframe_query for SQL analysis. ' +
+    'Without DataCanvas, or with it at its canvas cap when an auto-mode call omits canvas_id, a larger result ' +
     'returns its earliest observations with truncated=true, and retrieval_guidance names the last period returned ' +
     'and how to narrow the query.',
   annotations: {
@@ -950,7 +944,9 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     ),
     canvas_id: blankAsUnset(CanvasIdSchema.optional()).describe(
       'Existing canvas ID to accumulate results into across multiple queries. ' +
-        'This selects the destination only; it does not force staging. Use output_mode="canvas" to stage an under-budget result.',
+        'This selects the destination only; it does not force staging. Use output_mode="canvas" to stage an under-budget result. ' +
+        'A canvas_id that has expired fails as canvas_not_found once the result is staged: omit it to stage onto a fresh canvas. ' +
+        'At the canvas cap only a canvas_id you hold can stage; omitted there, auto mode returns the result inline and output_mode="canvas" fails as canvas_capacity_exhausted.',
     ),
     output_mode: blankAsUnset(z.enum(['auto', 'canvas']).default('auto')).describe(
       'Result placement. auto returns an under-budget result inline and spills only when needed. ' +
@@ -1027,7 +1023,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           .describe('A single time-series observation.'),
       )
       .describe(
-        'Inline observations, oldest period first. When truncated=true this is the budget-limited time-ascending prefix of the result; observation_count remains the full count.',
+        'Inline observations, ordered by the dates each period spans, earliest first: by first date, and on the same first date the shorter period first (2023-M01, 2023-Q1, 2023-S1, 2023). When truncated=true this is a prefix of that order — on a staged result at most the first 100 rows, ending before the first row of a series series_metadata does not list; without DataCanvas the longest prefix that fits the response budget. observation_count remains the full count.',
       ),
     series_attributes: z
       .object({
@@ -1097,11 +1093,18 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       )
       .optional()
       .describe(
-        'Per-series attributes, one entry per distinct series_key in the result. Present only ' +
+        'Per-series attributes, one entry per distinct series_key in the result, in order of first appearance in observations. Present only ' +
           'when the query resolved to more than one series; a single-series query carries its ' +
-          'values in series_attributes instead. Unit and scale differ across series in one query — ' +
+          'values in series_attributes instead. A staged result lists its first 20 series only: series_count is then present with the total, ' +
+          "and the staged table's rows carry every series' attributes. Unit and scale differ across series in one query — " +
           'WEO NGDPD is USD published in billions (scale 9) while NGDP_RPCH is PT at scale 0 — so interpret each series ' +
           'against its own entry.',
+      ),
+    series_count: z
+      .number()
+      .optional()
+      .describe(
+        'How many distinct series the result holds, present only on a staged result whose series_metadata lists the first 20 of more. SELECT DISTINCT series_key, unit, scale, decimals, series_reference_period FROM <table_name> ORDER BY series_key returns the attributes of every one.',
       ),
     unresolved_attributes: z
       .object({
@@ -1171,8 +1174,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     truncated: z
       .boolean()
       .describe(
-        'True only when observations is an incomplete preview of observation_count. A result can be staged=true and truncated=false when every observation also fits inline, ' +
-          'and staged=false and truncated=true when DataCanvas is not enabled and the full result exceeds the response budget.',
+        'True only when observations is an incomplete preview of observation_count. A staged result is truncated=true when it holds more than 100 observations or more than 20 series, ' +
+          'and staged=false and truncated=true when the full result exceeds the response budget and was not staged: DataCanvas is not enabled, or an auto-mode call without canvas_id found it at its canvas cap.',
       ),
     canvas_id: z
       .string()
@@ -1190,8 +1193,9 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       .string()
       .optional()
       .describe(
-        'Present on every staged result, where it names the imf_dataframe_describe-before-imf_dataframe_query retrieval workflow, ' +
-          'and on a result truncated without DataCanvas, where it names the last time_period returned and how to narrow the query for the rest.',
+        'Present on every staged result, where it names the imf_dataframe_describe-before-imf_dataframe_query retrieval workflow ' +
+          "and, when series_metadata is cut, the SELECT DISTINCT query that returns every series' attributes, " +
+          'and on a result truncated without staging, where it says why (DataCanvas is not enabled, or at its canvas cap) and names the last time_period returned and how to reach the rest.',
       ),
     source: z
       .string()
@@ -1301,9 +1305,37 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         'Enable DataCanvas with CANVAS_PROVIDER_TYPE=duckdb, or omit output_mode/use output_mode="auto" for an inline result.',
     },
     {
+      /**
+       * Re-raised from canvas acquisition: the framework's own hint says to
+       * re-run the tool that produced the id, which is this one, and resending
+       * the id fails again. canvas_id is an optional destination here, so
+       * omitting it is the way back.
+       */
+      reason: 'canvas_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'canvas_id names a canvas that has expired, was lost on a server restart, or belongs to another session, and the result was to be staged on it (it spilled, or output_mode="canvas")',
+      severity: 'warning',
+      recovery:
+        'Omit canvas_id to stage the result on a fresh canvas. The tables staged on the expired canvas went with it, so stage again each one you still need.',
+    },
+    {
+      /**
+       * Reached only when minting, with canvas_id omitted, and raised only for
+       * output_mode="canvas", where the caller asked to stage. An auto-mode
+       * call never asked, already holds the data, and returns it inline.
+       */
+      reason: 'canvas_capacity_exhausted',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'output_mode="canvas" was requested without canvas_id while DataCanvas holds as many canvases as it allows; an auto-mode call there returns the result inline instead',
+      retryable: true,
+      severity: 'warning',
+      recovery:
+        'Pass a canvas_id you already hold to stage the result on it, or use output_mode="auto" to receive the result inline, cut to the response budget when it does not fit.',
+    },
+    {
       reason: 'response_too_large',
       code: JsonRpcErrorCode.SerializationError,
-      when: 'The fixed part of the result — full series_metadata, plus the retrieval handle when staging — exceeds the response budget before any observation can be included',
+      when: 'The result is not staged — DataCanvas is not enabled, or an auto-mode call without canvas_id found it at its canvas cap — and its fixed part, the full series_metadata, exceeds the response budget before any observation can be included; a staged result never fails this way',
       severity: 'warning',
       recovery:
         'Narrow the dimension key to fewer series so the full series_metadata fits in one response.',
@@ -1473,6 +1505,11 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       const blankList = blankPositions.some((index) => (sentMembers[index]?.length ?? 0) > 1)
         ? ' A + list whose members are all blank is empty too.'
         : '';
+      /**
+       * The key and * are what the caller sends back, so content[] renders them
+       * as code spans rather than escaping them to \*. The key format names
+       * dimensions, never a value the caller sends, and stays escaped text.
+       */
       throw ctx.fail(
         'empty_key_segment',
         `Key '${trimmedKey}' leaves position ${namePositions(blankPositions)} empty.${blankList} An empty position matches no series — use * to match every code there. Key format: ${structure.keyFormat}`,
@@ -1481,6 +1518,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           emptyPositions: blankPositions.map((index) => index + 1),
           keyFormat: structure.keyFormat,
         },
+        { literals: [trimmedKey, '*'] },
       );
     }
 
@@ -1502,6 +1540,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
           positions: wildcardPositions.map((index) => index + 1),
           keyFormat: structure.keyFormat,
         },
+        { literals: [trimmedKey, '*'] },
       );
     }
 
@@ -1540,6 +1579,12 @@ export const imfQueryDataset = tool('imf_query_dataset', {
         'invalid_key_code',
         `Key '${trimmedKey}' uses ${invalidCodes.length} code(s) not in the codelist for their position: ${invalidCodes.map(describeInvalidCode).join('; ')}. Key format: ${structure.keyFormat}`,
         { key: trimmedKey, invalidCodes, keyFormat: structure.keyFormat },
+        {
+          literals: [
+            trimmedKey,
+            ...invalidCodes.flatMap(({ code, suggestions }) => [code, ...suggestions]),
+          ],
+        },
       );
     }
     /**
@@ -1812,7 +1857,8 @@ export const imfQueryDataset = tool('imf_query_dataset', {
      * The flat field is pinned to the first series of the result rather than the
      * first the decoder happened to reach, so `series_attributes` and
      * `series_metadata[0]` always describe the same series. Observations are
-     * time-sorted, so the two orders are otherwise unrelated — and a flat record
+     * ordered by the dates each period spans, not by series, so the two orders
+     * are otherwise unrelated — and a flat record
      * that silently belongs to a different series than the list's head is the
      * same class of confusion the per-series list exists to end.
      */
@@ -1891,20 +1937,15 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       return inlineResult;
     }
 
-    /** A key whose fixed metadata alone overflows fails rather than dropping the series inventory. */
-    const tooLarge = (fixedChars: number, fixedPart: string) =>
-      ctx.fail(
-        'response_too_large',
-        `${fixedPart} ${fixedChars} serialized characters before any observation (budget ${RESPONSE_BUDGET_CHARS}).`,
-        {
-          seriesCount: seriesKeys.length,
-          serializedChars: fixedChars,
-          budgetChars: RESPONSE_BUDGET_CHARS,
-        },
-      );
-
-    // Without a canvas an over-budget result is cut the same way, minus the handle.
-    if (!canvas) {
+    /**
+     * An over-budget result that is not staged is cut to the budget, keeping
+     * its full series inventory: a key whose metadata alone overflows fails
+     * rather than dropping it, since no table holds it. `capacity` is the
+     * refusal an auto-mode call met at the canvas cap; without it, no canvas
+     * is configured.
+     */
+    const cutToBudget = (capacity?: McpError) => {
+      const unstaged: Unstaged = capacity ? 'canvas_at_cap' : 'canvas_off';
       const fitted = fitToBudget(
         (count) => {
           const observations = selectedObservations.slice(0, count);
@@ -1913,52 +1954,91 @@ export const imfQueryDataset = tool('imf_query_dataset', {
             observations,
             staged: false,
             truncated: count < selectedObservations.length,
-            retrieval_guidance: inlineTruncationGuidance(observations, selectedObservations.length),
+            retrieval_guidance: inlineTruncationGuidance(
+              observations,
+              selectedObservations.length,
+              unstaged,
+            ),
           };
         },
         selectedObservations.length,
         notice,
       );
       if ('fixedChars' in fitted) {
-        throw tooLarge(fitted.fixedChars, "The result's full series metadata requires");
+        throw ctx.fail(
+          'response_too_large',
+          `The result's full series metadata requires ${fitted.fixedChars} serialized characters before any observation (budget ${RESPONSE_BUDGET_CHARS}).`,
+          {
+            seriesCount: seriesKeys.length,
+            serializedChars: fitted.fixedChars,
+            budgetChars: RESPONSE_BUDGET_CHARS,
+            ...(capacity ? { recovery: { hint: AT_CAP_TOO_LARGE_HINT } } : {}),
+          },
+          capacity ? { cause: capacity } : undefined,
+        );
       }
       return fitted.result;
-    }
-
-    const instance = await canvas.acquire(input.canvas_id, ctx);
-    const tableName = `imf_${idGenerator.generateRandomString(8, TABLE_NAME_CHARS)}`;
-    const stageGuidance =
-      'The complete result is staged on DataCanvas. Call imf_dataframe_describe with canvas_id first to inspect tables and columns, then call imf_dataframe_query with canvas_id and SQL against table_name.';
-    const stagedBase = {
-      ...base,
-      staged: true,
-      canvas_id: instance.canvasId,
-      table_name: tableName,
-      retrieval_guidance: stageGuidance,
     };
 
-    const fitted = fitToBudget(
-      (count) => ({
-        ...stagedBase,
-        observations: selectedObservations.slice(0, count),
-        truncated: count < selectedObservations.length,
-      }),
-      selectedObservations.length,
-      notice,
-    );
-    if ('fixedChars' in fitted) {
-      throw tooLarge(
-        fitted.fixedChars,
-        "The staged result's full series metadata and retrieval handle require",
+    if (!canvas) return cutToBudget();
+
+    /**
+     * A staged result carries a preview bounded by count (STAGED_PREVIEW_SERIES).
+     * Acquisition refuses it two ways a caller can act on: a canvas_id that is
+     * gone, re-raised with this tool's recovery, and the canvas cap on a mint.
+     * Anything else, and any failure once the caller has cancelled, propagates
+     * untouched.
+     */
+    let instance: Awaited<ReturnType<typeof canvas.acquire>>;
+    try {
+      instance = await canvas.acquire(input.canvas_id, ctx);
+    } catch (err: unknown) {
+      if (ctx.signal.aborted || !(err instanceof McpError)) throw err;
+      const reason = err.data?.reason;
+      if (reason === 'canvas_not_found') {
+        throw ctx.fail(
+          'canvas_not_found',
+          `Canvas '${input.canvas_id}' is not found or has expired, so the result could not be staged on it.`,
+          { canvasId: input.canvas_id },
+          { cause: err },
+        );
+      }
+      if (reason !== 'canvas_capacity_exhausted') throw err;
+      if (explicit) {
+        throw ctx.fail(
+          'canvas_capacity_exhausted',
+          'DataCanvas is at its canvas cap, so output_mode="canvas" could not stage the result on a fresh canvas.',
+          undefined,
+          { cause: err },
+        );
+      }
+      /**
+       * An auto-mode caller never asked to stage, the data is already fetched,
+       * and under MCP_AUTH_MODE=none the occupied slots can be other callers',
+       * so the result is served the way a canvas-off one is. Nothing else
+       * records the cap once the refusal is answered here.
+       */
+      ctx.log.warning(
+        'DataCanvas is at its canvas cap; the over-budget result was returned inline, cut to the response budget',
+        { dataflowId, key, cap: err.data?.cap, activeCount: err.data?.activeCount },
       );
+      return cutToBudget(err);
     }
+    const tableName = `imf_${idGenerator.generateRandomString(8, TABLE_NAME_CHARS)}`;
+    const listCut = seriesKeys.length > STAGED_PREVIEW_SERIES;
+    const preview = stagedPreview(
+      selectedObservations,
+      new Set(seriesKeys.slice(0, STAGED_PREVIEW_SERIES)),
+    );
+    const stageGuidance =
+      'The complete result is staged on DataCanvas. Call imf_dataframe_describe with canvas_id first to inspect tables and columns, then call imf_dataframe_query with canvas_id and SQL against table_name.';
 
     /**
      * Column types are declared, not sniffed. Left to the framework, a column is
-     * typed from the first 100 rows, and rows stage time-ascending: a rate pegged
-     * at 1 for its first 100 months typed `value` BIGINT and truncated every later
-     * fraction, and a lead of null values kept for their status typed it VARCHAR.
-     * One entry per field of the row mapping below, in the same order.
+     * typed from the first 100 rows, and rows stage earliest period first: a rate
+     * pegged at 1 for its first 100 months typed `value` BIGINT and truncated every
+     * later fraction, and a lead of null values kept for their status typed it
+     * VARCHAR. One entry per field of the row mapping below, in the same order.
      */
     const schema: ColumnSchema[] = [
       { name: 'dataflow_id', type: 'VARCHAR' },
@@ -1989,7 +2069,21 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     });
     await instance.registerTable(tableName, rows, { schema, signal: ctx.signal });
 
-    return fitted.result;
+    return {
+      ...base,
+      ...(seriesMetadata
+        ? { series_metadata: seriesMetadata.slice(0, STAGED_PREVIEW_SERIES) }
+        : {}),
+      ...(listCut ? { series_count: seriesKeys.length } : {}),
+      observations: preview,
+      staged: true,
+      truncated: preview.length < selectedObservations.length,
+      canvas_id: instance.canvasId,
+      table_name: tableName,
+      retrieval_guidance: listCut
+        ? `${stageGuidance} series_metadata lists the first ${STAGED_PREVIEW_SERIES} of ${seriesKeys.length} series, and observations stops before the first row of any other; SELECT DISTINCT series_key, unit, scale, decimals, series_reference_period FROM ${tableName} ORDER BY series_key returns the attributes of all ${seriesKeys.length}.`
+        : stageGuidance,
+    } satisfies QueryDatasetResult;
   },
 
   format: formatQueryDataset,

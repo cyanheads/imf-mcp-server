@@ -35,7 +35,7 @@ await createApp({
     'IMF SDMX 3.0 macroeconomic data server. Keyless — no API key required.\n' +
     'Workflow: imf_list_databases → imf_get_database → imf_query_dataset\n' +
     'Country codes are ISO 3-letter (USA, GBR, DEU — not US, GB, DE).\n' +
-    'With DataCanvas on (the default; CANVAS_PROVIDER_TYPE=none turns it off), large multi-country queries spill to it, and imf_query_dataset output_mode="canvas" explicitly stages smaller results. For any staged result, call imf_dataframe_describe before imf_dataframe_query; when enabled, imf_dataframe_drop removes one completed table. Without DataCanvas, an over-budget result returns its earliest observations with truncated=true, and retrieval_guidance says how to narrow the query.\n' +
+    'With DataCanvas on (the default; CANVAS_PROVIDER_TYPE=none turns it off), large multi-country queries spill to it and return a preview (the first 20 series, at most 100 observations), and imf_query_dataset output_mode="canvas" explicitly stages smaller results. For any staged result, call imf_dataframe_describe before imf_dataframe_query; when enabled, imf_dataframe_drop removes one completed table. Without DataCanvas, or at its canvas cap on an auto-mode call without canvas_id, an over-budget result returns its earliest observations with truncated=true, and retrieval_guidance says how to narrow the query.\n' +
     'Key legacy note: the IFS monolithic database is decomposed — use CPI, ER, IL, MFS_* instead.',
   setup(core) {
     const cfg = getServerConfig();
