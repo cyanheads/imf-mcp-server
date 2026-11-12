@@ -246,8 +246,8 @@ errors: [
     when: 'sql is not a single SELECT statement, or is SELECT-shaped but fails to prepare',
     recovery: 'Send exactly one SELECT (or WITH … SELECT) statement and check names against imf_dataframe_describe.' },
   { reason: 'sql_not_permitted', code: ValidationError,
-    when: 'sql parses as SELECT but the read-only gate refuses it — external-data/PRAGMA table function, system catalog, a non-allowlisted plan operator, or a file named instead of a staged table',
-    recovery: 'Query only the tables listed by imf_dataframe_describe using plain SELECT features.' },
+    when: 'sql parses as SELECT but the read-only gate refuses it — external-data/PRAGMA table function, a system catalog read or named (an alias or CTE spelled like a DuckDB metadata view counts), a non-allowlisted plan operator, or a file named instead of a staged table',
+    recovery: 'Query only the tables listed by imf_dataframe_describe using plain SELECT features. An alias spelled like a DuckDB metadata view is refused the same way: rename it.' },
   { reason: 'sql_execution_error', code: ValidationError,
     when: 'sql prepares but fails while it runs, such as a failed cast or an arithmetic overflow',
     recovery: 'Use TRY_CAST for a conversion that can fail, cast to a wider type such as HUGEINT or DOUBLE before arithmetic that can overflow, or filter out the rows the message names.' },
@@ -257,7 +257,7 @@ errors: [
 ]
 ```
 
-Every reason the DataCanvas gate and engine can raise on `query()` is mapped onto one of these five (`canvas_not_found`, `missing_table`, `invalid_sql`, `sql_not_permitted`, `sql_execution_error`) before it leaves the handler: the engine's `sql_read_only` file refusal becomes `sql_not_permitted`, and `sql_parse_error` needs no entry because SELECT-shaped SQL that fails to parse surfaces as the gate's `invalid_sql`. The framework's own hints name `registerTable()` / `describe()`, which no MCP client can call.
+Every reason the DataCanvas gate and engine can raise on `query()` is mapped onto one of these five (`canvas_not_found`, `missing_table`, `invalid_sql`, `sql_not_permitted`, `sql_execution_error`) before it leaves the handler: the gate's `sql_read_only` refusal of a statement naming a file becomes `sql_not_permitted`, and `sql_parse_error` needs no entry because SELECT-shaped SQL that fails to parse surfaces as the gate's `invalid_sql`. The framework's own hints name `registerTable()` / `describe()`, which no MCP client can call.
 
 **Additional error contract on `imf_dataframe_drop`:**
 ```
