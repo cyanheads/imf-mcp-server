@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-11-12 · ⚠️ Breaking
+
+Staged imf_query_dataset results carry a count-bounded preview, so a wide key like WEO *.*.A stages instead of failing; mixed-frequency results sort by the dates their periods span; availability end dates are inclusive; canvas errors are declared. imf_dataframe_query now refuses SQL that names a DuckDB metadata view as an alias.
+
 ## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-10-29
 
 Publishes the imf-guide Agent Skill over MCP (skill://imf-guide/SKILL.md), turns DataCanvas on by default (CANVAS_PROVIDER_TYPE=none turns it off), stops startup with the variable named on an invalid IMF_REQUEST_TIMEOUT_MS or other bad setting, and moves to mcp-ts-core 0.13.18.
