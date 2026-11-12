@@ -1623,6 +1623,32 @@ describe('imfDataframeQuery over a DuckDB canvas', () => {
   });
 
   it.each([
+    `SELECT value AS duckdb_tables FROM ${table}`,
+    `SELECT value AS "Pg_Class" FROM ${table}`,
+    `WITH sqlite_schema AS (SELECT * FROM ${table}) SELECT count(*) AS n FROM sqlite_schema`,
+    `SELECT pg_tables.value FROM ${table} AS pg_tables`,
+    'SELECT pg_proc.n FROM (SELECT 1 AS n) pg_proc',
+  ])(
+    'refuses a name spelled like a DuckDB metadata view, with a recovery that says to rename it: %s',
+    async (sql) => {
+      const err = contractError(await run(sql));
+
+      expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
+      expect(err.data?.reason).toBe('sql_not_permitted');
+      expect(err.data?.recovery).toMatchObject({ hint: expect.stringContaining('rename it') });
+    },
+  );
+
+  it('answers an alias that only starts like a DuckDB metadata view', async () => {
+    const call = await run(`SELECT value AS duckdb_tables_x FROM ${table} ORDER BY time_period`);
+
+    expect(imfDataframeQuery.output.parse(call.structuredContent).rows).toEqual([
+      { duckdb_tables_x: 101.5 },
+      { duckdb_tables_x: 102.1 },
+    ]);
+  });
+
+  it.each([
     `SELECT CAST(series_key AS INTEGER) FROM ${table}`,
     `SELECT 9223372036854775807::BIGINT + 1::BIGINT FROM ${table}`,
   ])('#68 reports a data failure as sql_execution_error: %s', async (sql) => {

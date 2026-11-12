@@ -390,10 +390,10 @@ const imfDataframeQueryDefinition = tool('imf_dataframe_query', {
     {
       reason: 'sql_not_permitted',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'sql parses as a SELECT but the read-only gate refuses it — it calls an external-data or PRAGMA table function, reads a system catalog, plans an operator outside the read-only allowlist, or names a file instead of a staged table',
+      when: 'sql parses as a SELECT but the read-only gate refuses it — it calls an external-data or PRAGMA table function, reads or names a system catalog (a column alias, CTE name, or table alias spelled like a DuckDB metadata view counts), plans an operator outside the read-only allowlist, or names a file instead of a staged table',
       severity: 'warning',
       recovery:
-        'Query only the tables listed by imf_dataframe_describe using plain SELECT features; file-reading functions and catalog introspection are not available here.',
+        'Query only the tables listed by imf_dataframe_describe using plain SELECT features; file-reading functions and catalog introspection are not available here. A column alias, CTE name, or table alias spelled like a DuckDB metadata view (duckdb_tables, pg_class) is refused the same way: rename it.',
     },
     {
       reason: 'sql_execution_error',
