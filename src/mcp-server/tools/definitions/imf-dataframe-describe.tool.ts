@@ -39,7 +39,11 @@ const imfDataframeDescribeDefinition = tool('imf_dataframe_describe', {
                     name: z
                       .string()
                       .describe('Column name — use this in SELECT and WHERE clauses.'),
-                    type: z.string().describe('DuckDB column type, e.g. VARCHAR, DOUBLE, BIGINT.'),
+                    type: z
+                      .string()
+                      .describe(
+                        'DuckDB column type as the engine spells it, e.g. VARCHAR, DOUBLE, BIGINT, DECIMAL(10,2), INTEGER[].',
+                      ),
                   })
                   .describe('A single column definition.'),
               )
@@ -79,7 +83,7 @@ const imfDataframeDescribeDefinition = tool('imf_dataframe_describe', {
       });
     }
 
-    const tableInfos = await instance.describe();
+    const tableInfos = await instance.describe({ signal: ctx.signal });
     ctx.log.info('Canvas described', { canvasId: input.canvas_id, tables: tableInfos.length });
 
     return {
@@ -87,7 +91,10 @@ const imfDataframeDescribeDefinition = tool('imf_dataframe_describe', {
       tables: tableInfos.map((t) => ({
         name: t.name,
         row_count: t.rowCount,
-        columns: t.columns.map((c) => ({ name: c.name, type: c.type })),
+        // `type` is a coarse registration tag (DECIMAL and LIST read VARCHAR). The
+        // DuckDB provider sets `engineType` on every column; it is optional only in
+        // the type, for a hand-built TableInfo.
+        columns: t.columns.map((c) => ({ name: c.name, type: c.engineType ?? c.type })),
       })),
       table_count: tableInfos.length,
     };

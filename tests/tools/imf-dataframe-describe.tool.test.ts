@@ -3,10 +3,14 @@
  * @module tests/tools/imf-dataframe-describe.tool.test
  */
 
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { z } from '@cyanheads/mcp-ts-core';
+import { CanvasRegistry, DataCanvas, DuckdbProvider } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/canvas/canvas-accessor.js', () => ({
   getCanvas: vi.fn(),
@@ -195,6 +199,115 @@ describe('imfDataframeDescribe', () => {
         // The pattern alone says nothing about where an id comes from.
         description: expect.stringContaining('imf_query_dataset'),
       });
+    });
+  });
+});
+
+describe('imfDataframeDescribe over a DuckDB canvas', () => {
+  let canvas: DataCanvas;
+  let exportRoot: string;
+  let stagedId: string;
+  let emptyId: string;
+
+  beforeAll(async () => {
+    exportRoot = await mkdtemp(join(tmpdir(), 'imf-dataframe-describe-test-'));
+    const provider = new DuckdbProvider({
+      defaultRowLimit: 10_000,
+      exportRootPath: exportRoot,
+      memoryLimitMb: 256,
+      schemaSniffRows: 100,
+    });
+    canvas = new DataCanvas(provider, new CanvasRegistry(provider));
+    const ctx = createMockContext({ tenantId: 'test' });
+    const staged = await canvas.acquire(undefined, ctx);
+    stagedId = staged.canvasId;
+    await staged.registerTable('spilled_cpi', [
+      { series_key: 'USA.CPI.CP01.IX.M', time_period: '2024-01', value: 101.5 },
+      { series_key: 'USA.CPI.CP01.IX.M', time_period: '2024-02', value: 102.1 },
+    ]);
+    // Engine types the coarse registration tags cannot name.
+    await staged.query('SELECT 1.25::DECIMAL(10,2) AS amount, [1, 2] AS codes, 7::SMALLINT AS n', {
+      registerAs: 'typed',
+    });
+    emptyId = (await canvas.acquire(undefined, ctx)).canvasId;
+  });
+
+  afterAll(async () => {
+    await canvas.shutdown(createMockContext({ tenantId: 'test' }));
+    await rm(exportRoot, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    (getCanvas as ReturnType<typeof vi.fn>).mockReturnValue(canvas);
+  });
+
+  const call = (canvas_id: string) =>
+    runToolContract(imfDataframeDescribe, imfDataframeDescribe.input.parse({ canvas_id }), {
+      context: { tenantId: 'test' },
+    });
+
+  const textOf = (result: Awaited<ReturnType<typeof call>>) =>
+    (result.content as Array<{ type: string; text: string }>)[0]!.text;
+
+  const tableNamed = (result: Awaited<ReturnType<typeof call>>, name: string) =>
+    imfDataframeDescribe.output.parse(result.structuredContent).tables.find((t) => t.name === name);
+
+  it('reports a staged observation table on both surfaces', async () => {
+    const result = await call(stagedId);
+
+    expect(tableNamed(result, 'spilled_cpi')).toEqual({
+      name: 'spilled_cpi',
+      row_count: 2,
+      columns: [
+        { name: 'series_key', type: 'VARCHAR' },
+        { name: 'time_period', type: 'VARCHAR' },
+        { name: 'value', type: 'DOUBLE' },
+      ],
+    });
+    const text = textOf(result);
+    expect(text).toContain('### spilled_cpi (2 rows)');
+    expect(text).toContain('| series_key | VARCHAR |');
+    expect(text).toContain('| value | DOUBLE |');
+  });
+
+  it('reports a canvas with nothing staged as zero tables on both surfaces', async () => {
+    const result = await call(emptyId);
+
+    expect(imfDataframeDescribe.output.parse(result.structuredContent)).toEqual({
+      canvas_id: emptyId,
+      tables: [],
+      table_count: 0,
+    });
+    expect(textOf(result)).toBe(`**Canvas:** \`${emptyId}\`\n**Tables:** 0\n`);
+  });
+
+  it("reports each column's type as the engine spells it, on both surfaces", async () => {
+    const result = await call(stagedId);
+
+    expect(tableNamed(result, 'typed')?.columns).toEqual([
+      { name: 'amount', type: 'DECIMAL(10,2)' },
+      { name: 'codes', type: 'INTEGER[]' },
+      { name: 'n', type: 'SMALLINT' },
+    ]);
+    const text = textOf(result);
+    expect(text).toContain('| amount | DECIMAL(10,2) |');
+    expect(text).toContain('| codes | INTEGER[] |');
+    expect(text).toContain('| n | SMALLINT |');
+  });
+
+  it("passes the caller's cancellation to the canvas describe", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const ctx = createMockContext({
+      tenantId: 'test',
+      signal: controller.signal,
+      errors: imfDataframeDescribe.errors,
+    });
+    const input = imfDataframeDescribe.input.parse({ canvas_id: stagedId });
+
+    await expect(imfDataframeDescribe.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'cancelled' },
     });
   });
 });
