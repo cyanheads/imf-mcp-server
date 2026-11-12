@@ -137,12 +137,16 @@ export const imfGetDatabase = tool('imf_get_database', {
       .string()
       .nullable()
       .optional()
-      .describe('Earliest period with published data, or null when the constraint omits it.'),
+      .describe(
+        'First day with published data in any series, as YYYY-MM-DD, e.g. 1980-01-01. Null when the constraint omits it or names no calendar date.',
+      ),
     time_period_end: z
       .string()
       .nullable()
       .optional()
-      .describe('Latest period with published data, or null when the constraint omits it.'),
+      .describe(
+        'Last day with published data in any series, inclusive, as YYYY-MM-DD, e.g. 2031-12-31 when the latest period is 2031. imf_query_dataset accepts it as start_period or end_period. Null when the constraint omits it or names no calendar date.',
+      ),
     dimension_id: z
       .string()
       .optional()

@@ -1207,21 +1207,32 @@ describe('ImfSdmxService.fetchDataflowStructure', () => {
 
 // --- #26: availability constraint parsing ----------------------------------------
 
-/** Builds an availableconstraint response with the annotation and cube-region shapes IMF emits. */
-function availabilityXml(seriesCount: number, dimensions: Record<string, string[]>): string {
+/**
+ * Builds an availableconstraint response with the annotation and cube-region shapes IMF emits.
+ * The time annotations default to WEO's live `[1980-01-01, 2032-01-01)`; null omits one.
+ */
+function availabilityXml(
+  seriesCount: number,
+  dimensions: Record<string, string[]>,
+  time: { start: string | null; end: string | null } = { start: '1980-01-01', end: '2032-01-01' },
+): string {
   const keyValues = Object.entries(dimensions)
     .map(
       ([dim, codes]) =>
         `<com:KeyValue id="${dim}">${codes.map((c) => `<com:Value>${c}</com:Value>`).join('')}</com:KeyValue>`,
     )
     .join('');
+  const timeAnnotation = (id: string, title: string | null) =>
+    title === null
+      ? ''
+      : `<com:Annotation id="${id}"><com:AnnotationTitle>${title}</com:AnnotationTitle></com:Annotation>`;
   return `<?xml version="1.0" encoding="utf-8"?>
 <mes:Structure xmlns:mes="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message" xmlns:com="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/common">
   <str:ContentConstraint xmlns:str="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/structure">
     <com:Annotations>
       <com:Annotation id="series_count"><com:AnnotationTitle>${seriesCount}</com:AnnotationTitle></com:Annotation>
-      <com:Annotation id="time_period_start"><com:AnnotationTitle>1980-01-01</com:AnnotationTitle></com:Annotation>
-      <com:Annotation id="time_period_end"><com:AnnotationTitle>2032-01-01</com:AnnotationTitle></com:Annotation>
+      ${timeAnnotation('time_period_start', time.start)}
+      ${timeAnnotation('time_period_end', time.end)}
     </com:Annotations>
     <str:CubeRegion>${keyValues}</str:CubeRegion>
   </str:ContentConstraint>
@@ -1304,7 +1315,46 @@ describe('ImfSdmxService.fetchAvailabilityConstraint (#26)', () => {
 
     expect(result?.series_count).toBe(0);
     expect(result?.time_period_start).toBe('1980-01-01');
-    expect(result?.time_period_end).toBe('2032-01-01');
+    // The constraint's end is exclusive; the last day with data is the day before.
+    expect(result?.time_period_end).toBe('2031-12-31');
+  });
+
+  it('#72 reports a time bound that is absent or not a calendar date as null', async () => {
+    fetchWithTimeout.mockResolvedValue({
+      status: 200,
+      ok: true,
+      text: () =>
+        Promise.resolve(availabilityXml(52, { FREQUENCY: ['A'] }, { start: null, end: '2032' })),
+    });
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const result = await svc.fetchAvailabilityConstraint(flow('WEO'), 'USA', ctx);
+
+    expect(result).toMatchObject({ time_period_start: null, time_period_end: null });
+  });
+
+  it('#72 reads a bound whose annotation text is padded with whitespace as its date', async () => {
+    fetchWithTimeout.mockResolvedValue({
+      status: 200,
+      ok: true,
+      text: () =>
+        Promise.resolve(
+          availabilityXml(
+            52,
+            { FREQUENCY: ['A'] },
+            { start: '\n  1980-01-01\n', end: ' 2032-01-01 ' },
+          ),
+        ),
+    });
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const result = await svc.fetchAvailabilityConstraint(flow('WEO'), 'USA', ctx);
+
+    // The strict calendar-day read would null a padded bound the portal's text still names.
+    expect(result).toMatchObject({
+      time_period_start: '1980-01-01',
+      time_period_end: '2031-12-31',
+    });
   });
 
   it('returns null rather than throwing when the availability lookup fails', async () => {
@@ -1372,8 +1422,24 @@ describe('ImfSdmxService.fetchDataflowAvailability (#47)', () => {
         UNIT_MEASURE: ['PT', 'USD'],
       },
       time_period_start: '1980-01-01',
-      time_period_end: '2032-01-01',
+      time_period_end: '2031-12-31',
     });
+  });
+
+  it('#72 reports a time bound that is absent or not a calendar date as null', async () => {
+    fetchWithTimeout.mockResolvedValue({
+      status: 200,
+      ok: true,
+      text: () =>
+        Promise.resolve(
+          availabilityXml(1, { COUNTRY: ['USA'] }, { start: '1980-13-01', end: null }),
+        ),
+    });
+    const ctx = createMockContext({ tenantId: 'test' });
+
+    const result = await svc.fetchDataflowAvailability(flow('WEO'), ctx);
+
+    expect(result).toMatchObject({ time_period_start: null, time_period_end: null });
   });
 
   it.each([
@@ -1521,6 +1587,21 @@ describe('ImfSdmxService availability requests name the dataflow by agency, id, 
       `${AVAILABILITY_BASE}/IMF.SPR,GPT,1.0.1/`,
       `${AVAILABILITY_BASE}/IMF.SPR,GPT,2.0.0/`,
     ]);
+  });
+
+  it('ignores an entry cached under the key that held the exclusive end (#72)', async () => {
+    const ctx = createMockContext({ tenantId: 'test' });
+    await ctx.state.set('imf/availability/dataflow/IMF.SPR/GPT/1.0.1', {
+      series_count: 999,
+      available_codes: {},
+      time_period_start: '1980-01-01',
+      time_period_end: '2032-01-01',
+    });
+
+    const result = await svc.fetchDataflowAvailability(GPT, ctx);
+
+    expect(requestedUrls()).toEqual([`${AVAILABILITY_BASE}/IMF.SPR,GPT,1.0.1/`]);
+    expect(result.series_count).toBe(821);
   });
 });
 
@@ -3396,6 +3477,133 @@ describe('ImfSdmxService.fetchData observation status (#57)', () => {
       },
     ]);
   });
+});
+
+// --- #74: observations in the order of the dates their periods span ------------
+
+/** 1996 at each frequency `CPI` publishes, as the portal labels its periods. */
+const CPI_1996_LABELS = {
+  A: ['1996'],
+  Q: ['1996-Q1', '1996-Q2', '1996-Q3', '1996-Q4'],
+  M: Array.from({ length: 12 }, (_, month) => `1996-M${String(month + 1).padStart(2, '0')}`),
+};
+
+/**
+ * A `CPI`-shaped response for `USA+GBR.CPI.*` over the given frequencies of
+ * 1996. One TIME_PERIOD list holds every frequency's labels and each series
+ * indexes its own, as a mixed-frequency key returns them; `listOrder` puts that
+ * list in time order or against it, so neither sort can pass on list order.
+ */
+const cpi1996Payload = (
+  frequencies: Array<keyof typeof CPI_1996_LABELS>,
+  listOrder: 'ascending' | 'descending',
+) => {
+  const ascending = frequencies.flatMap((frequency) => CPI_1996_LABELS[frequency]);
+  const labels = listOrder === 'ascending' ? ascending : ascending.toReversed();
+  const series = Object.fromEntries(
+    [0, 1].flatMap((country) =>
+      frequencies.map((frequency, frequencyIndex) => [
+        `${country}:0:${frequencyIndex}`,
+        {
+          attributes: [],
+          observations: Object.fromEntries(
+            CPI_1996_LABELS[frequency].map((label) => [String(labels.indexOf(label)), ['1.5']]),
+          ),
+        },
+      ]),
+    ),
+  );
+  return {
+    data: {
+      dataSets: [{ series }],
+      structures: [
+        {
+          attributes: { series: [], observation: [] },
+          dimensions: {
+            series: [
+              { id: 'COUNTRY', values: [{ id: 'USA' }, { id: 'GBR' }] },
+              { id: 'INDEX_TYPE', values: [{ id: 'CPI' }] },
+              { id: 'FREQUENCY', values: frequencies.map((id) => ({ id })) },
+            ],
+            observation: [{ id: 'TIME_PERIOD', values: labels.map((value) => ({ value })) }],
+          },
+        },
+      ],
+    },
+  };
+};
+
+describe('ImfSdmxService.fetchData observation order (#74)', () => {
+  let svc: ImfSdmxService;
+
+  beforeEach(() => {
+    fetchWithTimeout.mockReset();
+    svc = new ImfSdmxService(
+      {} as AppConfig,
+      {} as StorageService,
+      'https://api.imf.org/external/sdmx/3.0',
+      30_000,
+    );
+  });
+
+  /** Each returned row as `<country> <time_period>`, in result order. */
+  const decodedOrder = async (payload: unknown) => {
+    fetchWithTimeout.mockResolvedValue({
+      status: 200,
+      ok: true,
+      text: () => Promise.resolve(JSON.stringify(payload)),
+    });
+    const result = await svc.fetchData(
+      'IMF.STA',
+      'CPI',
+      '5.0.0',
+      'USA+GBR.CPI.*',
+      undefined,
+      undefined,
+      createMockContext({ tenantId: 'test' }),
+    );
+    return result.observations.map((obs) => `${obs.series_key.slice(0, 3)} ${obs.time_period}`);
+  };
+
+  it.each(['ascending', 'descending'] as const)(
+    'orders a mixed A/Q/M result by the dates each period spans (labels %s)',
+    async (listOrder) => {
+      const order = await decodedOrder(cpi1996Payload(['A', 'Q', 'M'], listOrder));
+
+      // A month, then the quarter it opens, then the year: shorter first on a shared first day.
+      const periods = [
+        '1996-M01',
+        '1996-Q1',
+        '1996',
+        '1996-M02',
+        '1996-M03',
+        '1996-M04',
+        '1996-Q2',
+        '1996-M05',
+        '1996-M06',
+        '1996-M07',
+        '1996-Q3',
+        '1996-M08',
+        '1996-M09',
+        '1996-M10',
+        '1996-Q4',
+        '1996-M11',
+        '1996-M12',
+      ];
+      expect(order).toEqual(periods.flatMap((period) => [`USA ${period}`, `GBR ${period}`]));
+    },
+  );
+
+  it.each(['ascending', 'descending'] as const)(
+    'keeps a single-frequency result in label order (labels %s)',
+    async (listOrder) => {
+      const order = await decodedOrder(cpi1996Payload(['M'], listOrder));
+
+      expect(order).toEqual(
+        CPI_1996_LABELS.M.flatMap((period) => [`USA ${period}`, `GBR ${period}`]),
+      );
+    },
+  );
 });
 
 // --- #64: reference periods on the series row and on each observation -----------

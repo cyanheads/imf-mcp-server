@@ -15,6 +15,7 @@ vi.mock('@/services/imf-sdmx/imf-sdmx-service.js', () => ({
 
 import { imfGetDatabase } from '@/mcp-server/tools/definitions/imf-get-database.tool.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
+import { constraintTimeRange } from '@/services/imf-sdmx/time-period.js';
 
 const MOCK_DATAFLOW = {
   id: 'WEO',
@@ -61,8 +62,8 @@ const MOCK_AVAILABILITY = {
     INDICATOR: ['NGDP_RPCH', 'UNKNOWN_INDICATOR'],
     FREQUENCY: ['A'],
   },
-  time_period_start: '1980-01-01',
-  time_period_end: '2032-01-01',
+  // The service's reading of WEO's live annotations, the half-open [1980-01-01, 2032-01-01).
+  ...constraintTimeRange('1980-01-01', '2032-01-01'),
 };
 
 /**
@@ -227,8 +228,10 @@ describe('imfGetDatabase', () => {
       available_only: true,
       series_count: 8200,
       time_period_start: '1980-01-01',
-      time_period_end: '2032-01-01',
+      time_period_end: '2031-12-31',
     });
+    // #72: content[] states the same inclusive range structuredContent carries.
+    expect(text).toContain('**Available time range:** 1980-01-01 – 2031-12-31');
     expect(structured.dimensions.map((dimension) => dimension.id)).toEqual([
       'COUNTRY',
       'INDICATOR',

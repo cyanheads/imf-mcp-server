@@ -17,7 +17,9 @@
  * recovery that fails is reported with the concepts it left null. A reference
  * (base) period is read from the series row and from each observation, each
  * scope on its own; the SDMX 2.1 availability constraint is parsed for no-data enrichment, listing
- * a dimension's codes up to AVAILABILITY_CODE_CAP alongside the pre-cap total.
+ * a dimension's codes up to AVAILABILITY_CODE_CAP alongside the pre-cap total, with its
+ * half-open time coverage reported as the first and last days with data. Observations
+ * are returned in the order of the dates their periods span.
  * @module services/imf-sdmx/imf-sdmx-service
  */
 
@@ -33,6 +35,7 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { constraintTimeRange, sortByPeriod } from './time-period.js';
 import type {
   AvailabilityDimension,
   AvailabilityResult,
@@ -97,6 +100,24 @@ function callBudgetSpent(): McpError {
  * valid code as uncovered.
  */
 const AVAILABILITY_CODE_CAP = 20;
+
+/**
+ * An availability constraint's time coverage, read from its `time_period_start`
+ * and `time_period_end` annotations (the cube region carries no TimeRange) as
+ * the first and last days with data — see constraintTimeRange().
+ */
+function constraintCoverage(
+  xml: string,
+): Pick<AvailabilityResult, 'time_period_start' | 'time_period_end'> {
+  return constraintTimeRange(
+    /id="time_period_start"[^>]*>[\s\S]*?<com:AnnotationTitle>([^<]+)<\/com:AnnotationTitle>/i
+      .exec(xml)?.[1]
+      ?.trim(),
+    /id="time_period_end"[^>]*>[\s\S]*?<com:AnnotationTitle>([^<]+)<\/com:AnnotationTitle>/i
+      .exec(xml)?.[1]
+      ?.trim(),
+  );
+}
 
 /**
  * Client-facing text for a failed dataflow-list fetch. Deliberately says nothing
@@ -1287,7 +1308,8 @@ export class ImfSdmxService {
     signal?: AbortSignal,
   ): Promise<DataflowAvailabilityResult> {
     const { agencyId, id: dataflowId, version } = dataflow;
-    const cacheKey = `imf/availability/dataflow/${agencyId}/${dataflowId}/${version}`;
+    // v2: time_period_end became the inclusive last day; a v1 entry on a persistent store holds the exclusive end.
+    const cacheKey = `imf/availability/v2/dataflow/${agencyId}/${dataflowId}/${version}`;
     const cached = await ctx.state.get<DataflowAvailabilityResult>(cacheKey);
     if (cached) {
       ctx.log.debug('Dataflow availability served from cache', { agencyId, dataflowId, version });
@@ -1344,18 +1366,6 @@ export class ImfSdmxService {
       /id="series_count"[^>]*>[\s\S]*?<com:AnnotationTitle>(\d+)<\/com:AnnotationTitle>/i.exec(xml);
     const series_count = seriesCountMatch ? parseInt(seriesCountMatch[1] ?? '0', 10) : 0;
 
-    // time_period_start / time_period_end annotations
-    const tpsMatch =
-      /id="time_period_start"[^>]*>[\s\S]*?<com:AnnotationTitle>([^<]+)<\/com:AnnotationTitle>/i.exec(
-        xml,
-      );
-    const tpeMatch =
-      /id="time_period_end"[^>]*>[\s\S]*?<com:AnnotationTitle>([^<]+)<\/com:AnnotationTitle>/i.exec(
-        xml,
-      );
-    const time_period_start = tpsMatch?.[1]?.trim() ?? null;
-    const time_period_end = tpeMatch?.[1]?.trim() ?? null;
-
     // Cube region KeyValues: <com:KeyValue id="DIMENSION"> <com:Value>CODE</com:Value> ... </com:KeyValue>
     const available_codes: Record<string, AvailabilityDimension> = {};
     for (const kvMatch of xml.matchAll(
@@ -1378,7 +1388,7 @@ export class ImfSdmxService {
       }
     }
 
-    return { series_count, available_codes, time_period_start, time_period_end };
+    return { series_count, available_codes, ...constraintCoverage(xml) };
   }
 
   /** Parse an uncapped dataflow-wide availability constraint for discovery. */
@@ -1387,15 +1397,6 @@ export class ImfSdmxService {
       /id="series_count"[^>]*>[\s\S]*?<com:AnnotationTitle>(\d+)<\/com:AnnotationTitle>/i.exec(xml);
     if (!seriesCountMatch) return null;
     const series_count = Number.parseInt(seriesCountMatch[1] ?? '0', 10);
-
-    const tpsMatch =
-      /id="time_period_start"[^>]*>[\s\S]*?<com:AnnotationTitle>([^<]+)<\/com:AnnotationTitle>/i.exec(
-        xml,
-      );
-    const tpeMatch =
-      /id="time_period_end"[^>]*>[\s\S]*?<com:AnnotationTitle>([^<]+)<\/com:AnnotationTitle>/i.exec(
-        xml,
-      );
 
     const availableCodes = new Map<string, Set<string>>();
     for (const kvMatch of xml.matchAll(
@@ -1419,12 +1420,7 @@ export class ImfSdmxService {
       [...availableCodes].map(([dimensionId, values]) => [dimensionId, [...values]]),
     );
 
-    return {
-      series_count,
-      available_codes,
-      time_period_start: tpsMatch?.[1]?.trim() ?? null,
-      time_period_end: tpeMatch?.[1]?.trim() ?? null,
-    };
+    return { series_count, available_codes, ...constraintCoverage(xml) };
   }
 
   // ---------------------------------------------------------------------------
@@ -1822,15 +1818,13 @@ export class ImfSdmxService {
       }
     }
 
-    // Sort observations by time_period
-    observations.sort((a, b) => a.time_period.localeCompare(b.time_period));
-
     return {
       dataflowId,
       key,
       ...(startPeriod ? { startPeriod } : {}),
       ...(endPeriod ? { endPeriod } : {}),
-      observations,
+      // Oldest period first, across frequencies — the order every consumer's prefix assumes.
+      observations: sortByPeriod(observations),
       seriesAttributes: firstSeriesAttributes ?? { unit: null, scale: null, decimals: null },
       seriesAttributesByKey,
     };

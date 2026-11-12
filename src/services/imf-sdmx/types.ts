@@ -250,9 +250,16 @@ export interface AvailabilityResult {
   available_codes: Record<string, AvailabilityDimension>;
   /** Total series count for the queried constraint. 0 = code not covered at all. */
   series_count: number;
-  /** Latest period with data, if present in the constraint annotations. */
+  /**
+   * Last day with data, inclusive, as `YYYY-MM-DD` — the day before the
+   * constraint's exclusive `time_period_end` annotation. Null when the
+   * annotation is absent or names no calendar day.
+   */
   time_period_end: string | null;
-  /** Earliest period with data, if present in the constraint annotations. */
+  /**
+   * First day with data, as `YYYY-MM-DD`, from the constraint's
+   * `time_period_start` annotation. Null when it is absent or names no calendar day.
+   */
   time_period_start: string | null;
 }
 
@@ -266,9 +273,9 @@ export interface DataflowAvailabilityResult {
   available_codes: Record<string, string[]>;
   /** Total series published by the dataflow. */
   series_count: number;
-  /** Latest period with data, if present in the constraint annotations. */
+  /** Last day with data in any series, inclusive — read as on AvailabilityResult. */
   time_period_end: string | null;
-  /** Earliest period with data, if present in the constraint annotations. */
+  /** First day with data in any series — read as on AvailabilityResult. */
   time_period_start: string | null;
 }
 
