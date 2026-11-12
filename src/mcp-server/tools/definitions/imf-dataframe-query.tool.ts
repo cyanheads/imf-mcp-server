@@ -11,11 +11,12 @@ import { clipTableCell, lineBreaksAsSpaces, tableCell } from '@/mcp-server/markd
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 
 /**
- * Cheap pre-canvas shape check, deliberately identical to the framework gate's own
- * `isSelectShaped` test. It exists so `invalid_sql` stays reachable when the canvas
- * is disabled (#2) — the authoritative statement-type check lives in the framework
- * and runs against DuckDB's parser, which types `WITH … SELECT` as SELECT and
- * `WITH … INSERT` as INSERT.
+ * Cheap pre-canvas shape check: SELECT or WITH only, narrower than the framework
+ * gate, which classifies a statement from DuckDB's parse of it and also admits
+ * FROM-first, VALUES, SHOW, DESCRIBE, and parenthesized reads. It exists so
+ * `invalid_sql` stays reachable when the canvas is disabled (#2) — the
+ * authoritative statement-type check lives in the framework, where DuckDB types
+ * `WITH … SELECT` as SELECT and `WITH … INSERT` as INSERT.
  */
 const SELECT_SHAPED = /^\s*(?:SELECT|WITH)\b/i;
 const RESPONSE_ENVELOPE_CHAR_LIMIT = 100_000;
@@ -307,7 +308,7 @@ const CANVAS_REASON_MAP: Record<string, ContractReason> = {
   denied_function_in_plan: 'sql_not_permitted',
   plan_operator_not_allowed: 'sql_not_permitted',
   system_catalog_access: 'sql_not_permitted',
-  // The engine's refusal of a file named in the SQL.
+  // A statement naming a file, refused by the gate whether or not the file exists.
   sql_read_only: 'sql_not_permitted',
   // Prepared cleanly, then failed on the staged data (a cast, an overflow).
   sql_execution_error: 'sql_execution_error',

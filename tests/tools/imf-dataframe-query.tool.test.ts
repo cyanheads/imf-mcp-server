@@ -1396,9 +1396,8 @@ describe('imfDataframeQuery', () => {
   // #68: file reads and execution failures arrive under declared reasons
   // -------------------------------------------------------------------------
 
-  it('#68 maps sql_read_only onto sql_not_permitted and keeps the engine message', async () => {
-    const message =
-      'Canvas SQL rejected: Permission Error: Cannot access file "x.csv" - file system operations are disabled by configuration';
+  it('#68 maps sql_read_only onto sql_not_permitted and keeps the gate message', async () => {
+    const message = 'Canvas SQL rejected: "x.csv" names a file, not a staged table.';
     mockCanvasQuery({
       reject: new McpError(JsonRpcErrorCode.ValidationError, message, { reason: 'sql_read_only' }),
     });
@@ -1612,16 +1611,16 @@ describe('imfDataframeQuery over a DuckDB canvas', () => {
     ).toMatchObject({ text: expect.stringContaining('\nc1699: [object Object]\n```') });
   });
 
-  it.each(["SELECT * FROM 'x.csv'", `SELECT a.* FROM ${table} a JOIN 'y.parquet' b ON 1=1`])(
-    '#68 refuses a file read as sql_not_permitted: %s',
-    async (sql) => {
-      const err = contractError(await run(sql));
+  it.each([
+    ["SELECT * FROM 'x.csv'", 'x.csv'],
+    [`SELECT a.* FROM ${table} a JOIN 'y.parquet' b ON 1=1`, 'y.parquet'],
+  ])('#68 refuses a file read as sql_not_permitted: %s', async (sql, file) => {
+    const err = contractError(await run(sql));
 
-      expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
-      expect(err.data?.reason).toBe('sql_not_permitted');
-      expect(err.message).toMatch(/Cannot access file/);
-    },
-  );
+    expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(err.data?.reason).toBe('sql_not_permitted');
+    expect(err.message).toBe(`Canvas SQL rejected: "${file}" names a file, not a staged table.`);
+  });
 
   it.each([
     `SELECT CAST(series_key AS INTEGER) FROM ${table}`,
