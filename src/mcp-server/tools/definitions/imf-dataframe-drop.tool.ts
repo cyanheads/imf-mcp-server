@@ -46,7 +46,8 @@ const imfDataframeDropDefinition = tool('imf_dataframe_drop', {
       code: JsonRpcErrorCode.NotFound,
       when: 'canvas_id does not match any registered DataCanvas session (expired, wrong session, or canvas disabled)',
       severity: 'warning',
-      recovery: 'Re-run imf_query_dataset to obtain a fresh canvas_id.',
+      recovery:
+        'The canvas has expired or was never staged, and its tables went with it, so nothing is left to drop.',
     },
     {
       reason: 'invalid_table_name',

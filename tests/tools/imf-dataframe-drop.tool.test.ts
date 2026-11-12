@@ -25,6 +25,10 @@ let canvas: DataCanvas;
 let instance: CanvasInstance;
 let ctx: Parameters<typeof imfDataframeDrop.handler>[1];
 
+/** An expired canvas took its tables with it, so there is nothing to re-stage just to drop. */
+const NOT_FOUND_RECOVERY =
+  'The canvas has expired or was never staged, and its tables went with it, so nothing is left to drop.';
+
 async function createRealCanvas(): Promise<void> {
   const provider = new DuckdbProvider({
     defaultRowLimit: 10_000,
@@ -222,9 +226,25 @@ describe('imfDataframeDrop', () => {
       code: JsonRpcErrorCode.NotFound,
       data: {
         reason: 'canvas_not_found',
-        recovery: { hint: expect.stringContaining('imf_query_dataset') },
+        recovery: { hint: NOT_FOUND_RECOVERY },
       },
     });
+  });
+
+  it('tells a caller holding an unknown canvas_id that nothing is left to drop, on both surfaces', async () => {
+    const call = await runToolContract(
+      imfDataframeDrop,
+      { canvas_id: 'ZZZZZZZZZZ', table_name: 'target_table' },
+      { context: { tenantId: 'test' } },
+    );
+    const text = (call.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
+
+    expect(contractError(call)).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'canvas_not_found', recovery: { hint: NOT_FOUND_RECOVERY } },
+    });
+    expect(text).toContain(`Recovery: ${NOT_FOUND_RECOVERY}`);
+    expect(text).not.toContain('imf_query_dataset');
   });
 
   it('declares the mutating idempotent annotations and recovery contracts', () => {
@@ -239,7 +259,7 @@ describe('imfDataframeDrop', () => {
         expect.objectContaining({
           reason: 'canvas_not_found',
           code: JsonRpcErrorCode.NotFound,
-          recovery: expect.stringContaining('imf_query_dataset'),
+          recovery: NOT_FOUND_RECOVERY,
         }),
         expect.objectContaining({
           reason: 'invalid_table_name',
