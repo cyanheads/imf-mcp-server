@@ -1,6 +1,6 @@
 # imf-mcp-server - Directory Structure
 
-Generated on: 2026-10-29 08:53:24
+Generated on: 2026-11-12 11:29:58
 
 ```text
 imf-mcp-server/
@@ -173,6 +173,7 @@ imf-mcp-server/
 │   │   │   └── canvas-accessor.ts
 │   │   └── imf-sdmx/
 │   │       ├── imf-sdmx-service.ts
+│   │       ├── time-period.ts
 │   │       └── types.ts
 │   └── index.ts
 ├── tests/
@@ -188,7 +189,8 @@ imf-mcp-server/
 │   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   └── imf-sdmx/
-│   │       └── imf-sdmx-service.test.ts
+│   │       ├── imf-sdmx-service.test.ts
+│   │       └── time-period.test.ts
 │   ├── tools/
 │   │   ├── imf-dataframe-describe.tool.test.ts
 │   │   ├── imf-dataframe-drop.registry.test.ts

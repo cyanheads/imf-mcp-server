@@ -68,21 +68,21 @@ IMF macroeconomic data across 190 countries: World Economic Outlook projections,
 
 - Resolves terms to SDMX dimension codes (countries are ISO 3-letter: `USA`, not `US`) and returns `key_format`, the dot-separated dimension order `imf_query_dataset` requires
 - Codelist previews hold 50 entries; set `dimension_id` to page one dimension with `limit`/`offset` (at most 200 per page, `next_offset` names the rest), and `codelist_filter` to keep codes whose ID or name contains every word
-- `available_only=true` pages only the codes the dataflow publishes, with series count and time coverage; `agency_id`/`version` are auto-detected when omitted
+- `available_only=true` pages only the codes the dataflow publishes, with series count and the first and last day with data (`time_period_end` is inclusive); `agency_id`/`version` are auto-detected when omitted
 
 ---
 
 ### `imf_query_dataset` <sub>tool</sub>
 
 - Dot-separated key in DSD order, where `+` combines codes at a position and `*` matches all of them; codes and `dataflow_id` are case-insensitive. `start_period`/`end_period` accept `YYYY`, `YYYY-SN`, `YYYY-QN`, `YYYY-MM`, or `YYYY-MM-DD`, and `last_n_observations` (1–1,000,000) keeps each series' last N observations
-- Returns `time_period`, `value`, `status`, and series attributes (`unit`, `scale`, `decimals`, `reference_period` where published), with one `series_metadata` entry per series. Responses are held to 100,000 characters: with DataCanvas, larger results spill to it (`output_mode: "canvas"` forces staging, and `staged` reports storage); without it, the earliest observations return with `truncated: true` and `retrieval_guidance`
-- Key and range errors are `invalid_key_code` (with the nearest valid codes), `wildcard_in_code_list`, `key_too_long`, `response_too_large`, `no_data`, and `no_data_in_range`; a `+` key that partly returns lists the rest in `missing_series`. Upstream failures are `data_unavailable` and `rate_limited`, both retryable within a 45-second call budget
+- Returns `time_period`, `value`, `status`, and series attributes (`unit`, `scale`, `decimals`, `reference_period` where published), with one `series_metadata` entry per series. Inline responses are held to 100,000 characters: with DataCanvas, larger results spill to it (`output_mode: "canvas"` forces staging, and `staged` reports storage) and return the first 20 series' entries and up to 100 observations, with `series_count` and a `SELECT DISTINCT` query for the rest; without it, or at its canvas cap when an `auto` call omits `canvas_id`, the earliest observations return with `truncated: true` and `retrieval_guidance`
+- Key and range errors are `invalid_key_code` (with the nearest valid codes), `wildcard_in_code_list`, `key_too_long`, `response_too_large` (only on a result that was not staged), `no_data`, and `no_data_in_range`; a `+` key that partly returns lists the rest in `missing_series`. Canvas errors are `canvas_not_found` (an expired `canvas_id`: omit it to stage onto a fresh canvas) and `canvas_capacity_exhausted` (`output_mode: "canvas"` at the canvas cap, retryable). Upstream failures are `data_unavailable` and `rate_limited`, both retryable within a 45-second call budget
 
 ---
 
 ### `imf_dataframe_describe` <sub>tool</sub>
 
-- Lists every staged table with row count and column names and DuckDB types
+- Lists every staged table with row count and column names and DuckDB types as the engine spells them (`DECIMAL(10,2)`, `INTEGER[]`)
 - Requires `canvas_id` from an `imf_query_dataset` call that returned `staged: true`; call it before `imf_dataframe_query`
 - Not listed when `CANVAS_PROVIDER_TYPE=none`, like the other dataframe tools
 
@@ -212,7 +212,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 - No API key required.
 
 ### Installation

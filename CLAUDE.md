@@ -2,8 +2,8 @@
 
 **Server:** imf-mcp-server
 **Version:** 0.5.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.4.0
 **Zod:** ^4.6.7
 
@@ -44,7 +44,6 @@
 
 ```ts
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { spillover } from '@cyanheads/mcp-ts-core/canvas';
 import { getCanvas } from '@/services/canvas/canvas-accessor.js';
 import { getImfSdmxService } from '@/services/imf-sdmx/imf-sdmx-service.js';
 
@@ -61,7 +60,7 @@ export const imfQueryDataset = tool('imf_query_dataset', {
       series_key: z.string().describe('Dimension codes for this series.'),
       time_period: z.string().describe('Period label, e.g. 2023 or 2023-Q1.'),
       value: z.number().nullable().describe('Observation value; null when missing.'),
-    })).describe('Inline rows — a budget-limited preview when truncated=true.'),
+    })).describe('Inline rows — a preview of the result when truncated=true.'),
     truncated: z.boolean().describe('True when observations is an incomplete preview of the result.'),
     canvas_id: z.string().optional().describe('DataCanvas session ID when the result spilled.'),
   }),
@@ -74,13 +73,14 @@ export const imfQueryDataset = tool('imf_query_dataset', {
     const svc = getImfSdmxService();
     const queryResult = await svc.fetchData(/* ... */);
     const canvas = getCanvas();
-    if (canvas) {
+    if (canvas && overBudget(queryResult)) {
+      // Staged: the full result registers as a table; the inline preview is bounded by count, not size.
       const instance = await canvas.acquire(input.canvas_id, ctx);
-      const result = await spillover({ canvas: instance, source: rows, previewChars: 100_000 });
-      if (result.spilled) return { observations: result.previewRows, truncated: true, canvas_id: instance.canvasId };
-      return { observations: result.previewRows, truncated: false };
+      await instance.registerTable(tableName, rows, { schema, signal: ctx.signal });
+      const preview = queryResult.observations.slice(0, 100);
+      return { observations: preview, truncated: preview.length < rows.length, canvas_id: instance.canvasId };
     }
-    // No canvas: the same budget holds — the longest time-ascending prefix that fits.
+    // No canvas: the response budget holds — the longest prefix of the result order that fits.
     const shown = prefixWithinBudget(queryResult.observations, 100_000);
     return { observations: shown, truncated: shown.length < queryResult.observations.length };
   },
@@ -274,6 +274,7 @@ src/
       canvas-accessor.ts               # DataCanvas instance accessor (setCanvas / getCanvas)
     imf-sdmx/
       imf-sdmx-service.ts              # IMF SDMX 3.0 API client — dataflows, DSD, data fetch
+      time-period.ts                    # Period labels → date spans, result order, constraint time range
       types.ts                          # Domain types for dataflows and observations
   mcp-server/
     codelist-page.ts                    # bounded codelist projection + every-word filter matcher
@@ -397,7 +398,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. This server uses DataCanvas, which defaults on, so `manifest.json` pins `CANVAS_PROVIDER_TYPE=none` and the bundle ships without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so the dataframe tools stay out of `tools/list` and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
+`bun run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs — `framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere (a `skills/` deeper in a package is runtime code and stays); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. This server uses DataCanvas, which defaults on, so `manifest.json` pins `CANVAS_PROVIDER_TYPE=none` and the bundle ships without the DuckDB native — `@duckdb/node-api` is an optional peer loaded lazily, so the dataframe tools stay out of `tools/list` and every other tool works normally. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 
